@@ -1,0 +1,33 @@
+{
+  "name": "collegedb",
+  "module": "src/index.ts",
+  "type": "module",
+  "scripts": {
+	"docs:build": "bunx typedoc src --out ./typedoc",
+	"prettier": "bunx prettier --write .",
+    "prettier:check": "bunx prettier --check .",
+    "prepare": "husky install"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20250726.0"
+  },
+  "devDependencies": {
+    "@babel/cli": "^7.28.0",
+    "@babel/core": "^7.28.0",
+    "@babel/preset-env": "^7.28.0",
+    "@babel/preset-typescript": "^7.27.1",
+    "@types/bun": "latest",
+    "husky": "^9.1.7",
+    "jsdoc-babel": "^0.5.0",
+    "lint-staged": "^16.1.2",
+    "prettier": "^3.6.2",
+    "prettier-plugin-organize-imports": "^4.2.0",
+    "typedoc": "^0.28.8"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "lint-staged": {
+    "*.{js,css,md}": "prettier --write"
+  }
+}

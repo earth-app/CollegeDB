@@ -1,0 +1,39 @@
+{
+  "template": "#{{CHANGELOG}}\n## Contributors\n- #{{CONTRIBUTORS}}",
+  "commit_template": "- #{{TITLE}} (#{{MERGE_SHA}})",
+  "pr_template": "- #{{TITLE}} (##{{NUMBER}})",
+  "categories": [
+    {
+      "title": "## Breaking Changes",
+      "labels": ["breaking", "breaking change", "major"]
+    },
+    {
+      "title": "## New Features",
+      "labels": ["feat", "feature", "enhancement"]
+    },
+    {
+      "title": "## Bug Fixes",
+      "labels": ["fix", "bugfix"]
+    },
+    {
+      "title": "## Testing Updates",
+      "labels": ["test", "testing"]
+    },
+    {
+      "title": "## Documentation",
+      "labels": ["docs", "documentation"]
+    },
+    {
+      "title": "## Other Updates",
+      "labels": ["build", "other", "chore", "style"]
+    }
+  ],
+  "label_extractor": [
+    {
+      "pattern": "^(build|breaking|major|chore|ci|docs|feat|fix|perf|refactor|revert|style|test){1}(\\([\\w\\-\\.]+\\))?(!)?: ([\\w ])+([\\s\\S]*)",
+      "target": "$1"
+    }
+  ],
+  "max_pull_requests": 1000,
+  "max_back_track_time_days": 1000
+}

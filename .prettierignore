@@ -1,0 +1,12 @@
+.vsocde/
+.config/
+bun.lock
+package.json
+package-lock.json
+LICENSE
+README.md
+tsconfig.json
+.github/
+.devcontainer/
+.wrangler/
+.idea/
