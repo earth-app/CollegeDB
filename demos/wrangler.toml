@@ -1,0 +1,36 @@
+name = "collegedb-worker"
+compatibility_date = "2025-01-31"
+main = "worker-demo.ts"
+
+[vars]
+ENV = "development"
+
+# Multiple D1 database bindings for sharding
+[[d1_databases]]
+binding = "db-east"
+database_name = "collegedb-east"
+database_id = "your-east-db-id"
+preview_database_id = "your-east-preview-db-id"
+
+[[d1_databases]]
+binding = "db-west"
+database_name = "collegedb-west"
+database_id = "your-west-db-id"
+preview_database_id = "your-west-preview-db-id"
+
+[[d1_databases]]
+binding = "db-central"
+database_name = "collegedb-central"
+database_id = "your-central-db-id"
+preview_database_id = "your-central-preview-db-id"
+
+# KV namespace for storing primary key to shard mappings
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"
+preview_id = "your-kv-preview-namespace-id"
+
+# Durable Object for shard coordination
+[[durable_objects.bindings]]
+name = "ShardCoordinator"
+class_name = "ShardCoordinator"
