@@ -23,5 +23,5 @@ cp -Rfv ./docs/* ./
 rm -rf ./docs
 
 git add .
-git commit -m "Update TypeDoc ($1)"
+git commit -m "Update TypeDoc ($1)" --no-verify
 git push -f origin gh-pages
