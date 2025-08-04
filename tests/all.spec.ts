@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	autoDetectAndMigrate,
 	checkMigrationNeeded,
@@ -27,8 +27,22 @@ const TEST_SCHEMA = `
 		user_id TEXT NOT NULL,
 		title TEXT NOT NULL,
 		content TEXT,
-		FOREIGN KEY (user_id) REFERENCES users(id)
-	);
+		FOREIGN KEY (user_id) REFERE		it('should cache migration results to avoid repeated checks', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				shards: { 'db-cache': mockDB1 as any },
+				strategy: 'hash'
+			};
+
+			// First migration should detect and migrate
+			const result1 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config, { skipCache: true });
+			expect(result1.migrationPerformed).toBe(true);
+
+			// Second migration should be cached (no migration performed)
+			const result2 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config);
+			expect(result2.migrationPerformed).toBe(false);
+			expect(result2.recordsMigrated).toBe(0);
+		}););
 
 	CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
 `;
@@ -660,7 +674,7 @@ describe('CollegeDB', () => {
 				strategy: 'hash'
 			};
 
-			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-auto', config);
+			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-auto', config, { skipCache: true });
 
 			expect(result.migrationNeeded).toBe(true);
 			expect(result.migrationPerformed).toBe(true);
@@ -745,7 +759,7 @@ describe('CollegeDB', () => {
 				strategy: 'hash'
 			};
 
-			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-mixed', config);
+			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-mixed', config, { skipCache: true });
 
 			// Should still migrate valid tables
 			expect(result.migrationPerformed).toBe(true);
@@ -760,7 +774,7 @@ describe('CollegeDB', () => {
 			};
 
 			// First migration
-			const result1 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config);
+			const result1 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config, { skipCache: true });
 			expect(result1.migrationPerformed).toBe(true);
 
 			// Should be cached

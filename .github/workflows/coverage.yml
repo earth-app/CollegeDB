@@ -10,10 +10,6 @@ jobs:
     - uses: actions/checkout@v4
     - name: Set up Bun
       uses: oven-sh/setup-bun@v2
-      with:
-        bun-version: 'latest'
-        registry-url: 'https://npm.pkg.github.com'
-        scope: '@earth-app'
     - name: Install dependencies
       run: bun install --frozen-lockfile
       env:
@@ -24,7 +20,7 @@ jobs:
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        slug: earth-app/mantle
+        slug: earth-app/CollegeDB
     - name: Upload coverage to GitHub
       uses: actions/upload-artifact@v4
       with:

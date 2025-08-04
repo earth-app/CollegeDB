@@ -3,12 +3,12 @@
   "module": "src/index.ts",
   "type": "module",
   "scripts": {
-	"docs:build": "bunx typedoc src --out ./typedoc",
-	"prettier": "bunx prettier --write .",
+    "docs:build": "bunx typedoc src --out ./typedoc",
+    "prettier": "bunx prettier --write .",
     "prettier:check": "bunx prettier --check .",
-    "test": "bun test",
-    "test:watch": "bun test --watch",
-    "test:coverage": "bun test --coverage",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "prepare": "husky install"
   },
   "dependencies": {
@@ -20,12 +20,14 @@
     "@babel/preset-env": "^7.28.0",
     "@babel/preset-typescript": "^7.27.1",
     "@types/bun": "latest",
+    "@vitest/coverage-v8": "^3.2.4",
     "husky": "^9.1.7",
     "jsdoc-babel": "^0.5.0",
     "lint-staged": "^16.1.2",
     "prettier": "^3.6.2",
     "prettier-plugin-organize-imports": "^4.2.0",
-    "typedoc": "^0.28.8"
+    "typedoc": "^0.28.8",
+    "vitest": "^3.2.4"
   },
   "peerDependencies": {
     "typescript": "^5"
