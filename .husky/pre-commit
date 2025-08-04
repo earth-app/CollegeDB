@@ -1,4 +1,15 @@
 #!/bin/sh
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+if [ -z "$branch" ]; then
+  branch="$GITHUB_REF_NAME"
+fi
+
+if [ "$branch" = "gh-pages" ]; then
+  echo "Skipping pre-commit script on gh-pages branch."
+  exit 0
+fi
+
 . "$(dirname "$0")/_/husky.sh"
 
-npx lint-staged
+bunx lint-staged
