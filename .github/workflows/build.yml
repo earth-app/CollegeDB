@@ -62,7 +62,7 @@ jobs:
     - name: Generate Documentation
       run: bun run docs:build
     - name: Upload Documentation Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: typedoc-documentation
         path: typedoc/
