@@ -9,3 +9,7 @@ tsconfig.json
 .devcontainer/
 .wrangler/
 .idea/
+typedoc/
+dist/
+coverage/
+node_modules/
