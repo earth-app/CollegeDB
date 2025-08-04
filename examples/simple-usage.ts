@@ -28,6 +28,28 @@
 import { createSchema, deleteByPrimaryKey, initialize, insert, selectByPrimaryKey, updateByPrimaryKey } from '../src/index.js';
 import type { Env } from '../src/types.js';
 
+// Example schema for a simple user and posts system
+const EXAMPLE_SCHEMA = `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		created_at INTEGER DEFAULT (strftime('%s', 'now'))
+	);
+
+	CREATE TABLE IF NOT EXISTS posts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		title TEXT NOT NULL,
+		content TEXT,
+		created_at INTEGER DEFAULT (strftime('%s', 'now')),
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
+	CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
+`;
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		// Initialize CollegeDB with your environment bindings
@@ -43,8 +65,8 @@ export default {
 
 		try {
 			// Ensure schema exists on all shards
-			await createSchema(env['db-east']);
-			await createSchema(env['db-west']);
+			await createSchema(env['db-east'], EXAMPLE_SCHEMA);
+			await createSchema(env['db-west'], EXAMPLE_SCHEMA);
 
 			// Example 1: Insert a new user
 			console.log('📝 Inserting user...');
@@ -141,8 +163,8 @@ export async function runSimpleExample(env: Env) {
 	});
 
 	// Create schema
-	await createSchema(env['db-east']);
-	await createSchema(env['db-west']);
+	await createSchema(env['db-east'], EXAMPLE_SCHEMA);
+	await createSchema(env['db-west'], EXAMPLE_SCHEMA);
 
 	// Basic operations
 	const userId = 'demo-user-' + Date.now();

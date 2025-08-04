@@ -56,8 +56,6 @@ import type { CollegeDBConfig, QueryResult, ShardStats } from './types.js';
 let globalConfig: CollegeDBConfig | null = null;
 
 /**
- * Initialize the collegedb with configuration
- *
  * Sets up the global configuration for the CollegeDB system. This must be called
  * before any other operations can be performed. The configuration includes KV
  * storage, available D1 shards, optional coordinator, and allocation strategy.
@@ -66,7 +64,6 @@ let globalConfig: CollegeDBConfig | null = null;
  * additional setup. If shards contain existing data with primary keys, CollegeDB
  * will automatically create the necessary mappings for seamless operation.
  *
- * @public
  * @param config - Configuration object containing all necessary bindings and settings
  * @throws {Error} If configuration is invalid or required bindings are missing
  * @example
@@ -332,34 +329,34 @@ async function getDatabase(primaryKey: string): Promise<D1Database> {
 }
 
 /**
- * Creates schema in a specific D1 database
+ * Creates the database schema in the specified D1 database
  *
- * Creates the default CollegeDB schema in the specified D1 database instance.
- * This is a convenience wrapper around the migrations module's createSchema function.
- *
- * @public
  * @param d1 - The D1 database instance to create schema in
+ * @param schema - The SQL schema definition to execute
  * @returns Promise that resolves when schema creation is complete
  * @throws {Error} If schema creation fails
  * @example
  * ```typescript
- * // Create schema on a specific shard
- * await createSchema(env.DB_NEW_SHARD);
+ * const userSchema = `
+ *   CREATE TABLE users (
+ *     id TEXT PRIMARY KEY,
+ *     name TEXT NOT NULL,
+ *     email TEXT UNIQUE
+ *   );
+ * `;
+ * await createSchema(env.DB_NEW_SHARD, userSchema);
  * ```
  */
-export async function createSchema(d1: D1Database): Promise<void> {
+export async function createSchema(d1: D1Database, schema: string): Promise<void> {
 	const { createSchema: createSchemaImpl } = await import('./migrations.js');
-	await createSchemaImpl(d1);
+	await createSchemaImpl(d1, schema);
 }
 
 /**
- * Inserts a record using the primary key for routing
- *
  * Executes an INSERT statement on the appropriate shard based on the primary key.
  * The primary key is used to determine which shard should store the record,
  * ensuring consistent routing for future queries.
  *
- * @public
  * @param primaryKey - Primary key to route the query (should match the record's primary key)
  * @param sql - SQL INSERT statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
@@ -382,7 +379,10 @@ export async function createSchema(d1: D1Database): Promise<void> {
  */
 export async function insert(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
 	const db = await getDatabase(primaryKey);
-	const result = await (await db.prepare(sql)).bind(...bindings).run();
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.run();
 
 	if (!result.success) {
 		throw new Error(`Insert failed: ${result.error || 'Unknown error'}`);
@@ -390,12 +390,9 @@ export async function insert(primaryKey: string, sql: string, bindings: any[] = 
 }
 
 /**
- * Selects records using the primary key for routing
- *
  * Executes a SELECT query on the appropriate shard based on the primary key.
  * Returns structured results with metadata about the query execution.
  *
- * @public
  * @param primaryKey - Primary key to route the query
  * @param sql - SQL SELECT statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
@@ -425,7 +422,10 @@ export async function insert(primaryKey: string, sql: string, bindings: any[] = 
  */
 export async function selectByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<QueryResult> {
 	const db = await getDatabase(primaryKey);
-	const result = await (await db.prepare(sql)).bind(...bindings).all();
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.all();
 
 	return {
 		success: result.success,
@@ -439,13 +439,10 @@ export async function selectByPrimaryKey(primaryKey: string, sql: string, bindin
 }
 
 /**
- * Updates records using the primary key for routing
- *
  * Executes an UPDATE statement on the appropriate shard based on the primary key.
  * The primary key ensures the update is performed on the correct shard where
  * the record is stored.
  *
- * @public
  * @param primaryKey - Primary key to route the query
  * @param sql - SQL UPDATE statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
@@ -468,7 +465,10 @@ export async function selectByPrimaryKey(primaryKey: string, sql: string, bindin
  */
 export async function updateByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
 	const db = await getDatabase(primaryKey);
-	const result = await (await db.prepare(sql)).bind(...bindings).run();
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.run();
 
 	if (!result.success) {
 		throw new Error(`Update failed: ${result.error || 'Unknown error'}`);
@@ -476,13 +476,10 @@ export async function updateByPrimaryKey(primaryKey: string, sql: string, bindin
 }
 
 /**
- * Deletes records using the primary key for routing
- *
  * Executes a DELETE statement on the appropriate shard based on the primary key.
  * The primary key ensures the deletion is performed on the correct shard where
  * the record is stored.
  *
- * @public
  * @param primaryKey - Primary key to route the query
  * @param sql - SQL DELETE statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
@@ -511,7 +508,10 @@ export async function updateByPrimaryKey(primaryKey: string, sql: string, bindin
  */
 export async function deleteByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
 	const db = await getDatabase(primaryKey);
-	const result = await (await db.prepare(sql)).bind(...bindings).run();
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.run();
 
 	if (!result.success) {
 		throw new Error(`Delete failed: ${result.error || 'Unknown error'}`);
@@ -534,26 +534,26 @@ export async function deleteByPrimaryKey(primaryKey: string, sql: string, bindin
  * ⚠️ **Note**: This operation involves data migration and should be used
  * carefully in production environments. Consider the impact on ongoing queries.
  *
- * @public
  * @param primaryKey - Primary key to reassign to a different shard
  * @param newBinding - New shard binding name where the data should be moved
+ * @param tableName - Name of the table containing the record to migrate
  * @returns Promise that resolves when reassignment and migration are complete
  * @throws {Error} If target shard not found, mapping doesn't exist, or migration fails
  * @example
  * ```typescript
  * // Move a user from east to west coast for better latency
  * try {
- *   await reassignShard('user-california-123', 'db-west');
+ *   await reassignShard('user-california-123', 'db-west', 'users');
  *   console.log('User successfully moved to west coast shard');
  * } catch (error) {
  *   console.error('Reassignment failed:', error.message);
  * }
  *
  * // Load balancing: move high-activity user to dedicated shard
- * await reassignShard('user-enterprise-456', 'db-dedicated');
+ * await reassignShard('user-enterprise-456', 'db-dedicated', 'users');
  * ```
  */
-export async function reassignShard(primaryKey: string, newBinding: string): Promise<void> {
+export async function reassignShard(primaryKey: string, newBinding: string, tableName: string): Promise<void> {
 	const config = getConfig();
 
 	if (!config.shards[newBinding]) {
@@ -577,7 +577,7 @@ export async function reassignShard(primaryKey: string, newBinding: string): Pro
 			throw new Error('Source or target shard not available');
 		}
 
-		await migrateRecord(sourceDb, targetDb, primaryKey);
+		await migrateRecord(sourceDb, targetDb, primaryKey, tableName);
 	}
 
 	// Update mapping
@@ -592,7 +592,6 @@ export async function reassignShard(primaryKey: string, newBinding: string): Pro
  * up-to-date information, then falls back to the configured shards if the
  * coordinator is unavailable.
  *
- * @public
  * @returns Promise resolving to array of shard binding names
  * @example
  * ```typescript
@@ -641,7 +640,6 @@ export async function listKnownShards(): Promise<string[]> {
  * - Capacity planning
  * - Performance analysis
  *
- * @public
  * @returns Promise resolving to array of shard statistics
  * @example
  * ```typescript
@@ -698,7 +696,6 @@ export async function getShardStats(): Promise<ShardStats[]> {
  * ⚠️ **Use with caution**: This function bypasses routing safeguards and should
  * be used only when you specifically need to target a particular shard.
  *
- * @public
  * @param shardBinding - The shard binding name to execute the query on
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
@@ -732,7 +729,10 @@ export async function queryOnShard(shardBinding: string, sql: string, bindings: 
 		throw new Error(`Shard ${shardBinding} not found`);
 	}
 
-	const result = await (await db.prepare(sql)).bind(...bindings).all();
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.all();
 
 	return {
 		success: result.success,
@@ -761,7 +761,6 @@ export async function queryOnShard(shardBinding: string, sql: string, bindings: 
  * - Complete system resets
  * - Emergency recovery scenarios
  *
- * @public
  * @returns Promise that resolves when all mappings are cleared
  * @example
  * ```typescript

@@ -28,7 +28,7 @@
  * console.log(counts); // { 'db-east': 42, 'db-west': 38 }
  * ```
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.0.0
  */
 
@@ -41,8 +41,8 @@ import type { ShardMapping } from './types.js';
  * All primary key to shard mappings are stored with this prefix to namespace
  * them from other data in the KV store and enable efficient prefix-based queries.
  *
- * @private
  * @constant
+ * @private
  */
 const SHARD_MAPPING_PREFIX = 'shard:';
 
@@ -53,14 +53,12 @@ const SHARD_MAPPING_PREFIX = 'shard:';
  * This provides a quick way to discover available shards without scanning
  * all mapping entries.
  *
- * @private
  * @constant
+ * @private
  */
 const KNOWN_SHARDS_KEY = 'known_shards';
 
 /**
- * Maps primary keys to shard bindings using Cloudflare KV
- *
  * The KVShardMapper class provides a persistent storage layer for mapping
  * primary keys to their assigned D1 database shards. It uses Cloudflare KV
  * for global, eventually consistent storage with low latency reads.
@@ -71,7 +69,6 @@ const KNOWN_SHARDS_KEY = 'known_shards';
  * - Efficient bulk operations and statistics
  * - Prefix-based key organization for performance
  *
- * @public
  * @example
  * ```typescript
  * const mapper = new KVShardMapper(env.KV);
@@ -92,19 +89,14 @@ const KNOWN_SHARDS_KEY = 'known_shards';
 export class KVShardMapper {
 	/**
 	 * Cloudflare KV namespace for storing mappings
-	 * @private
 	 * @readonly
 	 */
 	constructor(private kv: KVNamespace) {}
 
 	/**
-	 * Gets the shard mapping for a primary key
-	 *
 	 * Retrieves the shard assignment for a given primary key from KV storage.
 	 * Returns null if no mapping exists, indicating the key has not been
 	 * assigned to any shard yet.
-	 *
-	 * @public
 	 * @param primaryKey - The primary key to look up
 	 * @returns Promise resolving to the shard mapping or null if not found
 	 * @throws {Error} If KV read operation fails
@@ -121,21 +113,17 @@ export class KVShardMapper {
 	 */
 	async getShardMapping(primaryKey: string): Promise<ShardMapping | null> {
 		const key = `${SHARD_MAPPING_PREFIX}${primaryKey}`;
-		const value = await this.kv.get(key, 'json');
-		return value as ShardMapping | null;
+		const value = await this.kv.get<ShardMapping>(key, 'json');
+		return value;
 	}
 
 	/**
-	 * Sets the shard mapping for a primary key
-	 *
 	 * Creates a new shard assignment for a primary key. This is typically used
 	 * when a new primary key is first encountered and needs to be assigned to
 	 * a shard. Sets both created and updated timestamps to the current time.
 	 *
-	 * ⚠️ **Note**: This will overwrite any existing mapping for the same key.
+	 * **Note**: This will overwrite any existing mapping for the same key.
 	 * Use updateShardMapping() if you want to preserve creation timestamp.
-	 *
-	 * @public
 	 * @param primaryKey - The primary key to map
 	 * @param shard - The shard binding name to assign
 	 * @returns Promise that resolves when the mapping is stored
@@ -148,24 +136,21 @@ export class KVShardMapper {
 	 */
 	async setShardMapping(primaryKey: string, shard: string): Promise<void> {
 		const key = `${SHARD_MAPPING_PREFIX}${primaryKey}`;
-		const mapping: ShardMapping = {
+		const mapping = {
 			shard,
 			createdAt: Date.now(),
 			updatedAt: Date.now()
-		};
+		} satisfies ShardMapping;
+
 		await this.kv.put(key, JSON.stringify(mapping));
 	}
 
 	/**
-	 * Updates the shard mapping for an existing primary key
-	 *
 	 * Changes the shard assignment for a primary key that already has a mapping.
 	 * Preserves the original creation timestamp while updating the modified
 	 * timestamp. Throws an error if no existing mapping is found.
 	 *
 	 * This is typically used during shard rebalancing or data migration operations.
-	 *
-	 * @public
 	 * @param primaryKey - The primary key to update
 	 * @param newShard - The new shard binding name to assign
 	 * @returns Promise that resolves when the mapping is updated
@@ -188,25 +173,23 @@ export class KVShardMapper {
 		}
 
 		const key = `${SHARD_MAPPING_PREFIX}${primaryKey}`;
-		const mapping: ShardMapping = {
+		const mapping = {
 			...existing,
 			shard: newShard,
 			updatedAt: Date.now()
-		};
+		} satisfies ShardMapping;
+
 		await this.kv.put(key, JSON.stringify(mapping));
 	}
 
 	/**
-	 * Deletes the shard mapping for a primary key
-	 *
 	 * Completely removes the shard assignment for a primary key from KV storage.
 	 * This is typically used when data is being permanently deleted or when
 	 * cleaning up orphaned mappings.
 	 *
-	 * ⚠️ **WARNING**: After deletion, the primary key will be treated as new
+	 * **WARNING**: After deletion, the primary key will be treated as new
 	 * and may be assigned to a different shard on next access.
 	 *
-	 * @public
 	 * @param primaryKey - The primary key mapping to remove
 	 * @returns Promise that resolves when the mapping is deleted
 	 * @throws {Error} If KV delete operation fails
@@ -223,13 +206,10 @@ export class KVShardMapper {
 	}
 
 	/**
-	 * Gets the list of known shards
-	 *
 	 * Retrieves the list of all shard binding names that have been registered
 	 * with the system. This is maintained separately from the individual mappings
 	 * for efficient shard discovery.
 	 *
-	 * @public
 	 * @returns Promise resolving to array of shard binding names
 	 * @throws {Error} If KV read operation fails
 	 * @example
@@ -240,17 +220,14 @@ export class KVShardMapper {
 	 * ```
 	 */
 	async getKnownShards(): Promise<string[]> {
-		const shards = await this.kv.get(KNOWN_SHARDS_KEY, 'json');
-		return (shards as string[]) || [];
+		const shards = await this.kv.get<string[]>(KNOWN_SHARDS_KEY, 'json');
+		return shards || [];
 	}
 
 	/**
-	 * Updates the list of known shards
-	 *
 	 * Replaces the entire list of known shards with a new list. This is typically
 	 * used during system initialization or when shards are added/removed in bulk.
 	 *
-	 * @public
 	 * @param shards - Array of shard binding names to store
 	 * @returns Promise that resolves when the list is updated
 	 * @throws {Error} If KV write operation fails
@@ -261,16 +238,14 @@ export class KVShardMapper {
 	 * ```
 	 */
 	async setKnownShards(shards: string[]): Promise<void> {
+		if (!shards || shards.length === 0) return;
 		await this.kv.put(KNOWN_SHARDS_KEY, JSON.stringify(shards));
 	}
 
 	/**
-	 * Adds a new shard to the known shards list
-	 *
 	 * Appends a new shard to the list of known shards if it's not already present.
 	 * This operation is idempotent - adding the same shard multiple times has no effect.
 	 *
-	 * @public
 	 * @param shard - The shard binding name to add
 	 * @returns Promise that resolves when the shard is added
 	 * @throws {Error} If KV operations fail
@@ -282,6 +257,8 @@ export class KVShardMapper {
 	 * ```
 	 */
 	async addKnownShard(shard: string): Promise<void> {
+		if (!shard) return;
+
 		const knownShards = await this.getKnownShards();
 		if (!knownShards.includes(shard)) {
 			knownShards.push(shard);
@@ -290,13 +267,10 @@ export class KVShardMapper {
 	}
 
 	/**
-	 * Lists all primary keys mapped to a specific shard
-	 *
 	 * Scans all shard mappings to find primary keys assigned to the specified shard.
 	 * This operation requires reading all mappings and can be expensive for large
 	 * datasets. Consider caching results or using getShardKeyCounts() for statistics.
 	 *
-	 * @public
 	 * @param shard - The shard binding name to search for
 	 * @returns Promise resolving to array of primary keys assigned to the shard
 	 * @throws {Error} If KV operations fail
@@ -322,17 +296,14 @@ export class KVShardMapper {
 	}
 
 	/**
-	 * Counts the number of keys assigned to each shard
-	 *
 	 * Scans all shard mappings to count how many primary keys are assigned to
 	 * each shard. Returns a mapping of shard names to their key counts. This
 	 * is useful for load balancing and monitoring shard utilization.
 	 *
-	 * ⚠️ **Performance Note**: This operation scans all mappings and can be
+	 * **Performance Note**: This operation scans all mappings and can be
 	 * expensive for large datasets. Consider implementing caching for frequently
 	 * accessed statistics.
 	 *
-	 * @public
 	 * @returns Promise resolving to object mapping shard names to key counts
 	 * @throws {Error} If KV operations fail
 	 * @example
@@ -362,17 +333,14 @@ export class KVShardMapper {
 	}
 
 	/**
-	 * Clears all shard mappings (use with caution!)
-	 *
 	 * Deletes ALL shard mappings from KV storage. This is a destructive operation
 	 * that removes all primary key assignments. After this operation, all keys
 	 * will be treated as new and may be assigned to different shards.
 	 *
-	 * ⚠️ **DANGER**: This operation is irreversible and will cause data routing
+	 * **DANGER**: This operation is irreversible and will cause data routing
 	 * issues if used in production. Only use during development, testing, or
 	 * complete system resets.
 	 *
-	 * @public
 	 * @returns Promise that resolves when all mappings are deleted
 	 * @throws {Error} If KV operations fail
 	 * @example

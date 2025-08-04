@@ -29,6 +29,14 @@
 import type { D1Database, DurableObjectNamespace, KVNamespace } from '@cloudflare/workers-types';
 
 /**
+ * Sharding strategy options for CollegeDB
+ * - `round-robin`: Distributes keys evenly across available shards.
+ * - `random`: Selects a random shard for each key.
+ * - `hash`: Uses a hash function to determine the shard based on the primary key.
+ */
+export type ShardingStrategy = 'round-robin' | 'random' | 'hash';
+
+/**
  * Environment bindings for the Cloudflare Worker
  */
 export interface Env {
@@ -51,7 +59,7 @@ export interface CollegeDBConfig {
 	/** Available D1 database bindings */
 	shards: Record<string, D1Database>;
 	/** Default shard allocation strategy */
-	strategy?: 'round-robin' | 'random' | 'hash';
+	strategy?: ShardingStrategy;
 }
 
 /**
@@ -123,7 +131,7 @@ export interface ShardCoordinatorState {
 	 * `random` - selects a random shard for each key
 	 * `hash` - uses a hash function to determine shard based on primary key (default)
 	 */
-	strategy: 'round-robin' | 'random' | 'hash';
+	strategy: ShardingStrategy;
 	/** Round-robin counter for allocation */
 	roundRobinIndex: number;
 }

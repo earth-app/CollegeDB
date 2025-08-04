@@ -8,7 +8,7 @@
 
 A TypeScript library for horizontal scaling of SQLite-style databases on Cloudflare using D1 and KV. CollegeDB simulates vertical scaling by routing queries to the correct D1 database instance using primary key mappings stored in Cloudflare KV.
 
-## 🧠 Overview
+## Overview
 
 CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling you to:
 
@@ -29,9 +29,7 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 - **⚡ High Performance**: Optimized for Cloudflare Workers runtime
 - **🔧 TypeScript First**: Full type safety and excellent DX
 
-## 🚀 Quick Start
-
-### Installation
+## Installation
 
 ```bash
 bun add collegedb
@@ -39,7 +37,7 @@ bun add collegedb
 npm install collegedb
 ```
 
-### Basic Usage
+## Basic Usage
 
 ```typescript
 import { initialize, createSchema, insert, selectByPrimaryKey } from 'collegedb';
@@ -71,26 +69,12 @@ console.log(result.results[0]); // User data from existing database
 
 CollegeDB supports **seamless, automatic integration** with existing D1 databases that already contain data. Simply add your existing databases as shards in the configuration - CollegeDB will automatically detect existing data and create the necessary shard mappings **without requiring any manual migration steps**.
 
-### ✨ Automatic Migration (New!)
-
-**No manual setup required!** CollegeDB now automatically:
-
-- 🔍 Detects existing data in your databases
-- 🗺️ Creates shard mappings for all existing primary keys
-- 🚀 Makes existing data immediately queryable
-- 📊 Runs migration checks in the background
-- 💾 Caches results to avoid repeated scans
-
 ### Requirements for Drop-in Replacement
 
 1. **Primary Keys**: All tables must have a primary key column (typically named `id`)
 2. **Schema Compatibility**: Tables should use standard SQLite data types
 3. **Access Permissions**: CollegeDB needs read/write access to existing databases
 4. **KV Namespace**: A Cloudflare KV namespace for storing shard mappings
-
-### Super Simple Integration
-
-#### Just Add Your Existing Databases!
 
 ```typescript
 import { initialize, selectByPrimaryKey, insert } from 'collegedb';
@@ -115,19 +99,7 @@ await insert('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, 
 
 **That's it!** No migration scripts, no manual mapping creation, no downtime. Your existing data is immediately accessible through CollegeDB's sharding system.
 
-### How Automatic Migration Works
-
-1. **Initialization**: When you call `initialize()`, CollegeDB starts background migration detection
-2. **Data Discovery**: Scans each configured shard for tables with primary keys
-3. **Mapping Creation**: Creates KV mappings for all existing primary keys
-4. **Immediate Access**: Existing data becomes queryable through CollegeDB operations
-5. **Caching**: Results are cached to avoid repeated migration checks
-
-### Advanced Manual Integration (Optional)
-
-For fine-grained control, you can still use manual integration methods:
-
-#### Manual Validation (Optional)
+### Manual Validation (Optional)
 
 You can manually validate databases before integration if needed:
 
@@ -149,7 +121,7 @@ for (const table of tables) {
 }
 ```
 
-#### Manual Data Discovery (Optional)
+### Manual Data Discovery (Optional)
 
 If you want to inspect existing data before automatic migration:
 
@@ -164,7 +136,7 @@ console.log(`Found ${userIds.length} existing users`);
 const orderIds = await discoverExistingPrimaryKeys(env.ExistingDB, 'orders', 'order_id');
 ```
 
-#### Manual Integration (Optional)
+### Manual Integration (Optional)
 
 For complete control over the integration process:
 
@@ -193,8 +165,6 @@ if (result.success) {
 	console.error('Integration issues:', result.issues);
 }
 ```
-
-#### 4. Initialize CollegeDB with Existing Data
 
 After integration, initialize CollegeDB with your existing databases as shards:
 
@@ -253,13 +223,7 @@ export default {
 };
 ```
 
-### Manual Integration Example (Advanced)
-
-For scenarios requiring fine-grained control:
-
-### Advanced Integration Options
-
-#### Custom Primary Key Columns
+### Manual Integration Example
 
 If your tables use different primary key column names:
 
@@ -269,8 +233,6 @@ const productIds = await discoverExistingPrimaryKeys(env.ProductDB, 'products', 
 const sessionIds = await discoverExistingPrimaryKeys(env.SessionDB, 'sessions', 'session_key');
 ```
 
-#### Selective Table Integration
-
 Integrate only specific tables from existing databases:
 
 ```typescript
@@ -279,8 +241,6 @@ const result = await integrateExistingDatabase(env.ExistingDB, 'db-legacy', mapp
 	// Skip 'temp_logs', 'cache_data', etc.
 });
 ```
-
-#### Dry Run Testing
 
 Test integration without making changes:
 
@@ -292,37 +252,12 @@ const testResult = await integrateExistingDatabase(env.ExistingDB, 'db-test', ma
 console.log(`Would process ${testResult.totalRecords} records from ${testResult.tablesProcessed} tables`);
 ```
 
-### Migration Considerations
-
-#### ✅ Benefits of Automatic Migration
-
-- **Zero Downtime**: Existing data remains accessible during migration
-- **No Data Movement**: Only metadata mappings are created, data stays in place
-- **Immediate Benefits**: Existing data becomes queryable through CollegeDB instantly
-- **Background Processing**: Migration detection runs asynchronously
-- **Intelligent Caching**: Avoids repeated migration checks for performance
-- **Error Recovery**: Gracefully handles partial migrations and errors
-
-#### Performance Impact
+### Performance Impact
 
 - **One-time Setup**: Migration detection runs once per shard
 - **Minimal Overhead**: Only scans table metadata and sample records
 - **Cached Results**: Subsequent operations have no migration overhead
 - **Async Processing**: Doesn't block application startup or queries
-
-#### Data Consistency
-
-- **Existing Data**: Remains in original databases, unchanged
-- **New Data**: Gets distributed according to configured strategy
-- **Mixed Queries**: Both existing and new data accessible through same API
-- **Atomic Operations**: Each database operation remains ACID compliant
-
-#### Rollback Strategy
-
-- **Simple Rollback**: Clear KV mappings to return to original state
-- **Data Safety**: Original data is never modified or moved
-- **Gradual Migration**: Can selectively enable/disable specific shards
-- **Testing Support**: Dry-run mode available for validation
 
 ```typescript
 // Simple rollback - clear all mappings
@@ -335,9 +270,7 @@ import { clearMigrationCache } from 'collegedb';
 clearMigrationCache(); // Forces fresh migration check
 ```
 
-### Troubleshooting
-
-#### Common Issues
+## Troubleshooting
 
 **Tables without Primary Keys**
 
@@ -438,31 +371,6 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 - **Hash**: Consistent hashing for deterministic shard selection
 - **Round-Robin**: Evenly distribute new keys across shards
 - **Random**: Random shard selection for load balancing
-
-## 🛠 Development
-
-### Project Structure
-
-```txt
-collegedb/
-├── src/
-│   ├── index.ts          # Main exports
-│   ├── router.ts         # Query routing logic
-│   ├── kvmap.ts          # KV mapping operations
-│   ├── durable.ts        # Durable Object coordinator
-│   ├── migrations.ts     # Schema and data migrations
-│   └── types.ts          # TypeScript definitions
-├── tests/
-│   └── all.spec.ts       # Test suite
-├── examples/
-│   ├── simple-usage.ts   # Basic usage examples
-│   ├── advanced-usage.ts # Advanced features demo
-│   ├── automatic-migration.ts # NEW: Zero-config automatic integration
-│   └── drop-in-replacement.ts # Manual integration control
-├── demos/
-│   └── worker-demo.ts    # Complete worker implementation
-└── typedoc/              # Generated documentation
-```
 
 ## 🌐 Cloudflare Setup
 

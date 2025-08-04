@@ -14,6 +14,25 @@ import {
 } from '../src/index.js';
 import type { CollegeDBConfig } from '../src/types.js';
 
+// Test schema for creating tables
+const TEST_SCHEMA = `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE
+	);
+
+	CREATE TABLE IF NOT EXISTS posts (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		title TEXT NOT NULL,
+		content TEXT,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
+`;
+
 // Mock implementations for D1 and KV
 class MockD1Database {
 	private data = new Map<string, any[]>();
@@ -207,7 +226,7 @@ class MockD1Database {
 				if (sql.includes('LIMIT')) {
 					const limitMatch = sql.match(/LIMIT (\d+)/);
 					if (limitMatch) {
-						const limit = parseInt(limitMatch[1]);
+						const limit = parseInt(limitMatch[1] || '0');
 						results = results.slice(0, limit);
 					}
 				}
@@ -331,7 +350,7 @@ describe('CollegeDB', () => {
 		it('should create schema successfully', async () => {
 			// Test the migrations module directly with mock
 			const { createSchema } = await import('../src/migrations.js');
-			await expect(createSchema(mockDB1 as any)).resolves.toBeUndefined();
+			await expect(createSchema(mockDB1 as any, TEST_SCHEMA)).resolves.toBeUndefined();
 		});
 	});
 
@@ -339,8 +358,8 @@ describe('CollegeDB', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
 			const { createSchema } = await import('../src/migrations.js');
-			await createSchema(mockDB1 as any);
-			await createSchema(mockDB2 as any);
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
 
 		it('should insert and select a record', async () => {
@@ -420,17 +439,17 @@ describe('CollegeDB', () => {
 			await insert(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Test User']);
 
 			// Reassign to different shard
-			await expect(reassignShard(primaryKey, 'db-west')).resolves.toBeUndefined();
+			await expect(reassignShard(primaryKey, 'db-west', 'users')).resolves.toBeUndefined();
 		});
 	});
 
 	describe('Error Handling', () => {
 		it('should throw error for invalid shard in reassignment', async () => {
-			await expect(reassignShard('user-123', 'invalid-shard')).rejects.toThrow('Shard invalid-shard not found');
+			await expect(reassignShard('user-123', 'invalid-shard', 'users')).rejects.toThrow('Shard invalid-shard not found');
 		});
 
 		it('should throw error when reassigning non-existent key', async () => {
-			await expect(reassignShard('non-existent', 'db-west')).rejects.toThrow('No existing mapping found');
+			await expect(reassignShard('non-existent', 'db-west', 'users')).rejects.toThrow('No existing mapping found');
 		});
 	});
 
@@ -438,8 +457,8 @@ describe('CollegeDB', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
 			const { createSchema } = await import('../src/migrations.js');
-			await createSchema(mockDB1 as any);
-			await createSchema(mockDB2 as any);
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
 
 		it('should consistently route the same primary key to the same shard', async () => {
@@ -477,7 +496,7 @@ describe('CollegeDB', () => {
 		beforeEach(async () => {
 			// Create existing database with data
 			const { createSchema } = await import('../src/migrations.js');
-			await createSchema(mockDB1 as any);
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
 
 			// Add some existing data
 			await (mockDB1 as any)
@@ -510,12 +529,12 @@ describe('CollegeDB', () => {
 		it('should validate tables for sharding', async () => {
 			const { validateTableForSharding } = await import('../src/migrations.js');
 
-			const usersValidation = await validateTableForSharding(mockDB1 as any, 'users');
+			const usersValidation = await validateTableForSharding(mockDB1 as any, 'users', 'id');
 			expect(usersValidation.isValid).toBe(true);
 			expect(usersValidation.recordCount).toBe(2);
 			expect(usersValidation.tableName).toBe('users');
 
-			const invalidValidation = await validateTableForSharding(mockDB1 as any, 'nonexistent_table');
+			const invalidValidation = await validateTableForSharding(mockDB1 as any, 'nonexistent_table', 'id');
 			expect(invalidValidation.isValid).toBe(false);
 			expect(invalidValidation.issues).toContain("Table 'nonexistent_table' does not exist");
 		});
@@ -606,7 +625,7 @@ describe('CollegeDB', () => {
 
 			// Create existing database with data
 			const { createSchema } = await import('../src/migrations.js');
-			await createSchema(mockDB1 as any);
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
 
 			// Add some existing data without mappings
 			await (mockDB1 as any)
@@ -700,7 +719,7 @@ describe('CollegeDB', () => {
 		it('should handle databases with no data gracefully', async () => {
 			// Create empty database
 			const { createSchema } = await import('../src/migrations.js');
-			await createSchema(mockDB2 as any);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
 
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,

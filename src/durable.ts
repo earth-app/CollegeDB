@@ -26,7 +26,7 @@
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import type { ShardCoordinatorState } from './types.js';
+import type { ShardCoordinatorState, ShardingStrategy } from './types.js';
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
@@ -41,7 +41,6 @@ import type { ShardCoordinatorState } from './types.js';
  * - Provide HTTP API for shard allocation and management
  * - Maintain persistent state using Durable Object storage
  *
- * @public
  * @example
  * ```typescript
  * // Allocate a shard for a new primary key
@@ -121,7 +120,6 @@ export class ShardCoordinator {
 	 * - POST /flush - Clear all coordinator state (development only)
 	 * - GET /health - Health check endpoint
 	 *
-	 * @public
 	 * @param request - The incoming HTTP request
 	 * @returns Promise resolving to HTTP response
 	 * @example
@@ -167,11 +165,8 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Lists all known shards
-	 *
-	 * Returns a JSON array of all D1 binding names that have been registered
+	 * Retrieves all known shards as a JSON array of all D1 binding names that have been registered
 	 * with the coordinator.
-	 *
 	 * @private
 	 * @returns Promise resolving to HTTP response with shard list
 	 * @example Response body: `["db-east", "db-west", "db-central"]`
@@ -184,12 +179,9 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Adds a new shard to the known shards list
-	 *
 	 * Registers a new D1 database binding with the coordinator. If the shard
 	 * is already known, this operation is idempotent. Initializes statistics
 	 * for the new shard.
-	 *
 	 * @private
 	 * @param request - HTTP request containing shard binding name in JSON body
 	 * @returns Promise resolving to HTTP response indicating success
@@ -216,12 +208,9 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Removes a shard from the known shards list
-	 *
 	 * Unregisters a D1 database binding from the coordinator. Removes the shard
 	 * from the known shards list and deletes its statistics. Adjusts the round-robin
 	 * index if necessary to prevent out-of-bounds access.
-	 *
 	 * @private
 	 * @param request - HTTP request containing shard binding name in JSON body
 	 * @returns Promise resolving to HTTP response indicating success
@@ -249,11 +238,8 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Gets shard statistics
-	 *
 	 * Returns an array of statistics for all known shards, including
 	 * binding names, key counts, and last updated timestamps.
-	 *
 	 * @private
 	 * @returns Promise resolving to HTTP response with statistics array
 	 * @example Response body: `[{"binding": "db-east", "count": 1234, "lastUpdated": 1672531200000}]`
@@ -267,11 +253,8 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Updates shard statistics
-	 *
 	 * Updates the key count and last updated timestamp for a specific shard.
 	 * Used by other parts of the system to report changes in shard utilization.
-	 *
 	 * @private
 	 * @param request - HTTP request containing shard name and count in JSON body
 	 * @returns Promise resolving to HTTP response indicating success
@@ -294,8 +277,6 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Allocates a shard for a new primary key
-	 *
 	 * Selects an appropriate shard for a new primary key using the specified
 	 * allocation strategy. Updates internal state for round-robin allocation.
 	 *
@@ -314,7 +295,7 @@ export class ShardCoordinator {
 	private async handleAllocateShard(request: Request): Promise<Response> {
 		const { primaryKey, strategy } = (await request.json()) as {
 			primaryKey: string;
-			strategy?: 'round-robin' | 'random' | 'hash';
+			strategy?: ShardingStrategy;
 		};
 		const state = await this.getState();
 
@@ -339,12 +320,10 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Flushes all coordinator state (development only)
-	 *
 	 * Completely clears all coordinator state from Durable Object storage.
 	 * This removes all shard registrations, statistics, and configuration.
 	 *
-	 * ⚠️ **WARNING**: This operation is destructive and should only be used
+	 * **WARNING**: This operation is destructive and should only be used
 	 * in development environments or during testing.
 	 *
 	 * @private
@@ -359,8 +338,6 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Selects a shard based on the allocation strategy
-	 *
 	 * Implements the core shard selection logic for different allocation strategies.
 	 * Uses consistent algorithms to ensure predictable shard assignment.
 	 *
@@ -412,13 +389,9 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Increments the key count for a shard
-	 *
 	 * Atomically increments the key count for a specific shard and updates
 	 * the last modified timestamp. Used when new primary keys are assigned
 	 * to a shard.
-	 *
-	 * @public
 	 * @param shard - The shard binding name to increment
 	 * @returns Promise that resolves when the count is updated
 	 * @throws {Error} If the shard is not known to the coordinator
@@ -437,13 +410,9 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Decrements the key count for a shard
-	 *
 	 * Atomically decrements the key count for a specific shard and updates
 	 * the last modified timestamp. Used when primary keys are removed or
 	 * moved from a shard. Prevents negative counts.
-	 *
-	 * @public
 	 * @param shard - The shard binding name to decrement
 	 * @returns Promise that resolves when the count is updated
 	 * @throws {Error} If the shard is not known to the coordinator

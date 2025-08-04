@@ -49,6 +49,42 @@ import {
 } from '../src/index.js';
 import type { CollegeDBConfig, Env } from '../src/types.js';
 
+// Example schema for advanced usage scenarios
+const ADVANCED_SCHEMA = `
+	CREATE TABLE IF NOT EXISTS organizations (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		tier TEXT DEFAULT 'standard',
+		created_at INTEGER DEFAULT (strftime('%s', 'now'))
+	);
+
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		org_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		role TEXT DEFAULT 'member',
+		created_at INTEGER DEFAULT (strftime('%s', 'now')),
+		FOREIGN KEY (org_id) REFERENCES organizations(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS events (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		org_id TEXT NOT NULL,
+		type TEXT NOT NULL,
+		data TEXT,
+		timestamp INTEGER DEFAULT (strftime('%s', 'now')),
+		FOREIGN KEY (user_id) REFERENCES users(id),
+		FOREIGN KEY (org_id) REFERENCES organizations(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id);
+	CREATE INDEX IF NOT EXISTS idx_events_user_id ON events(user_id);
+	CREATE INDEX IF NOT EXISTS idx_events_org_id ON events(org_id);
+	CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+`;
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
@@ -107,7 +143,7 @@ async function handleSetup(config: CollegeDBConfig): Promise<Response> {
 	// Create schema on all shards
 	for (const [shardName, db] of Object.entries(config.shards)) {
 		console.log(`Creating schema on ${shardName}...`);
-		await createSchema(db);
+		await createSchema(db, ADVANCED_SCHEMA);
 	}
 
 	// Initialize coordinator with known shards
@@ -225,7 +261,7 @@ async function handleRebalance(): Promise<Response> {
 	for (let i = 0; i < keysToMove; i++) {
 		const keyToMove = `rebalance-key-${i}`;
 		try {
-			await reassignShard(keyToMove, leastLoaded.binding);
+			await reassignShard(keyToMove, leastLoaded.binding, 'users');
 			movedKeys.push(keyToMove);
 		} catch (error) {
 			console.warn(`Failed to move key ${keyToMove}:`, error);
@@ -337,7 +373,7 @@ async function handleErrorRecovery(): Promise<Response> {
 
 	// Test 2: Invalid shard reassignment
 	try {
-		await reassignShard('test-user', 'invalid-shard');
+		await reassignShard('test-user', 'invalid-shard', 'users');
 		tests.push({
 			test: 'Invalid shard reassignment',
 			passed: false,

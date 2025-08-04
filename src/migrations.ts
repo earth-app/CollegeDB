@@ -27,12 +27,13 @@
  * await migrateRecord(env.DB_EAST, env.DB_WEST, 'user-123', 'users');
  * ```
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.0.0
  */
 
 import type { D1Database } from '@cloudflare/workers-types';
-import type { CollegeDBConfig } from './types.js';
+import type { KVShardMapper } from './kvmap.js';
+import type { CollegeDBConfig, ShardingStrategy } from './types.js';
 
 /**
  * Cache for migration status to avoid repeated checks
@@ -41,67 +42,6 @@ import type { CollegeDBConfig } from './types.js';
 const migrationStatusCache = new Map<string, boolean>();
 
 /**
- * Default schema for collegedb tables
- *
- * Provides a comprehensive default schema suitable for typical web applications.
- * Includes user management, content posting, and shard mapping tables with
- * appropriate indexes for performance.
- *
- * Tables included:
- * - `shard_mappings`: Stores primary key to shard assignments
- * - `users`: User accounts with email uniqueness constraints
- * - `posts`: User-generated content with foreign key relationships
- *
- * Indexes included:
- * - Email index for fast user lookups
- * - User ID index for efficient post queries
- * - Creation time index for chronological queries
- *
- * @constant
- * @example
- * ```sql
- * -- Users table example
- * INSERT INTO users (id, name, email) VALUES ('user-123', 'John Doe', 'john@example.com');
- *
- * -- Posts table example
- * INSERT INTO posts (id, user_id, title, content) VALUES
- *   ('post-456', 'user-123', 'Hello World', 'My first post!');
- * ```
- */
-const DEFAULT_SCHEMA = `
-CREATE TABLE IF NOT EXISTS shard_mappings (
-  primary_key TEXT PRIMARY KEY,
-  shard_name TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE,
-  created_at INTEGER DEFAULT (strftime('%s', 'now')),
-  updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS posts (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT NOT NULL,
-  content TEXT,
-  created_at INTEGER DEFAULT (strftime('%s', 'now')),
-  updated_at INTEGER DEFAULT (strftime('%s', 'now')),
-  FOREIGN KEY (user_id) REFERENCES users(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
-CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
-`;
-
-/**
- * Creates the default schema in a D1 database
- *
  * Executes SQL statements to create the default table structure and indexes
  * in the specified D1 database. Supports custom schemas and handles SQL
  * statement parsing with comment filtering.
@@ -112,29 +52,23 @@ CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
  * 3. Executes each statement using prepared statements
  * 4. Provides detailed error reporting on failures
  *
- * @public
  * @param d1 - The D1 database instance to create schema in
- * @param customSchema - Optional custom schema SQL to use instead of default
+ * @param schema - Schema SQL to use
  * @returns Promise that resolves when all schema statements are executed
  * @throws {Error} If any schema statement fails with detailed error information
  * @example
  * ```typescript
- * // Create default schema
- * await createSchema(env.DB_EAST);
- *
- * // Create custom schema
- * const customSQL = `
+ * const sql = `
  *   CREATE TABLE products (
  *     id TEXT PRIMARY KEY,
  *     name TEXT NOT NULL,
  *     price REAL
  *   );
  * `;
- * await createSchema(env.DB_PRODUCTS, customSQL);
+ * await createSchema(env.DB_PRODUCTS, sql);
  * ```
  */
-export async function createSchema(d1: D1Database, customSchema?: string): Promise<void> {
-	const schema = customSchema || DEFAULT_SCHEMA;
+export async function createSchema(d1: D1Database, schema: string): Promise<void> {
 	const statements = schema
 		.split(';')
 		.map((stmt) => stmt.trim())
@@ -142,7 +76,7 @@ export async function createSchema(d1: D1Database, customSchema?: string): Promi
 
 	for (const statement of statements) {
 		try {
-			await (await d1.prepare(statement)).run();
+			await d1.prepare(statement).run();
 		} catch (error) {
 			console.error('Failed to execute schema statement:', statement, error);
 			throw new Error(`Schema migration failed: ${error}`);
@@ -151,8 +85,6 @@ export async function createSchema(d1: D1Database, customSchema?: string): Promi
 }
 
 /**
- * Creates schema across multiple D1 databases (all shards)
- *
  * Applies the schema to all provided D1 database instances in parallel.
  * This is useful for initializing a complete sharded database system
  * where all shards need the same table structure.
@@ -161,9 +93,8 @@ export async function createSchema(d1: D1Database, customSchema?: string): Promi
  * performance, but provides detailed error reporting that identifies
  * which specific shard failed if any errors occur.
  *
- * @public
  * @param shards - Record mapping shard names to D1 database instances
- * @param customSchema - Optional custom schema SQL to use instead of default
+ * @param schema - Schema SQL to use
  * @returns Promise that resolves when schema is created on all shards
  * @throws {Error} If schema creation fails on any shard, with shard identification
  * @example
@@ -183,9 +114,9 @@ export async function createSchema(d1: D1Database, customSchema?: string): Promi
  * }
  * ```
  */
-export async function createSchemaAcrossShards(shards: Record<string, D1Database>, customSchema?: string): Promise<void> {
+export async function createSchemaAcrossShards(shards: Record<string, D1Database>, schema: string): Promise<void> {
 	const promises = Object.entries(shards).map(([shardName, db]) => {
-		return createSchema(db, customSchema).catch((error) => {
+		return createSchema(db, schema).catch((error) => {
 			throw new Error(`Failed to create schema on shard ${shardName}: ${error.message}`);
 		});
 	});
@@ -194,34 +125,24 @@ export async function createSchemaAcrossShards(shards: Record<string, D1Database
 }
 
 /**
- * Checks if the schema exists in a D1 database
- *
  * Performs a lightweight check to determine if the expected schema is present
- * in the database. Currently checks for the presence of the 'users' table as
- * an indicator that the full schema has been created.
+ * in the database.
  *
- * This is useful for:
- * - Conditional schema creation
- * - Health checks and monitoring
- * - Migration validation
- *
- * @public
  * @param d1 - The D1 database instance to check
+ * @param table - The name of the table to check
  * @returns Promise resolving to true if schema tables exist, false otherwise
  * @example
  * ```typescript
- * const hasSchema = await schemaExists(env.DB_NEW_SHARD);
+ * const hasSchema = await schemaExists(env.DB_NEW_SHARD, "users");
  * if (!hasSchema) {
- *   console.log('Creating schema on new shard...');
- *   await createSchema(env.DB_NEW_SHARD);
- * } else {
- *   console.log('Schema already exists, skipping creation');
+ *     console.log('Creating schema on new shard...');
+ *     await createSchema(env.DB_NEW_SHARD, usersSchema);
  * }
  * ```
  */
-export async function schemaExists(d1: D1Database): Promise<boolean> {
+export async function schemaExists(d1: D1Database, table: string): Promise<boolean> {
 	try {
-		const result = await (await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")).first();
+		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='?'").bind(table).first();
 		return result !== null;
 	} catch {
 		return false;
@@ -229,21 +150,14 @@ export async function schemaExists(d1: D1Database): Promise<boolean> {
 }
 
 /**
- * Drops all tables in a D1 database (use with caution!)
- *
  * Removes all tables that are part of the default CollegeDB schema from
  * the specified database. This is a destructive operation that cannot be undone.
  *
- * Tables dropped:
- * - posts (with all user content)
- * - users (with all user accounts)
- * - shard_mappings (with all routing information)
- *
- * ⚠️ **DANGER**: This operation permanently deletes all data in the affected
+ * **DANGER**: This operation permanently deletes all data in the affected
  * tables. Only use during development, testing, or complete system resets.
  *
- * @public
  * @param d1 - The D1 database instance to drop tables from
+ * @param tables - The table schemas to drop
  * @returns Promise that resolves when all tables are dropped
  * @example
  * ```typescript
@@ -254,12 +168,10 @@ export async function schemaExists(d1: D1Database): Promise<boolean> {
  * }
  * ```
  */
-export async function dropSchema(d1: D1Database): Promise<void> {
-	const tables = ['posts', 'users', 'shard_mappings'];
-
+export async function dropSchema(d1: D1Database, ...tables: string[]): Promise<void> {
 	for (const table of tables) {
 		try {
-			await (await d1.prepare(`DROP TABLE IF EXISTS ${table}`)).run();
+			await d1.prepare(`DROP TABLE IF EXISTS ${table}`).run();
 		} catch (error) {
 			console.error(`Failed to drop table ${table}:`, error);
 		}
@@ -267,13 +179,10 @@ export async function dropSchema(d1: D1Database): Promise<void> {
 }
 
 /**
- * Gets the list of tables in a D1 database
- *
  * Queries the SQLite system catalog to retrieve all user-created tables
  * in the database. This is useful for schema inspection, validation,
  * and debugging purposes.
  *
- * @public
  * @param d1 - The D1 database instance to inspect
  * @returns Promise resolving to array of table names, sorted alphabetically
  * @throws Returns empty array if query fails or database is inaccessible
@@ -291,7 +200,7 @@ export async function dropSchema(d1: D1Database): Promise<void> {
  */
 export async function listTables(d1: D1Database): Promise<string[]> {
 	try {
-		const result = await (await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")).all();
+		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
 		return result.results.map((row: any) => row.name as string);
 	} catch {
 		return [];
@@ -299,8 +208,6 @@ export async function listTables(d1: D1Database): Promise<string[]> {
 }
 
 /**
- * Migrates data from one shard to another
- *
  * Moves a single record from a source D1 database to a target D1 database.
  * This is typically used during shard rebalancing operations when data needs
  * to be redistributed across shards for load balancing.
@@ -315,11 +222,10 @@ export async function listTables(d1: D1Database): Promise<string[]> {
  * across databases. If the operation fails partway through, manual cleanup
  * may be required.
  *
- * @public
- * @param sourceDb - Source D1 database containing the record
- * @param targetDb - Target D1 database to receive the record
+ * @param source - Source D1 database containing the record
+ * @param target - Target D1 database to receive the record
  * @param primaryKey - Primary key of the record to migrate
- * @param tableName - Name of the table containing the record (defaults to 'users')
+ * @param tableName - Name of the table containing the record
  * @returns Promise that resolves when migration is complete
  * @throws {Error} If source record not found, schema creation fails, or database operations fail
  * @example
@@ -334,25 +240,19 @@ export async function listTables(d1: D1Database): Promise<string[]> {
  * }
  *
  * // Migrate a post between shards
- * await migrateRecord(sourceDb, targetDb, 'post-456', 'posts');
+ * await migrateRecord(source, target, 'post-456', 'posts');
  * ```
  */
-export async function migrateRecord(
-	sourceDb: D1Database,
-	targetDb: D1Database,
-	primaryKey: string,
-	tableName: string = 'users'
-): Promise<void> {
-	// Get the record from source
-	const sourceRecord = await (await sourceDb.prepare(`SELECT * FROM ${tableName} WHERE id = ?`)).bind(primaryKey).first();
+export async function migrateRecord(source: D1Database, target: D1Database, primaryKey: string, tableName: string): Promise<void> {
+	const sourceRecord = await source.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).bind(primaryKey).first();
 
 	if (!sourceRecord) {
 		throw new Error(`Record with primary key ${primaryKey} not found in source database`);
 	}
 
 	// Create schema if it doesn't exist in target
-	if (!(await schemaExists(targetDb))) {
-		await createSchema(targetDb);
+	if (!(await schemaExists(target, tableName))) {
+		await createSchema(target, tableName);
 	}
 
 	// Get column names
@@ -362,20 +262,20 @@ export async function migrateRecord(
 
 	// Insert into target database
 	const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
-	await (await targetDb.prepare(insertSQL)).bind(...values).run();
+	await target
+		.prepare(insertSQL)
+		.bind(...values)
+		.run();
 
 	// Delete from source database
-	await (await sourceDb.prepare(`DELETE FROM ${tableName} WHERE id = ?`)).bind(primaryKey).run();
+	await source.prepare(`DELETE FROM ${tableName} WHERE id = ?`).bind(primaryKey).run();
 }
 
 /**
- * Discovers primary keys in an existing database table
- *
  * Scans an existing table to find all primary keys that need to be mapped to shards.
  * This is useful when integrating CollegeDB with an existing database that already
  * contains data. The function assumes the table has an 'id' column as the primary key.
  *
- * @public
  * @param d1 - The D1 database instance to scan
  * @param tableName - Name of the table to discover primary keys from
  * @param primaryKeyColumn - Name of the primary key column (defaults to 'id')
@@ -393,7 +293,7 @@ export async function migrateRecord(
  */
 export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: string, primaryKeyColumn: string = 'id'): Promise<string[]> {
 	try {
-		const result = await (await d1.prepare(`SELECT ${primaryKeyColumn} FROM ${tableName}`)).all();
+		const result = await d1.prepare(`SELECT ${primaryKeyColumn} FROM ${tableName}`).all();
 		return result.results.map((row: any) => String(row[primaryKeyColumn]));
 	} catch (error) {
 		throw new Error(`Failed to discover primary keys in table ${tableName}: ${error}`);
@@ -401,13 +301,10 @@ export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: str
 }
 
 /**
- * Creates shard mappings for existing primary keys
- *
  * Takes a list of existing primary keys and creates shard mappings for them using
  * the specified allocation strategy. This allows existing data to be integrated
  * into the CollegeDB sharding system without data migration.
  *
- * @public
  * @param primaryKeys - Array of primary key values to create mappings for
  * @param shardBindings - Array of available shard binding names
  * @param strategy - Allocation strategy to use ('hash', 'round-robin', or 'random')
@@ -462,12 +359,22 @@ export async function createMappingsForExistingKeys(
 }
 
 /**
- * Validates that a table has a suitable primary key for CollegeDB
- *
+ * Represents the result of validating a table for sharding.
+ * Contains information about the table structure, primary key, record count,
+ * and any issues encountered during validation.
+ */
+export type ValidationResult = {
+	isValid: boolean;
+	tableName: string;
+	primaryKeyColumn: string;
+	recordCount: number;
+	issues: string[];
+};
+
+/**
  * Checks if a table exists and has a primary key column that can be used
  * for sharding. Returns information about the table structure and primary key.
  *
- * @public
  * @param d1 - The D1 database instance to check
  * @param tableName - Name of the table to validate
  * @param primaryKeyColumn - Expected primary key column name (defaults to 'id')
@@ -485,30 +392,13 @@ export async function createMappingsForExistingKeys(
  * }
  * ```
  */
-export async function validateTableForSharding(
-	d1: D1Database,
-	tableName: string,
-	primaryKeyColumn: string = 'id'
-): Promise<{
-	isValid: boolean;
-	tableName: string;
-	primaryKeyColumn: string;
-	recordCount: number;
-	issues: string[];
-}> {
+export async function validateTableForSharding(d1: D1Database, tableName: string, primaryKeyColumn: string): Promise<ValidationResult> {
 	const issues: string[] = [];
 	let recordCount = 0;
 
 	try {
 		// Check if table exists
-		const tableCheck = await (
-			await d1.prepare(`
-			SELECT name FROM sqlite_master
-			WHERE type='table' AND name=?
-		`)
-		)
-			.bind(tableName)
-			.first();
+		const tableCheck = await d1.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).bind(tableName).first();
 
 		if (!tableCheck) {
 			issues.push(`Table '${tableName}' does not exist`);
@@ -518,11 +408,11 @@ export async function validateTableForSharding(
 				primaryKeyColumn,
 				recordCount: 0,
 				issues
-			};
+			} satisfies ValidationResult;
 		}
 
 		// Check if primary key column exists
-		const columnCheck = await (await d1.prepare(`PRAGMA table_info(${tableName})`)).all();
+		const columnCheck = await d1.prepare(`PRAGMA table_info(${tableName})`).all();
 		const hasIdColumn = columnCheck.results.some((col: any) => col.name === primaryKeyColumn && col.pk === 1);
 
 		if (!hasIdColumn) {
@@ -530,7 +420,7 @@ export async function validateTableForSharding(
 		}
 
 		// Get record count
-		const countResult = await (await d1.prepare(`SELECT COUNT(*) as count FROM ${tableName}`)).first();
+		const countResult = await d1.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
 		recordCount = (countResult as any)?.count || 0;
 
 		if (recordCount === 0) {
@@ -546,17 +436,43 @@ export async function validateTableForSharding(
 		primaryKeyColumn,
 		recordCount,
 		issues
-	};
+	} satisfies ValidationResult;
 }
 
 /**
- * Performs a complete drop-in integration of an existing database
- *
+ * Configuration options for integrating an existing database with CollegeDB.
+ * Allows customization of which tables to process, primary key column,
+ * sharding strategy, and whether to add the shard_mappings table.
+ */
+export type IntegrationOptions = {
+	tables?: string[];
+	primaryKeyColumn?: string;
+	strategy?: ShardingStrategy;
+	addShardMappingsTable?: boolean;
+	dryRun?: boolean;
+};
+
+/**
+ * Represents the result of integrating an existing database with CollegeDB.
+ * Contains information about the success of the integration, shard name,
+ * number of tables processed, total records integrated, mappings created,
+ * and any issues encountered during the process.
+ */
+export type IntegrationResult = {
+	success: boolean;
+	shardName: string;
+	tablesProcessed: number;
+	totalRecords: number;
+	mappingsCreated: number;
+	issues: string[];
+};
+
+/**
+ * Performs a complete drop-in integration of an existing database.
  * This is the main function for integrating CollegeDB with an existing database
  * that already contains data. It discovers tables, validates them, creates shard
  * mappings, and optionally adds the shard_mappings table if needed.
  *
- * @public
  * @param d1 - The existing D1 database to integrate
  * @param shardName - The shard binding name for this database
  * @param mapper - KVShardMapper instance for storing mappings
@@ -580,22 +496,9 @@ export async function validateTableForSharding(
 export async function integrateExistingDatabase(
 	d1: D1Database,
 	shardName: string,
-	mapper: any, // KVShardMapper instance
-	options: {
-		tables?: string[];
-		primaryKeyColumn?: string;
-		strategy?: 'hash' | 'round-robin' | 'random';
-		addShardMappingsTable?: boolean;
-		dryRun?: boolean;
-	} = {}
-): Promise<{
-	success: boolean;
-	shardName: string;
-	tablesProcessed: number;
-	totalRecords: number;
-	mappingsCreated: number;
-	issues: string[];
-}> {
+	mapper: KVShardMapper,
+	options: IntegrationOptions = {}
+): Promise<IntegrationResult> {
 	const { tables, primaryKeyColumn = 'id', strategy = 'hash', addShardMappingsTable = true, dryRun = false } = options;
 
 	const issues: string[] = [];
@@ -620,15 +523,12 @@ export async function integrateExistingDatabase(
 					continue;
 				}
 
-				// Discover existing primary keys
 				const primaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
-
 				if (primaryKeys.length === 0) {
 					issues.push(`Table ${tableName} has no records to process`);
 					continue;
 				}
 
-				// Create shard mappings (all keys in this database go to this shard)
 				if (!dryRun) {
 					for (const primaryKey of primaryKeys) {
 						await mapper.setShardMapping(primaryKey, shardName);
@@ -643,20 +543,20 @@ export async function integrateExistingDatabase(
 			}
 		}
 
-		// Add shard_mappings table if requested and not in dry run
 		if (addShardMappingsTable && !dryRun) {
 			const hasMappingsTable = (await listTables(d1)).includes('shard_mappings');
 			if (!hasMappingsTable) {
-				await (
-					await d1.prepare(`
+				await d1
+					.prepare(
+						`
 					CREATE TABLE IF NOT EXISTS shard_mappings (
 						primary_key TEXT PRIMARY KEY,
 						shard_name TEXT NOT NULL,
 						created_at INTEGER NOT NULL,
 						updated_at INTEGER NOT NULL
-					);
-				`)
-				).run();
+					);`.trim()
+					)
+					.run();
 			}
 		}
 
@@ -691,7 +591,6 @@ export async function integrateExistingDatabase(
  * 3. If unmapped data is found, performs automatic integration
  * 4. Caches results to avoid repeated checks
  *
- * @public
  * @param d1 - The D1 database instance to check and potentially migrate
  * @param shardName - The shard binding name for this database
  * @param config - CollegeDB configuration containing KV and strategy
@@ -777,13 +676,13 @@ export async function autoDetectAndMigrate(
 
 				// Sample some primary keys to check if they're mapped
 				const sampleSize = Math.min(maxRecordsToCheck, validation.recordCount);
-				const sampleKeys = await (
-					await d1.prepare(`
+				const sampleKeys = await d1
+					.prepare(
+						`
 					SELECT ${primaryKeyColumn} FROM ${tableName}
 					ORDER BY ${primaryKeyColumn}
-					LIMIT ?
-				`)
-				)
+					LIMIT ?`.trim()
+					)
 					.bind(sampleSize)
 					.all();
 
@@ -799,9 +698,8 @@ export async function autoDetectAndMigrate(
 					}
 				}
 
-				// If we found unmapped keys, migrate all keys in this table
 				if (unmappedCount > 0) {
-					console.log(`🔄 Auto-migrating table ${tableName} in shard ${shardName} (${validation.recordCount} records)`);
+					console.log(`Auto-migrating table ${tableName} in shard ${shardName} (${validation.recordCount} records)`);
 
 					const allPrimaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
 
@@ -819,7 +717,7 @@ export async function autoDetectAndMigrate(
 					tablesProcessed++;
 					migrationPerformed = true;
 
-					console.log(`✅ Auto-migrated ${newMappings} records from table ${tableName}`);
+					console.log(`Auto-migrated ${newMappings} records from table ${tableName}`);
 				}
 			} catch (error) {
 				issues.push(`Auto-migration failed for table ${tableName}: ${error}`);
@@ -833,16 +731,17 @@ export async function autoDetectAndMigrate(
 			// Add shard_mappings table if it doesn't exist
 			const hasMappingsTable = allTables.includes('shard_mappings');
 			if (!hasMappingsTable) {
-				await (
-					await d1.prepare(`
-					CREATE TABLE IF NOT EXISTS shard_mappings (
+				await d1
+					.prepare(
+						`CREATE TABLE IF NOT EXISTS shard_mappings (
 						primary_key TEXT PRIMARY KEY,
 						shard_name TEXT NOT NULL,
 						created_at INTEGER NOT NULL,
 						updated_at INTEGER NOT NULL
 					);
-				`)
-				).run();
+				`
+					)
+					.run();
 			}
 		}
 
@@ -850,7 +749,7 @@ export async function autoDetectAndMigrate(
 		migrationStatusCache.set(cacheKey, true);
 
 		if (migrationPerformed) {
-			console.log(`🎉 Auto-migration completed for shard ${shardName}: ${recordsMigrated} records from ${tablesProcessed} tables`);
+			console.log(`Auto-migration completed for shard ${shardName}: ${recordsMigrated} records from ${tablesProcessed} tables`);
 		}
 	} catch (error) {
 		issues.push(`Auto-migration error: ${error}`);
@@ -866,13 +765,10 @@ export async function autoDetectAndMigrate(
 }
 
 /**
- * Checks if a shard requires automatic migration
- *
  * Performs a lightweight check to determine if a database contains
  * existing data that hasn't been mapped to the sharding system.
  * This is used internally to trigger automatic migration.
  *
- * @public
  * @param d1 - The D1 database instance to check
  * @param shardName - The shard binding name
  * @param config - CollegeDB configuration
@@ -894,11 +790,20 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
 	}
 
 	try {
+		// Check if shard_mappings table exists as indicator of previous migration
+		const tables = await listTables(d1);
+		const hasShardMappingsTable = tables.includes('shard_mappings');
+
+		if (hasShardMappingsTable) {
+			// If shard_mappings table exists, this database has been processed before
+			migrationStatusCache.set(cacheKey, true);
+			return false;
+		}
+
 		const { KVShardMapper } = await import('./kvmap.js');
 		const mapper = new KVShardMapper(config.kv);
 
 		// Quick check: look for any table with data
-		const tables = await listTables(d1);
 		const dataTableNames = tables.filter(
 			(table) => table !== 'shard_mappings' && !table.startsWith('sqlite_') && table !== 'sqlite_sequence'
 		);
@@ -907,12 +812,12 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
 			// Check first 3 tables only
 			try {
 				// Check if table has records
-				const countResult = await (await d1.prepare(`SELECT COUNT(*) as count FROM ${tableName} LIMIT 1`)).first();
+				const countResult = await d1.prepare(`SELECT COUNT(*) as count FROM ${tableName} LIMIT 1`).first();
 				const recordCount = (countResult as any)?.count || 0;
 
 				if (recordCount > 0) {
 					// Sample one record to see if it's mapped
-					const sampleRecord = await (await d1.prepare(`SELECT id FROM ${tableName} LIMIT 1`)).first();
+					const sampleRecord = await d1.prepare(`SELECT id FROM ${tableName} LIMIT 1`).first();
 					if (sampleRecord) {
 						const primaryKey = String((sampleRecord as any).id);
 						const mapping = await mapper.getShardMapping(primaryKey);
@@ -939,7 +844,6 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
  * Resets the internal cache used to track which databases have been
  * checked for migration. Useful for testing or forcing re-checks.
  *
- * @public
  * @example
  * ```typescript
  * // Force re-check of all databases

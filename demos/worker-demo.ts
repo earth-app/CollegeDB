@@ -60,6 +60,61 @@ import {
 } from '../src/index.js';
 import type { Env } from '../src/types.js';
 
+// Demo schema for college database
+const COLLEGE_SCHEMA = `
+	CREATE TABLE IF NOT EXISTS colleges (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		state TEXT NOT NULL,
+		enrollment INTEGER DEFAULT 0,
+		founded INTEGER,
+		type TEXT DEFAULT 'public',
+		created_at INTEGER DEFAULT (strftime('%s', 'now'))
+	);
+
+	CREATE TABLE IF NOT EXISTS students (
+		id TEXT PRIMARY KEY,
+		college_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		major TEXT,
+		year INTEGER DEFAULT 1,
+		gpa REAL DEFAULT 0.0,
+		enrolled_at INTEGER DEFAULT (strftime('%s', 'now')),
+		FOREIGN KEY (college_id) REFERENCES colleges(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS courses (
+		id TEXT PRIMARY KEY,
+		college_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		code TEXT NOT NULL,
+		credits INTEGER DEFAULT 3,
+		department TEXT,
+		FOREIGN KEY (college_id) REFERENCES colleges(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS enrollments (
+		id TEXT PRIMARY KEY,
+		student_id TEXT NOT NULL,
+		course_id TEXT NOT NULL,
+		semester TEXT NOT NULL,
+		year INTEGER NOT NULL,
+		grade TEXT,
+		enrolled_at INTEGER DEFAULT (strftime('%s', 'now')),
+		FOREIGN KEY (student_id) REFERENCES students(id),
+		FOREIGN KEY (course_id) REFERENCES courses(id),
+		UNIQUE(student_id, course_id, semester, year)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_students_college_id ON students(college_id);
+	CREATE INDEX IF NOT EXISTS idx_courses_college_id ON courses(college_id);
+	CREATE INDEX IF NOT EXISTS idx_enrollments_student_id ON enrollments(student_id);
+	CREATE INDEX IF NOT EXISTS idx_enrollments_course_id ON enrollments(course_id);
+	CREATE INDEX IF NOT EXISTS idx_colleges_state ON colleges(state);
+	CREATE INDEX IF NOT EXISTS idx_students_major ON students(major);
+`;
+
 // Export the Durable Object class
 export { ShardCoordinator };
 
@@ -246,10 +301,13 @@ curl https://your-worker.dev/api/stats
  */
 async function handleInit(env: Env): Promise<Response> {
 	try {
-		await createSchemaAcrossShards({
-			'db-east': env['db-east'],
-			'db-west': env['db-west']
-		});
+		await createSchemaAcrossShards(
+			{
+				'db-east': env['db-east'],
+				'db-west': env['db-west']
+			},
+			COLLEGE_SCHEMA
+		);
 
 		return new Response(
 			JSON.stringify({
@@ -477,7 +535,7 @@ async function handleRebalance(request: Request): Promise<Response> {
 		primaryKey: string;
 	};
 
-	await reassignShard(primaryKey, toShard);
+	await reassignShard(primaryKey, toShard, 'students');
 
 	return new Response(
 		JSON.stringify({

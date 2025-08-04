@@ -5,8 +5,8 @@
  * using D1 and KV. Routes queries to the correct D1 database instance using primary
  * key mappings stored in Cloudflare KV.
  *
- * @author CollegeDB Team
- * @version 1.0.0
+ * @author Gregory Mitchell
+ * @license MIT
  */
 
 // Export main API functions
@@ -41,8 +41,11 @@ export {
 	listTables,
 	migrateRecord,
 	schemaExists,
-	validateTableForSharding
+	validateTableForSharding,
+	type IntegrationOptions,
+	type IntegrationResult,
+	type ValidationResult
 } from './migrations.js';
 
 // Export types
-export type { CollegeDBConfig, Env, QueryResult, ShardCoordinatorState, ShardMapping, ShardStats, ShardStrategy } from './types.js';
+export type { CollegeDBConfig, Env, QueryResult, ShardCoordinatorState, ShardMapping, ShardStats, ShardingStrategy } from './types.js';

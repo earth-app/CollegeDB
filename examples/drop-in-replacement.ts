@@ -153,7 +153,7 @@ async function handleValidation(env: Env): Promise<Response> {
 		for (const table of tables) {
 			if (table === 'shard_mappings') continue; // Skip internal table
 
-			const validation = await validateTableForSharding(db, table);
+			const validation = await validateTableForSharding(db, table, 'id');
 			tableValidations.push(validation);
 
 			if (validation.isValid) {
