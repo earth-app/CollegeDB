@@ -1,0 +1,24 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 2%
+    patch:
+      default:
+        target: 75%
+        threshold: 5%
+
+comment:
+  layout: 'condensed_header, condensed_files, condensed_footer'
+  require_changes: true
+  require_base: true
+  require_head: true
+
+ignore:
+  - 'test/**/*'
+  - 'coverage/**/*'
+  - '**/*.test.ts'
+  - '**/*.spec.ts'
+  - 'vitest.config.ts'
+  - 'wrangler.toml'
