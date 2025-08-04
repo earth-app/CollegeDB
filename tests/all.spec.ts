@@ -499,15 +499,15 @@ describe('CollegeDB', () => {
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 
 			// Add some existing data
-			await (mockDB1 as any)
+			await mockDB1
 				.prepare('INSERT INTO users (id, name, email) VALUES (?, ?, ?)')
 				.bind('existing-user-1', 'John Doe', 'john@example.com')
 				.run();
-			await (mockDB1 as any)
+			await mockDB1
 				.prepare('INSERT INTO users (id, name, email) VALUES (?, ?, ?)')
 				.bind('existing-user-2', 'Jane Smith', 'jane@example.com')
 				.run();
-			await (mockDB1 as any)
+			await mockDB1
 				.prepare('INSERT INTO posts (id, user_id, title, content) VALUES (?, ?, ?, ?)')
 				.bind('post-1', 'existing-user-1', 'First Post', 'Hello World')
 				.run();
