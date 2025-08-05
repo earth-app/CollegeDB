@@ -58,4 +58,3 @@ jobs:
           body: ${{ steps.changelog.outputs.changelog || github.event.inputs.changelog }}
           draft: false
           prerelease: false
-          prerelease: false
