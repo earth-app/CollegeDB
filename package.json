@@ -1,12 +1,20 @@
 {
   "name": "@earth-app/collegedb",
-  "module": "src/index.ts",
+  "module": "dist/index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "type": "module",
   "version": "1.0.0",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
+    "build": "bun build src/index.ts --outdir=dist --target=node --format=esm --minify --sourcemap=linked && bunx tsc --project tsconfig.build.json",
     "docs:build": "bunx typedoc src --out ./typedoc",
     "prettier": "bunx prettier --write .",
     "prettier:check": "bunx prettier --check .",
