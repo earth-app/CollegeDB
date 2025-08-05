@@ -13,11 +13,26 @@ jobs:
 
     permissions:
       contents: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+      - name: Publish to NPM
+        run: bun publish --registry https://registry.npmjs.org
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to GitHub Packages
+        run: bun publish --registry https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract Version from package.json
         run: |
           VERSION=$(node -p "require('./package.json').version")
@@ -39,7 +54,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: mantle v${{ env.VERSION }}
+          name: CollegeDB v${{ env.VERSION }}
           body: ${{ steps.changelog.outputs.changelog || github.event.inputs.changelog }}
           draft: false
+          prerelease: false
           prerelease: false

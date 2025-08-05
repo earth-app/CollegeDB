@@ -1,7 +1,11 @@
 {
-  "name": "collegedb",
+  "name": "@earth-app/collegedb",
   "module": "src/index.ts",
   "type": "module",
+  "version": "1.0.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "docs:build": "bunx typedoc src --out ./typedoc",
     "prettier": "bunx prettier --write .",
