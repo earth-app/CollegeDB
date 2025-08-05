@@ -1,16 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+	all,
 	autoDetectAndMigrate,
 	checkMigrationNeeded,
 	clearMigrationCache,
-	deleteByPrimaryKey,
+	first,
 	getShardStats,
 	initialize,
-	insert,
 	listKnownShards,
 	reassignShard,
-	selectByPrimaryKey,
-	updateByPrimaryKey
+	run
 } from '../src/index.js';
 import type { CollegeDBConfig } from '../src/types.js';
 
@@ -381,9 +380,9 @@ describe('CollegeDB', () => {
 			const insertSQL = 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)';
 			const selectSQL = 'SELECT * FROM users WHERE id = ?';
 
-			await insert(primaryKey, insertSQL, [primaryKey, 'Alice', 'alice@example.com']);
+			await run(primaryKey, insertSQL, [primaryKey, 'Alice', 'alice@example.com']);
 
-			const result = await selectByPrimaryKey(primaryKey, selectSQL, [primaryKey]);
+			const result = await all(primaryKey, selectSQL, [primaryKey]);
 
 			expect(result.success).toBe(true);
 			expect(result.results).toHaveLength(1);
@@ -398,13 +397,13 @@ describe('CollegeDB', () => {
 			const primaryKey = 'user-456';
 
 			// Insert first
-			await insert(primaryKey, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [primaryKey, 'Bob', 'bob@example.com']);
+			await run(primaryKey, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [primaryKey, 'Bob', 'bob@example.com']);
 
 			// Update
-			await updateByPrimaryKey(primaryKey, 'UPDATE users SET name = ? WHERE id = ?', ['Robert', primaryKey]);
+			await run(primaryKey, 'UPDATE users SET name = ? WHERE id = ?', ['Robert', primaryKey]);
 
 			// Verify update
-			const result = await selectByPrimaryKey(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
+			const result = await all(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
 
 			expect(result.results[0]).toMatchObject({
 				id: primaryKey,
@@ -417,17 +416,17 @@ describe('CollegeDB', () => {
 			const primaryKey = 'user-789';
 
 			// Insert first
-			await insert(primaryKey, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [primaryKey, 'Charlie', 'charlie@example.com']);
+			await run(primaryKey, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [primaryKey, 'Charlie', 'charlie@example.com']);
 
 			// Verify it exists
-			let result = await selectByPrimaryKey(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
+			let result = await all(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
 			expect(result.results).toHaveLength(1);
 
 			// Delete
-			await deleteByPrimaryKey(primaryKey, 'DELETE FROM users WHERE id = ?', [primaryKey]);
+			await run(primaryKey, 'DELETE FROM users WHERE id = ?', [primaryKey]);
 
 			// Verify it's gone
-			result = await selectByPrimaryKey(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
+			result = await all(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
 			expect(result.results).toHaveLength(0);
 		});
 	});
@@ -450,7 +449,7 @@ describe('CollegeDB', () => {
 			const primaryKey = 'user-reassign';
 
 			// First insert to establish mapping
-			await insert(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Test User']);
+			await run(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Test User']);
 
 			// Reassign to different shard
 			await expect(reassignShard(primaryKey, 'db-west', 'users')).resolves.toBeUndefined();
@@ -479,13 +478,14 @@ describe('CollegeDB', () => {
 			const primaryKey = 'consistent-user';
 
 			// Insert record
-			await insert(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Consistent User']);
+			await run(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Consistent User']);
 
 			// Multiple selects should hit the same shard
 			for (let i = 0; i < 5; i++) {
-				const result = await selectByPrimaryKey(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
-				expect(result.success).toBe(true);
-				expect(result.results).toHaveLength(1);
+				const result = await first(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
+				expect(result).toBeDefined();
+				expect(result!.id).toBe(primaryKey);
+				expect(result!.name).toBe('Consistent User');
 			}
 		});
 
@@ -493,15 +493,16 @@ describe('CollegeDB', () => {
 			const keys = ['user-1', 'user-2', 'user-3', 'user-4', 'user-5'];
 
 			for (const key of keys) {
-				await insert(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, `User ${key}`]);
+				await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, `User ${key}`]);
 			}
 
 			// Verify all records can be retrieved
 			for (const key of keys) {
-				const result = await selectByPrimaryKey(key, 'SELECT * FROM users WHERE id = ?', [key]);
+				const result = await all(key, 'SELECT * FROM users WHERE id = ?', [key]);
 				expect(result.success).toBe(true);
 				expect(result.results).toHaveLength(1);
-				expect(result.results[0].name).toBe(`User ${key}`);
+				expect(result.results[0]).toBeDefined();
+				expect(result.results[0]!.name).toBe(`User ${key}`);
 			}
 		});
 	});
@@ -603,11 +604,13 @@ describe('CollegeDB', () => {
 			});
 
 			// Query existing data
-			const result = await selectByPrimaryKey('existing-user-1', 'SELECT * FROM users WHERE id = ?', ['existing-user-1']);
+			const result = await all('existing-user-1', 'SELECT * FROM users WHERE id = ?', ['existing-user-1']);
 			expect(result.success).toBe(true);
 			expect(result.results).toHaveLength(1);
-			expect(result.results[0].name).toBe('John Doe');
-			expect(result.results[0].email).toBe('john@example.com');
+			expect(result.results[0]).toBeDefined();
+			expect(result.results[0]!.id).toBe('existing-user-1');
+			expect(result.results[0]!.name).toBe('John Doe');
+			expect(result.results[0]!.email).toBe('john@example.com');
 		});
 
 		it('should handle dry run mode', async () => {
@@ -724,10 +727,12 @@ describe('CollegeDB', () => {
 			await new Promise((resolve) => setTimeout(resolve, 100));
 
 			// Try to query existing data - should work after automatic migration
-			const result = await selectByPrimaryKey('auto-user-1', 'SELECT * FROM users WHERE id = ?', ['auto-user-1']);
+			const result = await all('auto-user-1', 'SELECT * FROM users WHERE id = ?', ['auto-user-1']);
 			expect(result.success).toBe(true);
 			expect(result.results).toHaveLength(1);
-			expect(result.results[0].name).toBe('John Auto');
+			expect(result.results[0]).toBeDefined();
+			expect(result.results[0]!.id).toBe('auto-user-1');
+			expect(result.results[0]!.name).toBe('John Auto');
 		});
 
 		it('should handle databases with no data gracefully', async () => {

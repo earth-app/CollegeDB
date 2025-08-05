@@ -24,7 +24,7 @@
  * @since 1.0.0
  */
 
-import { getShardStats, initialize, insert, selectByPrimaryKey, updateByPrimaryKey } from '../src/index.js';
+import { first, getShardStats, initialize, run } from '../src/index.js';
 import type { Env } from '../src/types.js';
 
 export default {
@@ -94,14 +94,14 @@ async function handleAutomaticDemo(env: Env): Promise<Response> {
 
 	for (const userId of sampleExistingIds) {
 		try {
-			const result = await selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+			const result = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
 
-			if (result.results.length > 0) {
+			if (result) {
 				results.push({
 					type: 'existing_data',
 					userId,
 					found: true,
-					data: result.results[0],
+					data: result,
 					message: 'Existing data automatically accessible!'
 				});
 			} else {
@@ -129,16 +129,16 @@ async function handleAutomaticDemo(env: Env): Promise<Response> {
 
 	for (const user of newUsers) {
 		try {
-			await insert(user.id, 'INSERT OR REPLACE INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
+			await run(user.id, 'INSERT OR REPLACE INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
 
 			// Immediately query it back
-			const result = await selectByPrimaryKey(user.id, 'SELECT * FROM users WHERE id = ?', [user.id]);
+			const result = await first(user.id, 'SELECT * FROM users WHERE id = ?', [user.id]);
 
 			results.push({
 				type: 'new_data',
 				userId: user.id,
 				action: 'inserted_and_retrieved',
-				data: result.results[0],
+				data: result,
 				message: 'New data automatically distributed and queryable!'
 			});
 		} catch (error) {
@@ -152,20 +152,20 @@ async function handleAutomaticDemo(env: Env): Promise<Response> {
 
 	// Step 4: Update existing data if any was found
 	const existingUser = results.find((r) => r.type === 'existing_data' && r.found);
-	if (existingUser) {
+	if (existingUser && existingUser.data) {
 		try {
-			await updateByPrimaryKey(existingUser.userId, 'UPDATE users SET name = ? WHERE id = ?', [
+			await run(existingUser.userId, 'UPDATE users SET name = ? WHERE id = ?', [
 				`${existingUser.data.name} (Updated)`,
 				existingUser.userId
 			]);
 
-			const updatedResult = await selectByPrimaryKey(existingUser.userId, 'SELECT * FROM users WHERE id = ?', [existingUser.userId]);
+			const updatedResult = await first(existingUser.userId, 'SELECT * FROM users WHERE id = ?', [existingUser.userId]);
 
 			results.push({
 				type: 'updated_data',
 				userId: existingUser.userId,
 				action: 'updated_existing',
-				data: updatedResult.results[0],
+				data: updatedResult,
 				message: 'Existing data successfully updated through sharding!'
 			});
 		} catch (error) {

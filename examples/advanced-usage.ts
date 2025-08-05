@@ -37,16 +37,7 @@
  * @since 1.0.0
  */
 
-import {
-	createSchema,
-	getShardStats,
-	initialize,
-	insert,
-	listKnownShards,
-	queryOnShard,
-	reassignShard,
-	selectByPrimaryKey
-} from '../src/index.js';
+import { allShard, createSchema, first, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index.js';
 import type { CollegeDBConfig, Env } from '../src/types.js';
 
 // Example schema for advanced usage scenarios
@@ -185,7 +176,7 @@ async function handleLoadTest(): Promise<Response> {
 		for (let j = 0; j < batchSize && i + j < userCount; j++) {
 			const userId = `load-test-user-${i + j}`;
 			batch.push(
-				insert(userId, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [
+				run(userId, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [
 					userId,
 					`Load Test User ${i + j}`,
 					`user${i + j}@loadtest.com`
@@ -204,7 +195,7 @@ async function handleLoadTest(): Promise<Response> {
 	for (let i = 0; i < userCount; i += 5) {
 		// Sample every 5th user
 		const userId = `load-test-user-${i}`;
-		readPromises.push(selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]));
+		readPromises.push(first(userId, 'SELECT * FROM users WHERE id = ?', [userId]));
 	}
 	await Promise.all(readPromises);
 	const readTime = Date.now() - readStartTime;
@@ -321,7 +312,7 @@ async function handleCrossShardQuery(config: CollegeDBConfig): Promise<Response>
 	// Query each shard directly for aggregate operations
 	for (const [shardName, _] of Object.entries(config.shards)) {
 		try {
-			const result = await queryOnShard(shardName, 'SELECT COUNT(*) as user_count FROM users', []);
+			const result = await allShard(shardName, 'SELECT COUNT(*) as user_count FROM users', []);
 			results.push({
 				shard: shardName,
 				userCount: result.results[0]?.user_count || 0
@@ -336,7 +327,7 @@ async function handleCrossShardQuery(config: CollegeDBConfig): Promise<Response>
 		}
 	}
 
-	const totalUsers = results.reduce((sum, r) => sum + (r.userCount || 0), 0);
+	const totalUsers = results.reduce((sum, r) => sum + (typeof r.userCount === 'number' ? r.userCount : 0), 0);
 
 	return new Response(
 		JSON.stringify({
@@ -357,10 +348,10 @@ async function handleErrorRecovery(): Promise<Response> {
 
 	// Test 1: Query non-existent user
 	try {
-		const result = await selectByPrimaryKey('non-existent-user', 'SELECT * FROM users WHERE id = ?', ['non-existent-user']);
+		const result = await first('non-existent-user', 'SELECT * FROM users WHERE id = ?', ['non-existent-user']);
 		tests.push({
 			test: 'Query non-existent user',
-			passed: result.results.length === 0,
+			passed: !result,
 			details: 'Should return empty results'
 		});
 	} catch (error) {
@@ -389,7 +380,7 @@ async function handleErrorRecovery(): Promise<Response> {
 
 	// Test 3: Malformed SQL
 	try {
-		await selectByPrimaryKey('test-user', 'INVALID SQL STATEMENT', []);
+		await run('test-user', 'INVALID SQL STATEMENT', []);
 		tests.push({
 			test: 'Malformed SQL',
 			passed: false,
@@ -432,7 +423,7 @@ async function handleDemo(): Promise<Response> {
 	// Insert users and track which shard they go to
 	const userPlacements = [];
 	for (const user of demoUsers) {
-		await insert(user.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
+		await run(user.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
 
 		// This would require access to the KV to determine actual shard
 		userPlacements.push({

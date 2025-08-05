@@ -40,7 +40,7 @@ npm install collegedb
 ## Basic Usage
 
 ```typescript
-import { initialize, createSchema, insert, selectByPrimaryKey } from 'collegedb';
+import { initialize, createSchema, run, first } from 'collegedb';
 
 // Initialize with your Cloudflare bindings (existing databases work automatically!)
 initialize({
@@ -57,17 +57,17 @@ initialize({
 await createSchema(env['db-new-shard']);
 
 // Insert data (automatically routed to appropriate shard)
-await insert('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Alice Johnson', 'alice@example.com']);
+await run('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Alice Johnson', 'alice@example.com']);
 
 // Query data (automatically routed to correct shard, works with existing data!)
-const result = await selectByPrimaryKey('existing-user-456', 'SELECT * FROM users WHERE id = ?', ['existing-user-456']);
+const result = await first<User>('existing-user-456', 'SELECT * FROM users WHERE id = ?', ['existing-user-456']);
 
-console.log(result.results[0]); // User data from existing database
+console.log(result); // User data from existing database
 ```
 
-## 🔄 Drop-in Replacement for Existing Databases
+## Drop-in Replacement for Existing Databases
 
-CollegeDB supports **seamless, automatic integration** with existing D1 databases that already contain data. Simply add your existing databases as shards in the configuration - CollegeDB will automatically detect existing data and create the necessary shard mappings **without requiring any manual migration steps**.
+CollegeDB supports **seamless, automatic integration** with existing D1 databases that already contain data. Simply add your existing databases as shards in the configuration. CollegeDB will automatically detect existing data and create the necessary shard mappings **without requiring any manual migration steps**.
 
 ### Requirements for Drop-in Replacement
 
@@ -77,7 +77,7 @@ CollegeDB supports **seamless, automatic integration** with existing D1 database
 4. **KV Namespace**: A Cloudflare KV namespace for storing shard mappings
 
 ```typescript
-import { initialize, selectByPrimaryKey, insert } from 'collegedb';
+import { initialize, first, run } from 'collegedb';
 
 // Add your existing databases as shards - that's it!
 initialize({
@@ -91,10 +91,10 @@ initialize({
 });
 
 // Existing data works immediately! 🎉
-const existingUser = await selectByPrimaryKey('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
+const existingUser = await first('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
 
 // New data gets distributed automatically
-await insert('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
+await run('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
 ```
 
 **That's it!** No migration scripts, no manual mapping creation, no downtime. Your existing data is immediately accessible through CollegeDB's sharding system.
@@ -169,7 +169,7 @@ if (result.success) {
 After integration, initialize CollegeDB with your existing databases as shards:
 
 ```typescript
-import { initialize } from 'collegedb';
+import { initialize, first } from 'collegedb';
 
 // Include existing databases as shards
 initialize({
@@ -184,7 +184,7 @@ initialize({
 });
 
 // Existing data is now automatically routed!
-const user = await selectByPrimaryKey('existing-user-123', 'SELECT * FROM users WHERE id = ?', ['existing-user-123']);
+const user = await first('existing-user-123', 'SELECT * FROM users WHERE id = ?', ['existing-user-123']);
 ```
 
 ### Complete Drop-in Example
@@ -192,7 +192,7 @@ const user = await selectByPrimaryKey('existing-user-123', 'SELECT * FROM users 
 The simplest possible integration - just add your existing databases:
 
 ```typescript
-import { initialize, selectByPrimaryKey, insert } from 'collegedb';
+import { initialize, first, run } from 'collegedb';
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -208,10 +208,11 @@ export default {
 		});
 
 		// Step 2: Use existing data immediately - no migration needed!
-		const existingUser = await selectByPrimaryKey('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
+		// Supports typed queries, inserts, updates, deletes, etc.
+		const existingUser = await first<User>('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
 
 		// Step 3: New data gets distributed automatically
-		await insert('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
+		await run('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
 
 		return new Response(
 			JSON.stringify({
@@ -313,17 +314,17 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 
 ## 📚 API Reference
 
-| Function                                 | Description                             | Parameters              |
-| ---------------------------------------- | --------------------------------------- | ----------------------- |
-| `initialize(config)`                     | Initialize CollegeDB with configuration | `CollegeDBConfig`       |
-| `createSchema(d1)`                       | Create database schema on a D1 instance | `D1Database`            |
-| `insert(key, sql, bindings)`             | Insert record using primary key routing | `string, string, any[]` |
-| `selectByPrimaryKey(key, sql, bindings)` | Select records by primary key           | `string, string, any[]` |
-| `updateByPrimaryKey(key, sql, bindings)` | Update records by primary key           | `string, string, any[]` |
-| `deleteByPrimaryKey(key, sql, bindings)` | Delete records by primary key           | `string, string, any[]` |
-| `reassignShard(key, newShard)`           | Move primary key to different shard     | `string, string`        |
-| `listKnownShards()`                      | Get list of available shards            | `void`                  |
-| `getShardStats()`                        | Get statistics for all shards           | `void`                  |
+| Function                       | Description                                  | Parameters              |
+| ------------------------------ | -------------------------------------------- | ----------------------- |
+| `initialize(config)`           | Initialize CollegeDB with configuration      | `CollegeDBConfig`       |
+| `createSchema(d1)`             | Create database schema on a D1 instance      | `D1Database`            |
+| `prepare(key, sql)`            | Prepare a SQL statement for execution        | `string, string`        |
+| `run(key, sql, bindings)`      | Execute a SQL query with primary key routing | `string, string, any[]` |
+| `first(key, sql, bindings)`    | Execute a SQL query and return first result  | `string, string, any[]` |
+| `all(key, sql, bindings)`      | Execute a SQL query and return all results   | `string, string, any[]` |
+| `reassignShard(key, newShard)` | Move primary key to different shard          | `string, string`        |
+| `listKnownShards()`            | Get list of available shards                 | `void`                  |
+| `getShardStats()`              | Get statistics for all shards                | `void`                  |
 
 ### Drop-in Replacement Functions
 

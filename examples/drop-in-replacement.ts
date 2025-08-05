@@ -27,11 +27,11 @@
  */
 
 import {
+	all,
 	discoverExistingPrimaryKeys,
 	initialize,
 	integrateExistingDatabase,
 	listTables,
-	selectByPrimaryKey,
 	validateTableForSharding
 } from '../src/index.js';
 import { KVShardMapper } from '../src/kvmap.js';
@@ -222,7 +222,7 @@ async function handleDemo(env: Env): Promise<Response> {
 
 	for (const userId of sampleUserIds) {
 		try {
-			const result = await selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+			const result = await all(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
 
 			results.push({
 				userId,

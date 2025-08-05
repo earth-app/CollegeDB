@@ -354,7 +354,7 @@ export class KVShardMapper {
 	 */
 	async clearAllMappings(): Promise<void> {
 		const list = await this.kv.list({ prefix: SHARD_MAPPING_PREFIX });
-		const deletePromises = list.keys.map((key) => this.kv.delete(key.name));
-		await Promise.all(deletePromises);
+		const promises = list.keys.map((key) => this.kv.delete(key.name));
+		await Promise.all(promises);
 	}
 }

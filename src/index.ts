@@ -11,17 +11,17 @@
 
 // Export main API functions
 export {
+	all,
+	allShard,
 	createSchema,
-	deleteByPrimaryKey,
+	first,
 	flush,
 	getShardStats,
 	initialize,
-	insert,
 	listKnownShards,
-	queryOnShard,
+	prepare,
 	reassignShard,
-	selectByPrimaryKey,
-	updateByPrimaryKey
+	run
 } from './router.js';
 
 // Export utility classes
@@ -48,4 +48,4 @@ export {
 } from './migrations.js';
 
 // Export types
-export type { CollegeDBConfig, Env, QueryResult, ShardCoordinatorState, ShardMapping, ShardStats, ShardingStrategy } from './types.js';
+export type { CollegeDBConfig, Env, ShardCoordinatorState, ShardMapping, ShardStats, ShardingStrategy } from './types.js';

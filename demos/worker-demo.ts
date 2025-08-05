@@ -46,18 +46,7 @@
 
 import type { ExecutionContext } from '@cloudflare/workers-types';
 import { ShardCoordinator } from '../src/durable.js';
-import {
-	createSchemaAcrossShards,
-	deleteByPrimaryKey,
-	flush,
-	getShardStats,
-	initialize,
-	insert,
-	listKnownShards,
-	reassignShard,
-	selectByPrimaryKey,
-	updateByPrimaryKey
-} from '../src/index.js';
+import { createSchemaAcrossShards, first, flush, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index.js';
 import type { Env } from '../src/types.js';
 
 // Demo schema for college database
@@ -359,7 +348,7 @@ async function handleCreateUser(request: Request): Promise<Response> {
 		);
 	}
 
-	await insert(userData.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [userData.id, userData.name, userData.email || null]);
+	await run(userData.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [userData.id, userData.name, userData.email || null]);
 
 	return new Response(
 		JSON.stringify({
@@ -387,9 +376,9 @@ async function handleGetUser(url: URL): Promise<Response> {
 		);
 	}
 
-	const result = await selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+	const result = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
 
-	if (result.results.length === 0) {
+	if (!result) {
 		return new Response(
 			JSON.stringify({
 				error: 'User not found'
@@ -403,7 +392,7 @@ async function handleGetUser(url: URL): Promise<Response> {
 
 	return new Response(
 		JSON.stringify({
-			user: result.results[0]
+			user: result
 		}),
 		{
 			headers: { 'Content-Type': 'application/json' }
@@ -427,9 +416,9 @@ async function handleUpdateUser(request: Request): Promise<Response> {
 	}
 
 	// Check if user exists first
-	const existing = await selectByPrimaryKey(userData.id, 'SELECT * FROM users WHERE id = ?', [userData.id]);
+	const existing = await first(userData.id, 'SELECT * FROM users WHERE id = ?', [userData.id]);
 
-	if (existing.results.length === 0) {
+	if (!existing) {
 		return new Response(
 			JSON.stringify({
 				error: 'User not found'
@@ -441,7 +430,7 @@ async function handleUpdateUser(request: Request): Promise<Response> {
 		);
 	}
 
-	await updateByPrimaryKey(userData.id, 'UPDATE users SET name = COALESCE(?, name), email = COALESCE(?, email) WHERE id = ?', [
+	await run(userData.id, 'UPDATE users SET name = COALESCE(?, name), email = COALESCE(?, email) WHERE id = ?', [
 		userData.name,
 		userData.email,
 		userData.id
@@ -472,7 +461,7 @@ async function handleDeleteUser(url: URL): Promise<Response> {
 		);
 	}
 
-	await deleteByPrimaryKey(userId, 'DELETE FROM users WHERE id = ?', [userId]);
+	await run(userId, 'DELETE FROM users WHERE id = ?', [userId]);
 
 	return new Response(
 		JSON.stringify({

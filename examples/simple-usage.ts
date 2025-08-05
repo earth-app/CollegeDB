@@ -25,7 +25,7 @@
  * @since 1.0.0
  */
 
-import { createSchema, deleteByPrimaryKey, initialize, insert, selectByPrimaryKey, updateByPrimaryKey } from '../src/index.js';
+import { createSchema, first, initialize, run } from '../src/index.js';
 import type { Env } from '../src/types.js';
 
 // Example schema for a simple user and posts system
@@ -70,24 +70,20 @@ export default {
 
 			// Example 1: Insert a new user
 			console.log('📝 Inserting user...');
-			await insert('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Alice Johnson', 'alice@example.com']);
+			await run('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Alice Johnson', 'alice@example.com']);
 
 			// Example 2: Select the user
 			console.log('🔍 Selecting user...');
-			const userResult = await selectByPrimaryKey('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
-			console.log('User found:', userResult.results[0]);
+			const userResult = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+			console.log('User found:', userResult);
 
 			// Example 3: Update the user
 			console.log('✏️ Updating user...');
-			await updateByPrimaryKey('user-123', 'UPDATE users SET name = ?, email = ? WHERE id = ?', [
-				'Alice Smith',
-				'alice.smith@example.com',
-				'user-123'
-			]);
+			await run('user-123', 'UPDATE users SET name = ?, email = ? WHERE id = ?', ['Alice Smith', 'alice.smith@example.com', 'user-123']);
 
 			// Example 4: Verify the update
-			const updatedResult = await selectByPrimaryKey('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
-			console.log('Updated user:', updatedResult.results[0]);
+			const updatedResult = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+			console.log('Updated user:', updatedResult);
 
 			// Example 5: Insert multiple users to demonstrate sharding
 			const users = [
@@ -98,27 +94,27 @@ export default {
 
 			console.log('👥 Inserting multiple users...');
 			for (const user of users) {
-				await insert(user.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
+				await run(user.id, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [user.id, user.name, user.email]);
 			}
 
 			// Example 6: Retrieve all users (demonstrating cross-shard queries)
 			console.log('📋 Retrieving all users...');
 			const allUsers = [];
 			for (const user of users.concat([{ id: 'user-123', name: 'Alice Smith', email: 'alice.smith@example.com' }])) {
-				const result = await selectByPrimaryKey(user.id, 'SELECT * FROM users WHERE id = ?', [user.id]);
-				if (result.results.length > 0) {
-					allUsers.push(result.results[0]);
+				const result = await first(user.id, 'SELECT * FROM users WHERE id = ?', [user.id]);
+				if (result) {
+					allUsers.push(result);
 				}
 			}
 			console.log('All users:', allUsers);
 
 			// Example 7: Delete a user
 			console.log('🗑️ Deleting user...');
-			await deleteByPrimaryKey('user-789', 'DELETE FROM users WHERE id = ?', ['user-789']);
+			await run('user-789', 'DELETE FROM users WHERE id = ?', ['user-789']);
 
 			// Example 8: Verify deletion
-			const deletedResult = await selectByPrimaryKey('user-789', 'SELECT * FROM users WHERE id = ?', ['user-789']);
-			console.log('User after deletion:', deletedResult.results.length === 0 ? 'Not found (deleted)' : 'Still exists');
+			const deletedResult = await first('user-789', 'SELECT * FROM users WHERE id = ?', ['user-789']);
+			console.log('User after deletion:', deletedResult ? 'Still exists' : 'Not found (deleted)');
 
 			return new Response(
 				JSON.stringify({
@@ -170,20 +166,20 @@ export async function runSimpleExample(env: Env) {
 	const userId = 'demo-user-' + Date.now();
 
 	// Insert
-	await insert(userId, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [userId, 'Demo User', 'demo@example.com']);
+	await run(userId, 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [userId, 'Demo User', 'demo@example.com']);
 
 	// Select
-	const result = await selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
-	console.log('Created user:', result.results[0]);
+	const result = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+	console.log('Created user:', result);
 
 	// Update
-	await updateByPrimaryKey(userId, 'UPDATE users SET name = ? WHERE id = ?', ['Updated Demo User', userId]);
+	await run(userId, 'UPDATE users SET name = ? WHERE id = ?', ['Updated Demo User', userId]);
 
 	// Select again to verify update
-	const updatedResult = await selectByPrimaryKey(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
-	console.log('Updated user:', updatedResult.results[0]);
+	const updatedResult = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+	console.log('Updated user:', updatedResult);
 
 	// Clean up
-	await deleteByPrimaryKey(userId, 'DELETE FROM users WHERE id = ?', [userId]);
+	await run(userId, 'DELETE FROM users WHERE id = ?', [userId]);
 	console.log('User deleted successfully');
 }

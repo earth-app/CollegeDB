@@ -63,29 +63,6 @@ export interface CollegeDBConfig {
 }
 
 /**
- * Query result from D1 database operations
- */
-export interface QueryResult {
-	/** Query execution success status */
-	success: boolean;
-	/** Query execution metadata */
-	meta: {
-		/** Number of rows returned */
-		count: number;
-		/** Time taken for query execution */
-		duration: number;
-		/** Last inserted row ID (for INSERT operations) */
-		last_row_id?: number;
-		/** Number of rows changed (for UPDATE/DELETE operations) */
-		changes?: number;
-	};
-	/** Query results data */
-	results: any[];
-	/** Any errors that occurred */
-	error?: string;
-}
-
-/**
  * Shard statistics for monitoring and load balancing
  */
 export interface ShardStats {

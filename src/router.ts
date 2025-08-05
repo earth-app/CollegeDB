@@ -16,7 +16,7 @@
  *
  * @example
  * ```typescript
- * import { initialize, insert, selectByPrimaryKey } from './router.js';
+ * import { initialize, insert, first, run } from './router.js';
  *
  * // Initialize the system
  * initialize({
@@ -30,19 +30,19 @@
  * });
  *
  * // Insert a record (automatically routed to appropriate shard)
- * await insert('user-123', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-123', 'John']);
+ * await run('user-123', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-123', 'John']);
  *
  * // Query the record (routed to same shard)
- * const result = await selectByPrimaryKey('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+ * const result = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
  * ```
  *
  * @author CollegeDB Team
  * @since 1.0.0
  */
 
-import type { D1Database } from '@cloudflare/workers-types';
+import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types';
 import { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, QueryResult, ShardStats } from './types.js';
+import type { CollegeDBConfig, ShardStats } from './types.js';
 
 /**
  * Global configuration for the collegedb instance
@@ -353,66 +353,116 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
 }
 
 /**
- * Executes an INSERT statement on the appropriate shard based on the primary key.
+ * Prepares a SQL statement for execution.
+ *
+ * @param key - The primary key to route the query
+ * @param sql - The SQL statement to prepare
+ * @returns Promise that resolves to a prepared statement
+ * @throws {Error} If preparation fails
+ */
+export async function prepare(key: string, sql: string): Promise<D1PreparedStatement> {
+	const db = await getDatabase(key);
+	const result = db.prepare(sql);
+	return result;
+}
+
+/**
+ * Executes a statement on the appropriate shard based on the primary key.
  * The primary key is used to determine which shard should store the record,
  * ensuring consistent routing for future queries.
  *
- * @param primaryKey - Primary key to route the query (should match the record's primary key)
- * @param sql - SQL INSERT statement with parameter placeholders
+ * @template T - Type of the result records
+ * @param key - Primary key to route the query (should match the record's primary key)
+ * @param sql - SQL statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
- * @returns Promise that resolves when insert is complete
- * @throws {Error} If insert fails or routing fails
+ * @returns Promise that resolves when the statement is complete
+ * @throws {Error} If statement fails or routing fails
  * @example
  * ```typescript
  * // Insert a new user
- * await insert('user-123',
+ * await run('user-123',
  *   'INSERT INTO users (id, name, email) VALUES (?, ?, ?)',
  *   ['user-123', 'John Doe', 'john@example.com']
  * );
  *
  * // Insert a post linked to a user
- * await insert('post-456',
+ * await run('post-456',
  *   'INSERT INTO posts (id, user_id, title, content) VALUES (?, ?, ?, ?)',
  *   ['post-456', 'user-123', 'Hello World', 'My first post!']
  * );
  * ```
- */
-export async function insert(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
-	const db = await getDatabase(primaryKey);
-	const result = await db
-		.prepare(sql)
-		.bind(...bindings)
-		.run();
-
-	if (!result.success) {
-		throw new Error(`Insert failed: ${result.error || 'Unknown error'}`);
-	}
-}
-
-/**
- * Executes a SELECT query on the appropriate shard based on the primary key.
- * Returns structured results with metadata about the query execution.
  *
- * @param primaryKey - Primary key to route the query
- * @param sql - SQL SELECT statement with parameter placeholders
- * @param bindings - Parameter values to bind to the SQL statement
- * @returns Promise resolving to structured query results with metadata
- * @throws {Error} If query fails or routing fails
  * @example
  * ```typescript
- * // Get a specific user
- * const userResult = await selectByPrimaryKey('user-123',
- *   'SELECT * FROM users WHERE id = ?',
+ * // Update user information
+ * await run('user-123',
+ *   'UPDATE users SET name = ?, email = ? WHERE id = ?',
+ *   ['John Smith', 'johnsmith@example.com', 'user-123']
+ * );
+ *
+ * // Update post content
+ * await run('post-456',
+ *   'UPDATE posts SET title = ?, content = ?, updated_at = strftime("%s", "now") WHERE id = ?',
+ *   ['Updated Title', 'Updated content here', 'post-456']
+ * );
+ * ```
+ *
+ * @example
+ * ```typescript
+ * // Delete a specific user
+ * await run('user-123',
+ *   'DELETE FROM users WHERE id = ?',
  *   ['user-123']
  * );
  *
- * if (userResult.success && userResult.results.length > 0) {
- *   const user = userResult.results[0];
- *   console.log(`Found user: ${user.name}`);
- * }
+ * // Delete user's posts (cascade delete)
+ * await run('user-123',
+ *   'DELETE FROM posts WHERE user_id = ?',
+ *   ['user-123']
+ * );
+ *
+ * // Delete with conditions
+ * await run('user-123',
+ *   'DELETE FROM posts WHERE user_id = ? AND created_at < ?',
+ *   ['user-123', Date.now() - 86400000] // Posts older than 1 day
+ * );
+ * ```
+ */
+export async function run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+	const prepared = await prepare(key, sql);
+	const result = await prepared.bind(...bindings).run<T>();
+
+	if (!result.success) {
+		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+	}
+
+	return result;
+}
+
+/**
+ * Retrieves all records matching the query for a given primary key.
+ *
+ * This function is useful for fetching multiple records based on a primary key.
+ * It automatically routes the query to the correct shard based on the provided
+ * primary key, ensuring consistent data access.
+ * @param key - Primary key to route the query
+ * @param sql - The SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @returns Promise that resolves to the result of the update operation
+ * @throws {Error} If update fails or routing fails
+ *
+ * @example
+ * ```typescript
+ * type Post = {
+ *  id: string;
+ *  user_id: string;
+ *  title: string;
+ *  content: string;
+ * };
+ *
  *
  * // Get user's posts
- * const postsResult = await selectByPrimaryKey('user-123',
+ * const postsResult = await all<Post>('user-123',
  *   'SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC',
  *   ['user-123']
  * );
@@ -420,102 +470,52 @@ export async function insert(primaryKey: string, sql: string, bindings: any[] = 
  * console.log(`User has ${postsResult.meta.count} posts`);
  * ```
  */
-export async function selectByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<QueryResult> {
-	const db = await getDatabase(primaryKey);
-	const result = await db
-		.prepare(sql)
-		.bind(...bindings)
-		.all();
+export async function all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+	const prepared = await prepare(key, sql);
+	const result = await prepared.bind(...bindings).all<T>();
 
-	return {
-		success: result.success,
-		meta: {
-			count: result.results.length,
-			duration: 0 // D1 doesn't provide timing info
-		},
-		results: result.results,
-		error: result.success ? undefined : 'Query failed'
-	};
+	if (!result.success) {
+		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+	}
+
+	return result;
 }
 
 /**
- * Executes an UPDATE statement on the appropriate shard based on the primary key.
- * The primary key ensures the update is performed on the correct shard where
- * the record is stored.
+ * Retrieves the first record matching the query for a given primary key.
  *
- * @param primaryKey - Primary key to route the query
- * @param sql - SQL UPDATE statement with parameter placeholders
+ * This function is useful for fetching a single record based on a primary key.
+ * It automatically routes the query to the correct shard based on the provided
+ * primary key, ensuring consistent data access.
+ *
+ * @template T - Type of the result record
+ * @param key - Primary key to route the query
+ * @param sql - SQL statement with parameter placeholders
  * @param bindings - Parameter values to bind to the SQL statement
- * @returns Promise that resolves when update is complete
- * @throws {Error} If update fails or routing fails
+ * @returns Promise that resolves to the first matching record, or null if not found
+ * @throws {Error} If query fails or routing fails
+ *
  * @example
  * ```typescript
- * // Update user information
- * await updateByPrimaryKey('user-123',
- *   'UPDATE users SET name = ?, email = ? WHERE id = ?',
- *   ['John Smith', 'johnsmith@example.com', 'user-123']
- * );
- *
- * // Update post content
- * await updateByPrimaryKey('post-456',
- *   'UPDATE posts SET title = ?, content = ?, updated_at = strftime("%s", "now") WHERE id = ?',
- *   ['Updated Title', 'Updated content here', 'post-456']
- * );
- * ```
- */
-export async function updateByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
-	const db = await getDatabase(primaryKey);
-	const result = await db
-		.prepare(sql)
-		.bind(...bindings)
-		.run();
-
-	if (!result.success) {
-		throw new Error(`Update failed: ${result.error || 'Unknown error'}`);
-	}
-}
-
-/**
- * Executes a DELETE statement on the appropriate shard based on the primary key.
- * The primary key ensures the deletion is performed on the correct shard where
- * the record is stored.
- *
- * @param primaryKey - Primary key to route the query
- * @param sql - SQL DELETE statement with parameter placeholders
- * @param bindings - Parameter values to bind to the SQL statement
- * @returns Promise that resolves when deletion is complete
- * @throws {Error} If delete fails or routing fails
- * @example
- * ```typescript
- * // Delete a specific user
- * await deleteByPrimaryKey('user-123',
- *   'DELETE FROM users WHERE id = ?',
+ * type User = {
+ *   id: string;
+ *   name: string;
+ *   email: string;
+ * };
+ * // Get a specific user
+ * const userResult = await first<User>('user-123',
+ *   'SELECT * FROM users WHERE id = ?',
  *   ['user-123']
  * );
  *
- * // Delete user's posts (cascade delete)
- * await deleteByPrimaryKey('user-123',
- *   'DELETE FROM posts WHERE user_id = ?',
- *   ['user-123']
- * );
- *
- * // Delete with conditions
- * await deleteByPrimaryKey('user-123',
- *   'DELETE FROM posts WHERE user_id = ? AND created_at < ?',
- *   ['user-123', Date.now() - 86400000] // Posts older than 1 day
- * );
- * ```
+ * if (userResult) {
+ *   console.log(`Found user: ${userResult.name}`);
+ * }
  */
-export async function deleteByPrimaryKey(primaryKey: string, sql: string, bindings: any[] = []): Promise<void> {
-	const db = await getDatabase(primaryKey);
-	const result = await db
-		.prepare(sql)
-		.bind(...bindings)
-		.run();
-
-	if (!result.success) {
-		throw new Error(`Delete failed: ${result.error || 'Unknown error'}`);
-	}
+export async function first<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<T | null> {
+	const prepared = await prepare(key, sql);
+	const result = await prepared.bind(...bindings).first<T>();
+	return result;
 }
 
 /**
@@ -531,7 +531,7 @@ export async function deleteByPrimaryKey(primaryKey: string, sql: string, bindin
  * 3. If target shard differs from current, migrates the data
  * 4. Updates the KV mapping to point to the new shard
  *
- * ⚠️ **Note**: This operation involves data migration and should be used
+ * **Note**: This operation involves data migration and should be used
  * carefully in production environments. Consider the impact on ongoing queries.
  *
  * @param primaryKey - Primary key to reassign to a different shard
@@ -687,41 +687,29 @@ export async function getShardStats(): Promise<ShardStats[]> {
 }
 
 /**
- * Executes a custom query on a specific shard
- *
  * Bypasses the normal routing logic to execute a query directly on a specified
  * shard. This is useful for administrative operations, cross-shard queries,
  * or when you need to query data that doesn't follow the primary key routing pattern.
  *
- * ⚠️ **Use with caution**: This function bypasses routing safeguards and should
+ * **Use with caution**: This function bypasses routing safeguards and should
  * be used only when you specifically need to target a particular shard.
  *
  * @param shardBinding - The shard binding name to execute the query on
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
- * @returns Promise resolving to structured query results
+ * @returns Promise resolving to the result of the query execution
  * @throws {Error} If shard not found or query fails
  * @example
  * ```typescript
- * // Administrative query: count all users across a specific shard
- * const eastCoastStats = await queryOnShard('db-east',
- *   'SELECT COUNT(*) as user_count FROM users'
+ * // Administrative query: insert a new user directly into a specific shard
+ * const result = await runShard('db-east',
+ *   'INSERT INTO users (id, name, email) VALUES (?, ?, ?)',
+ *   ['user-789', 'Alice', 'alice@example.com']
  * );
- * console.log(`East coast users: ${eastCoastStats.results[0].user_count}`);
- *
- * // Cross-shard analytics: get recent posts from a specific region
- * const recentPosts = await queryOnShard('db-west',
- *   'SELECT id, title, created_at FROM posts WHERE created_at > ? ORDER BY created_at DESC LIMIT ?',
- *   [Date.now() - 86400000, 10] // Last 24 hours, limit 10
- * );
- *
- * // Schema inspection on specific shard
- * const tables = await queryOnShard('db-central',
- *   "SELECT name FROM sqlite_master WHERE type='table'"
- * );
+ * console.log(`Inserted user with ID: ${result.lastInsertId}`);
  * ```
  */
-export async function queryOnShard(shardBinding: string, sql: string, bindings: any[] = []): Promise<QueryResult> {
+export async function runShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
 	const config = getConfig();
 	const db = config.shards[shardBinding];
 
@@ -732,17 +720,104 @@ export async function queryOnShard(shardBinding: string, sql: string, bindings: 
 	const result = await db
 		.prepare(sql)
 		.bind(...bindings)
-		.all();
+		.run<T>();
 
-	return {
-		success: result.success,
-		meta: {
-			count: result.results.length,
-			duration: 0
-		},
-		results: result.results,
-		error: result.success ? undefined : 'Query failed'
-	};
+	if (!result.success) {
+		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+	}
+
+	return result;
+}
+
+/**
+ * Bypasses the normal routing logic to execute a query directly on a specified
+ * shard. This is useful for administrative operations, cross-shard queries,
+ * or when you need to query data that doesn't follow the primary key routing pattern.
+ *
+ * **Use with caution**: This function bypasses routing safeguards and should
+ * be used only when you specifically need to target a particular shard.
+ *
+ * @param shardBinding - The shard binding name to execute the query on
+ * @param sql - SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @returns Promise resolving to structured query results
+ * @throws {Error} If shard not found or query fails
+ * @example
+ * ```typescript
+ * // Administrative query: count all users across a specific shard
+ * const eastCoastStats = await allShard('db-east',
+ *   'SELECT COUNT(*) as user_count FROM users'
+ * );
+ * console.log(`East coast users: ${eastCoastStats.results[0].user_count}`);
+ *
+ * // Cross-shard analytics: get recent posts from a specific region
+ * const recentPosts = await allShard('db-west',
+ *   'SELECT id, title, created_at FROM posts WHERE created_at > ? ORDER BY created_at DESC LIMIT ?',
+ *   [Date.now() - 86400000, 10] // Last 24 hours, limit 10
+ * );
+ *
+ * // Schema inspection on specific shard
+ * const tables = await allShard('db-central',
+ *   "SELECT name FROM sqlite_master WHERE type='table'"
+ * );
+ * ```
+ */
+export async function allShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+	const config = getConfig();
+	const db = config.shards[shardBinding];
+
+	if (!db) {
+		throw new Error(`Shard ${shardBinding} not found`);
+	}
+
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.all<T>();
+
+	return result;
+}
+
+/**
+ * Bypasses the normal routing logic to execute a query directly on a specified
+ * shard. This is useful for administrative operations, cross-shard queries,
+ * or when you need to query data that doesn't follow the primary key routing pattern.
+ *
+ * **Use with caution**: This function bypasses routing safeguards and should
+ * be used only when you specifically need to target a particular shard.
+ *
+ * @param shardBinding - The shard binding name to execute the query on
+ * @param sql - SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @returns Promise resolving to the first matching record, or null if not found
+ * @throws {Error} If shard not found or query fails
+ * @example
+ * ```typescript
+ * // Administrative query: get a specific user from a shard
+ * const user = await firstShard('db-east',
+ *  'SELECT * FROM users WHERE id = ?',
+ *   ['user-123']);
+ * if (user) {
+ *   console.log(`Found user: ${user.name}`);
+ * } else {
+ *   console.log('User not found in east shard');
+ * }
+ * ```
+ */
+export async function firstShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<T | null> {
+	const config = getConfig();
+	const db = config.shards[shardBinding];
+
+	if (!db) {
+		throw new Error(`Shard ${shardBinding} not found`);
+	}
+
+	const result = await db
+		.prepare(sql)
+		.bind(...bindings)
+		.first<T>();
+
+	return result;
 }
 
 /**
@@ -752,7 +827,7 @@ export async function queryOnShard(shardBinding: string, sql: string, bindings: 
  * and the Durable Object coordinator. This operation resets the entire
  * routing system to a clean state.
  *
- * ⚠️ **DANGER**: This operation is destructive and irreversible. After flushing,
+ * **DANGER**: This operation is destructive and irreversible. After flushing,
  * all existing primary keys will be treated as new and may be assigned to
  * different shards than before, causing data routing issues.
  *
@@ -770,7 +845,7 @@ export async function queryOnShard(shardBinding: string, sql: string, bindings: 
  *   console.log('All shard mappings cleared for testing');
  *
  *   // Now all keys will be reassigned on next access
- *   await insert('user-123', 'INSERT INTO users (id, name) VALUES (?, ?)',
+ *   await run('user-123', 'INSERT INTO users (id, name) VALUES (?, ?)',
  *     ['user-123', 'Test User']);
  * }
  * ```
