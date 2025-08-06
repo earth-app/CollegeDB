@@ -30,10 +30,12 @@ jobs:
       - name: Build Project
         run: bun run build
       - name: Publish to NPM
+        if: success() || failure()
         run: bun publish --registry https://registry.npmjs.org
         env:
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish to GitHub Packages
+        if: success() || failure()
         run: bun publish --registry https://npm.pkg.github.com
         env:
           NPM_CONFIG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
