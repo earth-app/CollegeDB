@@ -40,29 +40,32 @@ npm install collegedb
 ## Basic Usage
 
 ```typescript
-import { initialize, createSchema, run, first } from 'collegedb';
+import { collegedb, createSchema, run, first } from 'collegedb';
 
 // Initialize with your Cloudflare bindings (existing databases work automatically!)
-initialize({
-	kv: env.KV,
-	coordinator: env.ShardCoordinator,
-	shards: {
-		'db-east': env['db-east'], // Can be existing DB with data
-		'db-west': env['db-west'] // Can be existing DB with data
+collegedb(
+	{
+		kv: env.KV,
+		coordinator: env.ShardCoordinator,
+		shards: {
+			'db-east': env['db-east'], // Can be existing DB with data
+			'db-west': env['db-west'] // Can be existing DB with data
+		},
+		strategy: 'hash' // or 'round-robin', 'random'
 	},
-	strategy: 'hash' // or 'round-robin', 'random'
-});
+	async () => {
+		// Create schema on new shards only (existing shards auto-detected)
+		await createSchema(env['db-new-shard']);
 
-// Create schema on new shards only (existing shards auto-detected)
-await createSchema(env['db-new-shard']);
+		// Insert data (automatically routed to appropriate shard)
+		await run('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Johnson', 'alice@example.com']);
 
-// Insert data (automatically routed to appropriate shard)
-await run('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Alice Johnson', 'alice@example.com']);
+		// Query data (automatically routed to correct shard, works with existing data!)
+		const result = await first<User>('existing-user-456', 'SELECT * FROM users WHERE id = ?', ['existing-user-456']);
 
-// Query data (automatically routed to correct shard, works with existing data!)
-const result = await first<User>('existing-user-456', 'SELECT * FROM users WHERE id = ?', ['existing-user-456']);
-
-console.log(result); // User data from existing database
+		console.log(result); // User data from existing database
+	}
+);
 ```
 
 ## Drop-in Replacement for Existing Databases
@@ -77,24 +80,27 @@ CollegeDB supports **seamless, automatic integration** with existing D1 database
 4. **KV Namespace**: A Cloudflare KV namespace for storing shard mappings
 
 ```typescript
-import { initialize, first, run } from 'collegedb';
+import { collegedb, first, run } from 'collegedb';
 
 // Add your existing databases as shards - that's it!
-initialize({
-	kv: env.KV,
-	shards: {
-		'db-users': env.ExistingUserDB, // Your existing database with users
-		'db-orders': env.ExistingOrderDB, // Your existing database with orders
-		'db-new': env.NewDB // Optional new shard for growth
+collegedb(
+	{
+		kv: env.KV,
+		shards: {
+			'db-users': env.ExistingUserDB, // Your existing database with users
+			'db-orders': env.ExistingOrderDB, // Your existing database with orders
+			'db-new': env.NewDB // Optional new shard for growth
+		},
+		strategy: 'hash'
 	},
-	strategy: 'hash'
-});
+	async () => {
+		// Existing data works immediately!
+		const existingUser = await first('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
 
-// Existing data works immediately! 🎉
-const existingUser = await first('user-from-old-db', 'SELECT * FROM users WHERE id = ?', ['user-from-old-db']);
-
-// New data gets distributed automatically
-await run('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
+		// New data gets distributed automatically
+		await run('new-user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['new-user-123', 'New User', 'new@example.com']);
+	}
+);
 ```
 
 **That's it!** No migration scripts, no manual mapping creation, no downtime. Your existing data is immediately accessible through CollegeDB's sharding system.
@@ -273,7 +279,7 @@ clearMigrationCache(); // Forces fresh migration check
 
 ## Troubleshooting
 
-**Tables without Primary Keys**
+### Tables without Primary Keys
 
 ```typescript
 // Error: Primary key column 'id' not found
@@ -281,7 +287,7 @@ clearMigrationCache(); // Forces fresh migration check
 await db.prepare(`ALTER TABLE legacy_table ADD COLUMN id TEXT PRIMARY KEY`).run();
 ```
 
-**Large Database Integration**
+### Large Database Integration
 
 ```typescript
 // For very large databases, integrate in batches
@@ -296,7 +302,7 @@ for (let i = 0; i < allTables.length; i += batchSize) {
 }
 ```
 
-**Mixed Primary Key Types**
+### Mixed Primary Key Types
 
 ```typescript
 // Handle different primary key column names per table
@@ -314,17 +320,18 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 
 ## 📚 API Reference
 
-| Function                       | Description                                  | Parameters              |
-| ------------------------------ | -------------------------------------------- | ----------------------- |
-| `initialize(config)`           | Initialize CollegeDB with configuration      | `CollegeDBConfig`       |
-| `createSchema(d1)`             | Create database schema on a D1 instance      | `D1Database`            |
-| `prepare(key, sql)`            | Prepare a SQL statement for execution        | `string, string`        |
-| `run(key, sql, bindings)`      | Execute a SQL query with primary key routing | `string, string, any[]` |
-| `first(key, sql, bindings)`    | Execute a SQL query and return first result  | `string, string, any[]` |
-| `all(key, sql, bindings)`      | Execute a SQL query and return all results   | `string, string, any[]` |
-| `reassignShard(key, newShard)` | Move primary key to different shard          | `string, string`        |
-| `listKnownShards()`            | Get list of available shards                 | `void`                  |
-| `getShardStats()`              | Get statistics for all shards                | `void`                  |
+| Function                       | Description                                  | Parameters               |
+| ------------------------------ | -------------------------------------------- | ------------------------ |
+| `collegedb(config, callback)`  | Initialize CollegeDB, then run a callback    | `CollegeDBConfig, ()=>T` |
+| `initialize(config)`           | Initialize CollegeDB with configuration      | `CollegeDBConfig`        |
+| `createSchema(d1)`             | Create database schema on a D1 instance      | `D1Database`             |
+| `prepare(key, sql)`            | Prepare a SQL statement for execution        | `string, string`         |
+| `run(key, sql, bindings)`      | Execute a SQL query with primary key routing | `string, string, any[]`  |
+| `first(key, sql, bindings)`    | Execute a SQL query and return first result  | `string, string, any[]`  |
+| `all(key, sql, bindings)`      | Execute a SQL query and return all results   | `string, string, any[]`  |
+| `reassignShard(key, newShard)` | Move primary key to different shard          | `string, string`         |
+| `listKnownShards()`            | Get list of available shards                 | `void`                   |
+| `getShardStats()`              | Get statistics for all shards                | `void`                   |
 
 ### Drop-in Replacement Functions
 
@@ -337,11 +344,11 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | `integrateExistingDatabase(d1, shard)`    | Complete drop-in integration of existing DB             | `D1Database, string, mapper`   |
 | `createMappingsForExistingKeys(keys)`     | Create shard mappings for existing keys                 | `string[], string[], strategy` |
 | `listTables(d1)`                          | Get list of tables in database                          | `D1Database`                   |
-| `clearMigrationCache()`                   | **NEW**: Clear automatic migration cache                | `void`                         |
+| `clearMigrationCache()`                   | Clear automatic migration cache                         | `void`                         |
 
 ## 🏗 Architecture
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────┐
 │                    Cloudflare Worker                        │
 ├─────────────────────────────────────────────────────────────┤

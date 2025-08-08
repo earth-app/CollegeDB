@@ -16,7 +16,7 @@
  *
  * @example
  * ```typescript
- * import { initialize, insert, first, run } from './router.js';
+ * import { initialize, insert, first, run } from 'collegedb';
  *
  * // Initialize the system
  * initialize({
@@ -60,7 +60,7 @@ let globalConfig: CollegeDBConfig | null = null;
  * before any other operations can be performed. The configuration includes KV
  * storage, available D1 shards, optional coordinator, and allocation strategy.
  *
- * **NEW**: Automatically detects and migrates existing databases without requiring
+ * This will also automatically detect and migrate existing databases without requiring
  * additional setup. If shards contain existing data with primary keys, CollegeDB
  * will automatically create the necessary mappings for seamless operation.
  *
@@ -92,16 +92,93 @@ let globalConfig: CollegeDBConfig | null = null;
  * });
  * ```
  */
-export function initialize(config: CollegeDBConfig): void {
+export function initialize(config: CollegeDBConfig) {
 	globalConfig = config;
 
-	// Perform automatic migration detection in the background
-	// This runs asynchronously to avoid blocking initialization
 	if (config.shards && Object.keys(config.shards).length > 0) {
-		performBackgroundAutoMigration(config).catch((error) => {
+		performAutoMigration(config).catch((error) => {
 			console.warn('Background auto-migration failed:', error);
 		});
 	}
+}
+
+/**
+ * Sets up the global configuration for the CollegeDB system asynchronously.
+ * This must be called before any other operations can be performed. The
+ * configuration includes KVstorage, available D1 shards, optional coordinator,
+ * and allocation strategy.
+ *
+ * This will also automatically detect and migrate existing databases without requiring
+ * additional setup. If shards contain existing data with primary keys, CollegeDB
+ * will automatically create the necessary mappings for seamless operation.
+ *
+ * Compared to `initialize`, this method waits for the background check to finish.
+ *
+ * @param config - Configuration object containing all necessary bindings and settings
+ * @throws {Error} If configuration is invalid or required bindings are missing
+ * @example
+ * ```typescript
+ * // Basic setup with multiple shards - auto-migration happens automatically
+ * initializeAsync({
+ *   kv: env.KV,
+ *   shards: {
+ *     'db-primary': env.DB_PRIMARY,     // Existing DB with data
+ *     'db-secondary': env.DB_SECONDARY  // Another existing DB
+ *   },
+ *   strategy: 'round-robin'
+ * });
+ * // Existing data is now automatically accessible via CollegeDB!
+ *
+ * // Advanced setup with coordinator
+ * initializeAsync({
+ *   kv: env.KV,
+ *   coordinator: env.ShardCoordinator,
+ *   shards: {
+ *     'db-east': env.DB_EAST,
+ *     'db-west': env.DB_WEST,
+ *     'db-central': env.DB_CENTRAL
+ *   },
+ *   strategy: 'hash'
+ * });
+ * ```
+ */
+export async function initializeAsync(config: CollegeDBConfig) {
+	globalConfig = config;
+
+	if (config.shards && Object.keys(config.shards).length > 0)
+		try {
+			await performAutoMigration(config);
+		} catch (error) {
+			console.warn('Auto migration failed:', error);
+		}
+}
+
+/**
+ * Initializes the configuration and then performs a callback once the configuration
+ * has finished initializing.
+ *
+ * @param config - CollegeDB Configuration
+ * @param callback - The callback to perform after the initialization
+ * @returns The result of the callback
+ * @example
+ * ```
+ * import { collegedb, first } from 'collegedb'
+ *
+ * const result = collegedb({
+ *   kv: env.KV,
+ *   shards: {
+ *     'db-primary': env.DB_PRIMARY,     // Existing DB with data
+ *     'db-secondary': env.DB_SECONDARY  // Another existing DB
+ *   },
+ *   strategy: 'hash'
+ * }, async () => {
+ *     return await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+ * });
+ * ```
+ */
+export async function collegedb<T>(config: CollegeDBConfig, callback: () => T) {
+	await initializeAsync(config);
+	return await callback();
 }
 
 /**
@@ -114,7 +191,7 @@ export function initialize(config: CollegeDBConfig): void {
  * @private
  * @param config - CollegeDB configuration
  */
-async function performBackgroundAutoMigration(config: CollegeDBConfig): Promise<void> {
+async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 	try {
 		const { autoDetectAndMigrate } = await import('./migrations.js');
 		const shardNames = Object.keys(config.shards);
