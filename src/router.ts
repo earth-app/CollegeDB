@@ -599,7 +599,7 @@ function selectShardByLocation(
  */
 async function getShardForKey(primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
 	const config = getConfig();
-	const mapper = new KVShardMapper(config.kv);
+	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 
 	// Check if mapping already exists
 	const existingMapping = await mapper.getShardMapping(primaryKey);
@@ -976,7 +976,7 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 		throw new CollegeDBError(`Shard ${newBinding} not found in configuration`, 'SHARD_NOT_FOUND');
 	}
 
-	const mapper = new KVShardMapper(config.kv);
+	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 	const currentMapping = await mapper.getShardMapping(primaryKey);
 
 	if (!currentMapping) {
@@ -1093,7 +1093,7 @@ export async function getShardStats(): Promise<ShardStats[]> {
 	}
 
 	// Fallback to KV-based counting
-	const mapper = new KVShardMapper(config.kv);
+	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 	const counts = await mapper.getShardKeyCounts();
 
 	return Object.entries(config.shards).map(([binding, _]) => ({
@@ -1268,7 +1268,7 @@ export async function firstShard<T = Record<string, unknown>>(shardBinding: stri
  */
 export async function flush(): Promise<void> {
 	const config = getConfig();
-	const mapper = new KVShardMapper(config.kv);
+	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 
 	await mapper.clearAllMappings();
 

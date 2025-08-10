@@ -110,6 +110,14 @@ export interface CollegeDBConfig {
 	 * @since 1.0.2
 	 */
 	disableAutoMigration?: boolean;
+	/**
+	 * Whether to hash shard mapping keys with SHA-256 for security and privacy.
+	 * When enabled, primary keys are hashed before storing in KV, protecting
+	 * sensitive data like emails from being visible in KV keys.
+	 * @default true
+	 * @since 1.0.3
+	 */
+	hashShardMappings?: boolean;
 }
 
 /**
@@ -142,6 +150,23 @@ export interface ShardMapping {
 	createdAt: number;
 	/** Timestamp when mapping was last updated */
 	updatedAt: number;
+	/** Original unhashed primary key (only stored when hashing is disabled) */
+	originalKey?: string;
+}
+
+/**
+ * Multi-key shard mapping for lookup by various unique identifiers
+ * @since 1.0.3
+ */
+export interface MultiKeyShardMapping {
+	/** D1 binding name */
+	shard: string;
+	/** Timestamp when mapping was created */
+	createdAt: number;
+	/** Timestamp when mapping was last updated */
+	updatedAt: number;
+	/** All keys that resolve to this shard mapping (for reverse lookups) */
+	keys: string[];
 }
 
 /**

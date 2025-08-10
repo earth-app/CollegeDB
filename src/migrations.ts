@@ -646,7 +646,7 @@ export async function autoDetectAndMigrate(
 
 	try {
 		const { KVShardMapper } = await import('./kvmap.js');
-		const mapper = new KVShardMapper(config.kv);
+		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 
 		// Discover tables to check
 		const allTables = await listTables(d1);
@@ -802,7 +802,7 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
 		}
 
 		const { KVShardMapper } = await import('./kvmap.js');
-		const mapper = new KVShardMapper(config.kv);
+		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 
 		// Quick check: look for any table with data
 		const dataTableNames = tables.filter(
