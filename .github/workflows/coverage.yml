@@ -14,6 +14,13 @@ jobs:
       run: bun install --frozen-lockfile
       env:
         GITHUB_TOKEN: ${{ github.token }}
+    - name: Run tests
+      run: bunx vitest --reporter=junit --outputFile=test-report.junit.xml
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/test-results-action@v1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
     - name: Run tests with coverage
       run: bun run test:coverage
     - name: Upload coverage reports to Codecov
