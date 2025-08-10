@@ -27,6 +27,8 @@ jobs:
         run: |
           bun install --global husky
           bun install --frozen-lockfile
+      - name: Verify Tests
+        run: bun run test --coverage
       - name: Build Project
         run: bun run build
       - name: Publish to NPM
