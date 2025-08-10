@@ -22,3 +22,6 @@ ignore:
   - '**/*.spec.ts'
   - 'vitest.config.ts'
   - 'wrangler.toml'
+  - 'examples/**/*'
+  - 'dist/**/*'
+  - 'demos/**/*'
