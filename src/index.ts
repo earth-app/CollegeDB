@@ -13,15 +13,20 @@
 export {
 	all,
 	allShard,
+	collegedb,
 	createSchema,
 	first,
+	firstShard,
 	flush,
+	getClosestRegionFromIP,
 	getShardStats,
 	initialize,
+	initializeAsync,
 	listKnownShards,
 	prepare,
 	reassignShard,
-	run
+	run,
+	runShard
 } from './router.js';
 
 // Export utility classes
@@ -48,4 +53,13 @@ export {
 } from './migrations.js';
 
 // Export types
-export type { CollegeDBConfig, Env, ShardCoordinatorState, ShardMapping, ShardStats, ShardingStrategy } from './types.js';
+export type {
+	CollegeDBConfig,
+	D1Region,
+	Env,
+	ShardCoordinatorState,
+	ShardLocation,
+	ShardMapping,
+	ShardStats,
+	ShardingStrategy
+} from './types.js';

@@ -29,12 +29,36 @@
 import type { D1Database, DurableObjectNamespace, KVNamespace } from '@cloudflare/workers-types';
 
 /**
+ * Available Cloudflare D1 regions for geographic optimization
+ */
+export type D1Region =
+	| 'wnam' // Western North America (US West Coast)
+	| 'enam' // Eastern North America (US East Coast)
+	| 'weur' // Western Europe
+	| 'eeur' // Eastern Europe
+	| 'apac' // Asia Pacific
+	| 'oc' // Oceania
+	| 'me' // Middle East
+	| 'af'; // Africa
+
+/**
+ * Shard location configuration for geographic optimization
+ */
+export interface ShardLocation {
+	/** The D1 region where this shard is located */
+	region: D1Region;
+	/** Optional priority weight for this shard (higher = preferred) */
+	priority?: number;
+}
+
+/**
  * Sharding strategy options for CollegeDB
  * - `round-robin`: Distributes keys evenly across available shards.
  * - `random`: Selects a random shard for each key.
  * - `hash`: Uses a hash function to determine the shard based on the primary key.
+ * - `location`: Selects shards based on geographic proximity to reduce latency.
  */
-export type ShardingStrategy = 'round-robin' | 'random' | 'hash';
+export type ShardingStrategy = 'round-robin' | 'random' | 'hash' | 'location';
 
 /**
  * Environment bindings for the Cloudflare Worker
@@ -60,6 +84,10 @@ export interface CollegeDBConfig {
 	shards: Record<string, D1Database>;
 	/** Default shard allocation strategy */
 	strategy?: ShardingStrategy;
+	/** Target region for location-based sharding */
+	targetRegion?: D1Region;
+	/** Geographic locations of each shard (required for location strategy) */
+	shardLocations?: Record<string, ShardLocation>;
 }
 
 /**
@@ -107,8 +135,13 @@ export interface ShardCoordinatorState {
 	 * `round-robin` - distributes keys evenly across shards
 	 * `random` - selects a random shard for each key
 	 * `hash` - uses a hash function to determine shard based on primary key (default)
+	 * `location` - selects shards based on geographic proximity to reduce latency
 	 */
 	strategy: ShardingStrategy;
 	/** Round-robin counter for allocation */
 	roundRobinIndex: number;
+	/** Target region for location-based allocation */
+	targetRegion?: D1Region;
+	/** Geographic locations of each shard */
+	shardLocations?: Record<string, ShardLocation>;
 }

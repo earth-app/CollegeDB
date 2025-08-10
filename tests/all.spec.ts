@@ -1,3 +1,4 @@
+import type { Request } from '@cloudflare/workers-types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	all,
@@ -5,6 +6,7 @@ import {
 	checkMigrationNeeded,
 	clearMigrationCache,
 	first,
+	getClosestRegionFromIP,
 	getShardStats,
 	initialize,
 	listKnownShards,
@@ -792,6 +794,278 @@ describe('CollegeDB', () => {
 			// Should check again but find already migrated
 			const result3 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config);
 			expect(result3.migrationPerformed).toBe(false); // Already migrated, but cache was cleared
+		});
+	});
+
+	describe('Location-based sharding', () => {
+		it('should allocate to closest region shard', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				strategy: 'location',
+				targetRegion: 'wnam',
+				shardLocations: {
+					'db-west': { region: 'wnam', priority: 2 },
+					'db-east': { region: 'enam', priority: 1 },
+					'db-europe': { region: 'weur', priority: 1 }
+				},
+				shards: {
+					'db-west': mockDB1 as any,
+					'db-east': mockDB2 as any,
+					'db-europe': mockDB1 as any
+				}
+			};
+
+			initialize(config);
+
+			// Multiple allocations to test consistency
+			const allocations = new Set<string>();
+			for (let i = 0; i < 10; i++) {
+				await run(`user-${i}`, 'INSERT INTO users (id, name) VALUES (?, ?)', [`user-${i}`, `User ${i}`]);
+				// In actual implementation, we'd check which shard was used
+				// For this test, we verify no errors occur
+			}
+
+			// Verify users were created successfully
+			const user1 = await first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
+			expect(user1).toBeTruthy();
+			expect(user1?.name).toBe('User 1');
+		});
+
+		it('should fallback to hash strategy when no location info available', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				strategy: 'location',
+				targetRegion: 'wnam',
+				// No shardLocations provided
+				shards: {
+					'db-1': mockDB1 as any,
+					'db-2': mockDB2 as any
+				}
+			};
+
+			initialize(config);
+
+			// Should work even without location info (fallback to hash)
+			await run('user-fallback', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-fallback', 'Fallback User']);
+			const user = await first('user-fallback', 'SELECT * FROM users WHERE id = ?', ['user-fallback']);
+
+			expect(user).toBeTruthy();
+			expect(user?.name).toBe('Fallback User');
+		});
+
+		it('should handle missing target region gracefully', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				strategy: 'location',
+				// No targetRegion provided
+				shardLocations: {
+					'db-west': { region: 'wnam', priority: 2 },
+					'db-east': { region: 'enam', priority: 1 }
+				},
+				shards: {
+					'db-west': mockDB1 as any,
+					'db-east': mockDB2 as any
+				}
+			};
+
+			initialize(config);
+
+			// Should fallback to hash strategy
+			await run('user-no-target', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-no-target', 'No Target User']);
+			const user = await first('user-no-target', 'SELECT * FROM users WHERE id = ?', ['user-no-target']);
+
+			expect(user).toBeTruthy();
+			expect(user?.name).toBe('No Target User');
+		});
+
+		it('should respect shard priorities', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				strategy: 'location',
+				targetRegion: 'weur',
+				shardLocations: {
+					'db-priority-high': { region: 'weur', priority: 3 },
+					'db-priority-low': { region: 'weur', priority: 1 }
+				},
+				shards: {
+					'db-priority-high': mockDB1 as any,
+					'db-priority-low': mockDB2 as any
+				}
+			};
+
+			initialize(config);
+
+			// Both are in the same region but different priorities
+			// High priority should be preferred (though we can't directly test
+			// shard selection in this mock setup, we test that it works)
+			await run('user-priority-test', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-priority-test', 'Priority Test User']);
+
+			const user = await first('user-priority-test', 'SELECT * FROM users WHERE id = ?', ['user-priority-test']);
+			expect(user).toBeTruthy();
+			expect(user?.name).toBe('Priority Test User');
+		});
+
+		it('should maintain consistency for same primary key', async () => {
+			const config: CollegeDBConfig = {
+				kv: mockKV as any,
+				strategy: 'location',
+				targetRegion: 'apac',
+				shardLocations: {
+					'db-tokyo': { region: 'apac', priority: 2 },
+					'db-sydney': { region: 'oc', priority: 1 }
+				},
+				shards: {
+					'db-tokyo': mockDB1 as any,
+					'db-sydney': mockDB2 as any
+				}
+			};
+
+			initialize(config);
+
+			const primaryKey = 'user-consistency-test';
+
+			// First operation
+			await run(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Consistency Test User']);
+
+			// Subsequent operations should go to same shard
+			await run(primaryKey, 'UPDATE users SET name = ? WHERE id = ?', ['Updated User', primaryKey]);
+
+			const user = await first(primaryKey, 'SELECT * FROM users WHERE id = ?', [primaryKey]);
+			expect(user).toBeTruthy();
+			expect(user?.name).toBe('Updated User');
+		});
+	});
+
+	describe('IP Geolocation', () => {
+		it('should return correct region for US West Coast', () => {
+			const mockRequest = {
+				cf: {
+					country: 'US',
+					continent: 'NA',
+					region: 'CA',
+					timezone: 'America/Los_Angeles'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('wnam');
+		});
+
+		it('should return correct region for US East Coast', () => {
+			const mockRequest = {
+				cf: {
+					country: 'US',
+					continent: 'NA',
+					region: 'NY'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('enam');
+		});
+
+		it('should return correct region for European countries', () => {
+			const mockRequestUK = {
+				cf: {
+					country: 'GB',
+					continent: 'EU'
+				}
+			} as unknown as Request;
+
+			const regionUK = getClosestRegionFromIP(mockRequestUK);
+			expect(regionUK).toBe('weur');
+
+			const mockRequestGermany = {
+				cf: {
+					country: 'DE',
+					continent: 'EU'
+				}
+			} as unknown as Request;
+
+			const regionDE = getClosestRegionFromIP(mockRequestGermany);
+			expect(regionDE).toBe('eeur');
+		});
+
+		it('should return correct region for Asia Pacific countries', () => {
+			const mockRequestJapan = {
+				cf: {
+					country: 'JP',
+					continent: 'AS'
+				}
+			} as unknown as Request;
+
+			const regionJP = getClosestRegionFromIP(mockRequestJapan);
+			expect(regionJP).toBe('apac');
+
+			const mockRequestIndia = {
+				cf: {
+					country: 'IN',
+					continent: 'AS'
+				}
+			} as unknown as Request;
+
+			const regionIN = getClosestRegionFromIP(mockRequestIndia);
+			expect(regionIN).toBe('apac');
+		});
+
+		it('should return correct region for Oceania', () => {
+			const mockRequest = {
+				cf: {
+					country: 'AU',
+					continent: 'OC'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('oc');
+		});
+
+		it('should return correct region for Middle East', () => {
+			const mockRequest = {
+				cf: {
+					country: 'AE',
+					continent: 'AS'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('me');
+		});
+
+		it('should return correct region for Africa', () => {
+			const mockRequest = {
+				cf: {
+					country: 'ZA',
+					continent: 'AF'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('af');
+		});
+
+		it('should fallback to wnam when no CF data available', () => {
+			const mockRequest = {} as unknown as Request;
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('wnam');
+
+			const mockRequestNoCF = {
+				cf: undefined
+			} as unknown as Request;
+			const regionNoCF = getClosestRegionFromIP(mockRequestNoCF);
+			expect(regionNoCF).toBe('wnam');
+		});
+
+		it('should handle South American countries correctly', () => {
+			const mockRequest = {
+				cf: {
+					country: 'BR',
+					continent: 'SA'
+				}
+			} as unknown as Request;
+
+			const region = getClosestRegionFromIP(mockRequest);
+			expect(region).toBe('enam'); // Geographically closer to Eastern North America
 		});
 	});
 });

@@ -40,9 +40,9 @@
  * @since 1.0.0
  */
 
-import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types';
+import type { D1Database, D1PreparedStatement, D1Result, Request } from '@cloudflare/workers-types';
 import { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, ShardStats } from './types.js';
+import type { CollegeDBConfig, D1Region, ShardLocation, ShardStats } from './types.js';
 
 /**
  * Global configuration for the collegedb instance
@@ -256,6 +256,265 @@ function getConfig(): CollegeDBConfig {
 }
 
 /**
+ * Calculates the relative distance between two D1 regions for location-based sharding.
+ * Lower values indicate closer regions with better expected latency.
+ *
+ * @private
+ * @param from - Source region
+ * @param to - Target region
+ * @returns Relative distance score (lower is better)
+ */
+function calculateRegionDistance(from: D1Region, to: D1Region): number {
+	// Same region = optimal
+	if (from === to) return 0;
+
+	// Define region coordinates (approximate)
+	const regionCoords: Record<D1Region, { lat: number; lon: number }> = {
+		wnam: { lat: 37.7749, lon: -122.4194 }, // San Francisco
+		enam: { lat: 40.7128, lon: -74.006 }, // New York
+		weur: { lat: 51.5074, lon: -0.1278 }, // London
+		eeur: { lat: 52.52, lon: 13.405 }, // Berlin
+		apac: { lat: 35.6762, lon: 139.6503 }, // Tokyo
+		oc: { lat: -33.8688, lon: 151.2093 }, // Sydney
+		me: { lat: 25.2048, lon: 55.2708 }, // Dubai
+		af: { lat: -26.2041, lon: 28.0473 } // Johannesburg
+	};
+
+	const fromCoord = regionCoords[from];
+	const toCoord = regionCoords[to];
+
+	// Simple Euclidean distance calculation
+	const latDiff = fromCoord.lat - toCoord.lat;
+	const lonDiff = fromCoord.lon - toCoord.lon;
+	return Math.sqrt(latDiff * latDiff + lonDiff * lonDiff);
+}
+
+/**
+ * Determines the closest D1 region based on an IP address.
+ * Uses IP geolocation to estimate the user's location and find the nearest D1 region.
+ *
+ * This function uses Cloudflare's CF object which provides geolocation data
+ * in Cloudflare Workers environment. Falls back to 'wnam' if geolocation fails.
+ *
+ * @param request - The incoming Request object (contains CF geolocation data in Cloudflare Workers)
+ * @returns The closest D1Region based on IP geolocation
+ * @example
+ * ```typescript
+ * // In a Cloudflare Worker
+ * export default {
+ *   async fetch(request: Request, env: Env) {
+ *     const userRegion = getClosestRegionFromIP(request);
+ *
+ *     initialize({
+ *       kv: env.KV,
+ *       strategy: 'location',
+ *       targetRegion: userRegion, // Automatically optimized for user location
+ *       shardLocations: { ... },
+ *       shards: { ... }
+ *     });
+ *   }
+ * };
+ * ```
+ */
+export function getClosestRegionFromIP(request: Request): D1Region {
+	const cf = request.cf;
+
+	if (!cf || !cf.country) {
+		return 'wnam';
+	}
+
+	const country = cf.country as string;
+	const continent = cf.continent as string;
+
+	// Western North America
+	if (['US', 'CA', 'MX'].includes(country)) {
+		// Further refine by region/state if available
+		const region = (cf.region || cf.regionCode || '') as string;
+		const timezone = (cf.timezone || '') as string;
+
+		// West Coast indicators
+		if (
+			region.includes('CA') ||
+			region.includes('WA') ||
+			region.includes('OR') ||
+			region.includes('NV') ||
+			region.includes('AZ') ||
+			region.includes('UT') ||
+			timezone.includes('Pacific') ||
+			timezone.includes('America/Los_Angeles')
+		) {
+			return 'wnam';
+		}
+
+		// East Coast and Central - default to Eastern North America
+		return 'enam';
+	}
+
+	// Eastern North America (broader North America)
+	if (['GL', 'PM', 'BM'].includes(country)) {
+		return 'enam';
+	}
+
+	// Western Europe
+	if (['GB', 'IE', 'FR', 'ES', 'PT', 'NL', 'BE', 'LU', 'CH', 'AT', 'IT'].includes(country)) {
+		return 'weur';
+	}
+
+	// Eastern Europe
+	if (
+		[
+			'DE',
+			'PL',
+			'CZ',
+			'SK',
+			'HU',
+			'SI',
+			'HR',
+			'BA',
+			'RS',
+			'ME',
+			'MK',
+			'AL',
+			'BG',
+			'RO',
+			'MD',
+			'UA',
+			'BY',
+			'LT',
+			'LV',
+			'EE',
+			'FI',
+			'SE',
+			'NO',
+			'DK',
+			'IS'
+		].includes(country)
+	) {
+		return 'eeur';
+	}
+
+	// Russia - closer to Eastern Europe for most population centers
+	if (country === 'RU') {
+		return 'eeur';
+	}
+
+	// Asia Pacific
+	if (['JP', 'KR', 'CN', 'HK', 'TW', 'MO', 'MN', 'KP'].includes(country)) {
+		return 'apac';
+	}
+
+	// Southeast Asia and South Asia -> APAC
+	if (
+		['TH', 'VN', 'SG', 'MY', 'ID', 'PH', 'BN', 'KH', 'LA', 'MM', 'TL', 'IN', 'PK', 'BD', 'LK', 'NP', 'BT', 'MV', 'AF'].includes(country)
+	) {
+		return 'apac';
+	}
+
+	// Oceania
+	if (['AU', 'NZ', 'PG', 'FJ', 'NC', 'VU', 'SB', 'WS', 'TO', 'KI', 'NR', 'PW', 'FM', 'MH', 'TV'].includes(country)) {
+		return 'oc';
+	}
+
+	// Middle East
+	if (['AE', 'SA', 'QA', 'KW', 'BH', 'OM', 'YE', 'IQ', 'IR', 'SY', 'LB', 'JO', 'IL', 'PS', 'TR', 'CY'].includes(country)) {
+		return 'me';
+	}
+
+	// Africa
+	if (continent === 'AF' || ['EG', 'LY', 'TN', 'DZ', 'MA', 'SD', 'SS', 'ET', 'ER', 'DJ', 'SO'].includes(country)) {
+		return 'af';
+	}
+
+	// Central Asia -> closer to Eastern Europe
+	if (['KZ', 'UZ', 'TM', 'TJ', 'KG'].includes(country)) {
+		return 'eeur';
+	}
+
+	// South America -> geographically closer to Eastern North America
+	if (continent === 'SA' || ['BR', 'AR', 'CL', 'PE', 'CO', 'VE', 'EC', 'BO', 'PY', 'UY', 'GY', 'SR', 'GF'].includes(country)) {
+		return 'enam';
+	}
+
+	// Central America and Caribbean -> Eastern North America
+	if (
+		['GT', 'BZ', 'SV', 'HN', 'NI', 'CR', 'PA', 'CU', 'JM', 'HT', 'DO', 'PR', 'TT', 'BB', 'GD', 'VC', 'LC', 'DM', 'AG', 'KN'].includes(
+			country
+		)
+	) {
+		return 'enam';
+	}
+
+	// Default fallback - Western North America (major Cloudflare hub)
+	return 'wnam';
+}
+
+/**
+ * Selects the optimal shard for location-based allocation strategy.
+ * Prioritizes shards in the target region, then nearby regions by distance.
+ *
+ * @private
+ * @param targetRegion - The preferred region for allocation
+ * @param availableShards - List of available shard names
+ * @param shardLocations - Geographic locations of each shard
+ * @param primaryKey - The primary key being allocated (for consistent tiebreaking)
+ * @returns Selected shard name
+ */
+function selectShardByLocation(
+	targetRegion: D1Region,
+	availableShards: string[],
+	shardLocations: Record<string, ShardLocation>,
+	primaryKey: string
+): string {
+	// Filter shards that have location information
+	const locatedShards = availableShards.filter((shard) => shardLocations[shard]);
+
+	if (locatedShards.length === 0) {
+		// Fallback to hash if no location info available
+		let hash = 0;
+		for (let i = 0; i < primaryKey.length; i++) {
+			const char = primaryKey.charCodeAt(i);
+			hash = (hash << 5) - hash + char;
+			hash = hash & hash;
+		}
+		const index = Math.abs(hash) % availableShards.length;
+		return availableShards[index]!;
+	}
+
+	// Calculate distances and priorities
+	const shardScores = locatedShards.map((shard) => {
+		const location = shardLocations[shard]!;
+		const distance = calculateRegionDistance(targetRegion, location.region);
+		const priority = location.priority || 1;
+
+		// Lower score is better (distance penalty, priority bonus)
+		const score = distance - priority * 0.1;
+
+		return { shard, score, distance, priority };
+	});
+
+	// Sort by score (lower is better)
+	shardScores.sort((a, b) => a.score - b.score);
+
+	// For ties in the best score range, use consistent hashing
+	const bestScore = shardScores[0]!.score;
+	const bestShards = shardScores.filter((s) => Math.abs(s.score - bestScore) < 0.01);
+
+	if (bestShards.length === 1) {
+		return bestShards[0]!.shard;
+	}
+
+	// Consistent selection among best candidates
+	let hash = 0;
+	for (let i = 0; i < primaryKey.length; i++) {
+		const char = primaryKey.charCodeAt(i);
+		hash = (hash << 5) - hash + char;
+		hash = hash & hash;
+	}
+	const index = Math.abs(hash) % bestShards.length;
+	return bestShards[index]!.shard;
+}
+
+/**
  * Gets or allocates a shard for a primary key
  *
  * This is the core routing function that determines which shard should handle
@@ -266,6 +525,7 @@ function getConfig(): CollegeDBConfig {
  * - **round-robin**: Cycles through shards in order (with coordinator)
  * - **random**: Randomly selects from available shards
  * - **hash**: Uses consistent hashing for deterministic assignment
+ * - **location**: Selects shards based on geographic proximity to target region
  *
  * The function prefers using the Durable Object coordinator when available
  * for centralized allocation decisions, falling back to local strategies
@@ -338,7 +598,9 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					primaryKey,
-					strategy: config.strategy || 'round-robin'
+					strategy: config.strategy || 'round-robin',
+					targetRegion: config.targetRegion,
+					shardLocations: config.shardLocations
 				})
 			});
 
@@ -350,7 +612,7 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
 			}
 		} catch (error) {
-			console.warn('Coordinator allocation failed, falling back to random:', error);
+			console.warn('Coordinator allocation failed, falling back to local strategy:', error);
 			selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
 		}
 	} else {
@@ -366,6 +628,22 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 				}
 				const index = Math.abs(hash) % availableShards.length;
 				selectedShard = availableShards[index]!;
+				break;
+			case 'location':
+				if (!config.targetRegion) {
+					console.warn('Location strategy requires targetRegion in config, falling back to hash');
+					// Fallback to hash
+					let fallbackHash = 0;
+					for (let i = 0; i < primaryKey.length; i++) {
+						const char = primaryKey.charCodeAt(i);
+						fallbackHash = (fallbackHash << 5) - fallbackHash + char;
+						fallbackHash = fallbackHash & fallbackHash;
+					}
+					const fallbackIndex = Math.abs(fallbackHash) % availableShards.length;
+					selectedShard = availableShards[fallbackIndex]!;
+				} else {
+					selectedShard = selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
+				}
 				break;
 			case 'random':
 				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
