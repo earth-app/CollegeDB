@@ -41,8 +41,9 @@
  */
 
 import type { D1Database, D1PreparedStatement, D1Result, Request } from '@cloudflare/workers-types';
+import { CollegeDBError } from './errors.js';
 import { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, D1Region, ShardLocation, ShardStats } from './types.js';
+import type { CollegeDBConfig, D1Region, OperationType, ShardLocation, ShardStats, ShardingStrategy } from './types.js';
 
 /**
  * Global configuration for the collegedb instance
@@ -95,7 +96,7 @@ let globalConfig: CollegeDBConfig | null = null;
 export function initialize(config: CollegeDBConfig) {
 	globalConfig = config;
 
-	if (config.shards && Object.keys(config.shards).length > 0) {
+	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration) {
 		performAutoMigration(config).catch((error) => {
 			console.warn('Background auto-migration failed:', error);
 		});
@@ -145,7 +146,7 @@ export function initialize(config: CollegeDBConfig) {
 export async function initializeAsync(config: CollegeDBConfig) {
 	globalConfig = config;
 
-	if (config.shards && Object.keys(config.shards).length > 0)
+	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration)
 		try {
 			await performAutoMigration(config);
 		} catch (error) {
@@ -238,6 +239,16 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 }
 
 /**
+ * Resets the global configuration (for testing purposes only)
+ *
+ * @private
+ * @internal
+ */
+export function resetConfig(): void {
+	globalConfig = null;
+}
+
+/**
  * Gets the global configuration, throwing an error if not initialized
  *
  * Internal utility function that retrieves the global configuration and
@@ -250,9 +261,51 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
  */
 function getConfig(): CollegeDBConfig {
 	if (!globalConfig) {
-		throw new Error('CollegeDB not initialized. Call initialize() first.');
+		throw new CollegeDBError('CollegeDB not initialized. Call initialize() first.', 'NOT_INITIALIZED');
 	}
 	return globalConfig;
+}
+
+/**
+ * Determines the operation type from a SQL statement
+ * @private
+ * @param sql - The SQL statement to analyze
+ * @returns The operation type ('read' for SELECT, 'write' for INSERT/UPDATE/DELETE)
+ */
+function getOperationType(sql: string): OperationType {
+	const sql0 = sql.trim().toUpperCase();
+
+	if (
+		sql0.startsWith('SELECT') ||
+		sql0.startsWith('VALUES') ||
+		sql0.startsWith('TABLE') ||
+		sql0.startsWith('PRAGMA') ||
+		sql0.startsWith('EXPLAIN') ||
+		sql0.startsWith('WITH') ||
+		sql0.startsWith('SHOW')
+	) {
+		return 'read';
+	}
+
+	// All other operations (INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, etc.) are considered writes
+	return 'write';
+}
+
+/**
+ * Resolves the effective sharding strategy based on configuration and operation type
+ * @private
+ * @param config - CollegeDB configuration
+ * @param type - The type of operation being performed
+ * @returns The effective sharding strategy to use
+ */
+function resolveStrategy(config: CollegeDBConfig, type: OperationType): ShardingStrategy {
+	const strategy = config.strategy || 'hash';
+
+	if (typeof strategy === 'string') {
+		return strategy;
+	}
+
+	return strategy[type];
 }
 
 /**
@@ -515,7 +568,7 @@ function selectShardByLocation(
 }
 
 /**
- * Gets or allocates a shard for a primary key
+ * Gets or allocates a shard for a primary key with operation-specific strategy
  *
  * This is the core routing function that determines which shard should handle
  * a given primary key. If a mapping already exists, it returns the existing
@@ -533,16 +586,18 @@ function selectShardByLocation(
  *
  * @private
  * @param primaryKey - The primary key to route
+ * @param operationType - The type of operation (read/write) for mixed strategy support
  * @returns Promise resolving to the shard binding name
  * @throws {Error} If no shards are configured or allocation fails
  * @example
  * ```typescript
  * // This function is called internally by CRUD operations
- * const shard = await getShardForKey('user-123');
- * console.log(`User 123 is assigned to: ${shard}`);
+ * const readShard = await getShardForKey('user-123', 'read');
+ * const writeShard = await getShardForKey('user-123', 'write');
+ * console.log(`User 123 reads from: ${readShard}, writes to: ${writeShard}`);
  * ```
  */
-async function getShardForKey(primaryKey: string): Promise<string> {
+async function getShardForKey(primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
 	const config = getConfig();
 	const mapper = new KVShardMapper(config.kv);
 
@@ -556,7 +611,7 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 	// and perform automatic migration if needed
 	const availableShards = Object.keys(config.shards);
 	if (availableShards.length === 0) {
-		throw new Error('No shards configured');
+		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
 	}
 
 	// Check existing shards for unmapped data containing this primary key
@@ -587,6 +642,9 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 	// If no existing mapping found after auto-migration, allocate a new shard
 	let selectedShard: string;
 
+	// Resolve the effective strategy for this operation type
+	const effectiveStrategy = resolveStrategy(config, operationType);
+
 	// Use coordinator if available for allocation
 	if (config.coordinator) {
 		try {
@@ -598,7 +656,8 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					primaryKey,
-					strategy: config.strategy || 'round-robin',
+					strategy: effectiveStrategy, // Use resolved strategy instead of config.strategy
+					operationType, // Pass operation type for coordinator awareness
 					targetRegion: config.targetRegion,
 					shardLocations: config.shardLocations
 				})
@@ -617,8 +676,7 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 		}
 	} else {
 		// Simple allocation strategy without coordinator
-		const strategy = config.strategy || 'round-robin';
-		switch (strategy) {
+		switch (effectiveStrategy) {
 			case 'hash':
 				let hash = 0;
 				for (let i = 0; i < primaryKey.length; i++) {
@@ -627,7 +685,7 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 					hash = hash & hash;
 				}
 				const index = Math.abs(hash) % availableShards.length;
-				selectedShard = availableShards[index]!;
+				selectedShard = availableShards[index] || availableShards[0]!;
 				break;
 			case 'location':
 				if (!config.targetRegion) {
@@ -640,13 +698,13 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 						fallbackHash = fallbackHash & fallbackHash;
 					}
 					const fallbackIndex = Math.abs(fallbackHash) % availableShards.length;
-					selectedShard = availableShards[fallbackIndex]!;
+					selectedShard = availableShards[fallbackIndex] || availableShards[0]!;
 				} else {
 					selectedShard = selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
 				}
 				break;
 			case 'random':
-				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
+				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
 				break;
 			default: // round-robin
 				selectedShard = availableShards[0]!; // Simplified without state
@@ -660,24 +718,26 @@ async function getShardForKey(primaryKey: string): Promise<string> {
 }
 
 /**
- * Gets the D1 database instance for a primary key
+ * Gets the D1 database instance for a primary key with operation-specific routing
  *
  * Resolves the primary key to its assigned shard and returns the corresponding
  * D1 database instance. This function handles the complete routing process
- * from primary key to database connection.
+ * from primary key to database connection, with support for different strategies
+ * based on operation type.
  *
  * @private
  * @param primaryKey - The primary key to route
+ * @param operationType - The type of operation (read/write) for mixed strategy support
  * @returns Promise resolving to the D1 database instance
  * @throws {Error} If shard routing fails or database instance not found
  */
-async function getDatabase(primaryKey: string): Promise<D1Database> {
+async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<D1Database> {
 	const config = getConfig();
-	const shard = await getShardForKey(primaryKey);
+	const shard = await getShardForKey(primaryKey, operationType);
 	const database = config.shards[shard];
 
 	if (!database) {
-		throw new Error(`Shard ${shard} not found in configuration`);
+		throw new CollegeDBError(`Shard ${shard} not found in configuration`, 'SHARD_NOT_FOUND');
 	}
 
 	return database;
@@ -708,7 +768,7 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
 }
 
 /**
- * Prepares a SQL statement for execution.
+ * Prepares a SQL statement for execution with operation-aware routing.
  *
  * @param key - The primary key to route the query
  * @param sql - The SQL statement to prepare
@@ -716,7 +776,8 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
  * @throws {Error} If preparation fails
  */
 export async function prepare(key: string, sql: string): Promise<D1PreparedStatement> {
-	const db = await getDatabase(key);
+	const operationType = getOperationType(sql);
+	const db = await getDatabase(key, operationType);
 	const result = db.prepare(sql);
 	return result;
 }
@@ -788,7 +849,7 @@ export async function run<T = Record<string, unknown>>(key: string, sql: string,
 	const result = await prepared.bind(...bindings).run<T>();
 
 	if (!result.success) {
-		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+		throw new CollegeDBError(`Query failed: ${result.error || 'Unknown error'}`, 'QUERY_FAILED');
 	}
 
 	return result;
@@ -830,7 +891,7 @@ export async function all<T = Record<string, unknown>>(key: string, sql: string,
 	const result = await prepared.bind(...bindings).all<T>();
 
 	if (!result.success) {
-		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+		throw new CollegeDBError(`Query failed: ${result.error || 'Unknown error'}`, 'QUERY_FAILED');
 	}
 
 	return result;
@@ -912,14 +973,14 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 	const config = getConfig();
 
 	if (!config.shards[newBinding]) {
-		throw new Error(`Shard ${newBinding} not found in configuration`);
+		throw new CollegeDBError(`Shard ${newBinding} not found in configuration`, 'SHARD_NOT_FOUND');
 	}
 
 	const mapper = new KVShardMapper(config.kv);
 	const currentMapping = await mapper.getShardMapping(primaryKey);
 
 	if (!currentMapping) {
-		throw new Error(`No existing mapping found for primary key: ${primaryKey}`);
+		throw new CollegeDBError(`No existing mapping found for primary key: ${primaryKey}`, 'MAPPING_NOT_FOUND');
 	}
 
 	// Migrate data if different shard
@@ -929,7 +990,7 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 		const targetDb = config.shards[newBinding];
 
 		if (!sourceDb || !targetDb) {
-			throw new Error('Source or target shard not available');
+			throw new CollegeDBError('Source or target shard not available', 'SHARD_UNAVAILABLE');
 		}
 
 		await migrateRecord(sourceDb, targetDb, primaryKey, tableName);
@@ -1069,7 +1130,7 @@ export async function runShard<T = Record<string, unknown>>(shardBinding: string
 	const db = config.shards[shardBinding];
 
 	if (!db) {
-		throw new Error(`Shard ${shardBinding} not found`);
+		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
 	const result = await db
@@ -1078,7 +1139,7 @@ export async function runShard<T = Record<string, unknown>>(shardBinding: string
 		.run<T>();
 
 	if (!result.success) {
-		throw new Error(`Query failed: ${result.error || 'Unknown error'}`);
+		throw new CollegeDBError(`Query failed: ${result.error || 'Unknown error'}`, 'QUERY_FAILED');
 	}
 
 	return result;
@@ -1122,7 +1183,7 @@ export async function allShard<T = Record<string, unknown>>(shardBinding: string
 	const db = config.shards[shardBinding];
 
 	if (!db) {
-		throw new Error(`Shard ${shardBinding} not found`);
+		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
 	const result = await db
@@ -1164,7 +1225,7 @@ export async function firstShard<T = Record<string, unknown>>(shardBinding: stri
 	const db = config.shards[shardBinding];
 
 	if (!db) {
-		throw new Error(`Shard ${shardBinding} not found`);
+		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
 	const result = await db

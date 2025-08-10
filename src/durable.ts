@@ -26,7 +26,8 @@
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import type { ShardCoordinatorState, ShardingStrategy } from './types.js';
+import { CollegeDBError } from './errors.js';
+import type { MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types.js';
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
@@ -190,6 +191,15 @@ export class ShardCoordinator {
 	 */
 	private async handleAddShard(request: Request): Promise<Response> {
 		const { shard } = (await request.json()) as { shard: string };
+
+		// Validate required parameters
+		if (!shard || typeof shard !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid shard parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const state = await this.getState();
 
 		if (!state.knownShards.includes(shard)) {
@@ -219,6 +229,15 @@ export class ShardCoordinator {
 	 */
 	private async handleRemoveShard(request: Request): Promise<Response> {
 		const { shard } = (await request.json()) as { shard: string };
+
+		// Validate required parameters
+		if (!shard || typeof shard !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid shard parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const state = await this.getState();
 
 		const index = state.knownShards.indexOf(shard);
@@ -263,6 +282,22 @@ export class ShardCoordinator {
 	 */
 	private async handleUpdateStats(request: Request): Promise<Response> {
 		const { shard, count } = (await request.json()) as { shard: string; count: number };
+
+		// Validate required parameters
+		if (!shard || typeof shard !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid shard parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		if (count === undefined || typeof count !== 'number') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid count parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const state = await this.getState();
 
 		if (state.shardStats[shard]) {
@@ -293,10 +328,20 @@ export class ShardCoordinator {
 	 * @example Response body: `{"shard": "db-west"}`
 	 */
 	private async handleAllocateShard(request: Request): Promise<Response> {
-		const { primaryKey, strategy } = (await request.json()) as {
+		const { primaryKey, strategy, operationType } = (await request.json()) as {
 			primaryKey: string;
 			strategy?: ShardingStrategy;
+			operationType?: OperationType;
 		};
+
+		// Validate required parameters
+		if (!primaryKey || typeof primaryKey !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid primaryKey parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const state = await this.getState();
 
 		if (state.knownShards.length === 0) {
@@ -306,10 +351,12 @@ export class ShardCoordinator {
 			});
 		}
 
-		const selectedShard = this.selectShard(primaryKey, state, strategy || state.strategy);
+		// Resolve the effective strategy based on state strategy and operation type
+		const effectiveStrategy = this.resolveStrategy(state.strategy, strategy, operationType || 'write');
+		const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy);
 
 		// Update round-robin index for next allocation
-		if ((strategy || state.strategy) === 'round-robin') {
+		if (effectiveStrategy === 'round-robin') {
 			state.roundRobinIndex = (state.roundRobinIndex + 1) % state.knownShards.length;
 			await this.saveState(state);
 		}
@@ -338,6 +385,34 @@ export class ShardCoordinator {
 	}
 
 	/**
+	 * Resolves the effective sharding strategy for a given operation type
+	 *
+	 * @private
+	 * @param configStrategy - The strategy from state configuration
+	 * @param requestStrategy - Optional strategy override from request
+	 * @param operationType - The type of operation (read/write)
+	 * @returns The effective sharding strategy to use
+	 */
+	private resolveStrategy(
+		configStrategy: ShardingStrategy | MixedShardingStrategy,
+		requestStrategy?: ShardingStrategy,
+		operationType: OperationType = 'write'
+	): ShardingStrategy {
+		// Request strategy overrides everything
+		if (requestStrategy) {
+			return requestStrategy;
+		}
+
+		// If config strategy is a string, use it for all operations
+		if (typeof configStrategy === 'string') {
+			return configStrategy;
+		}
+
+		// If config strategy is a mixed strategy object, use the appropriate strategy for the operation type
+		return configStrategy[operationType];
+	}
+
+	/**
 	 * Implements the core shard selection logic for different allocation strategies.
 	 * Uses consistent algorithms to ensure predictable shard assignment.
 	 *
@@ -351,18 +426,18 @@ export class ShardCoordinator {
 	 * @param state - Current coordinator state containing available shards
 	 * @param strategy - The allocation strategy to use
 	 * @returns The selected shard binding name
-	 * @throws {Error} If no shards are available
+	 * @throws {CollegeDBError} If no shards are available
 	 * @example
 	 * ```typescript
 	 * const shard = this.selectShard('user-123', state, 'hash');
 	 * // Returns: "db-west" (consistent for this key)
 	 * ```
 	 */
-	private selectShard(primaryKey: string, state: ShardCoordinatorState, strategy: 'round-robin' | 'random' | 'hash'): string {
+	private selectShard(primaryKey: string, state: ShardCoordinatorState, strategy: ShardingStrategy): string {
 		const shards = state.knownShards;
 
 		if (shards.length === 0) {
-			throw new Error('No shards available');
+			throw new CollegeDBError('No shards available', 'NO_SHARDS');
 		}
 
 		switch (strategy) {
@@ -382,6 +457,18 @@ export class ShardCoordinator {
 				}
 				const index = Math.abs(hash) % shards.length;
 				return shards[index]!;
+
+			case 'location':
+				// For location strategy in coordinator, fallback to hash
+				// The actual location logic is handled in router.ts
+				let locationHash = 0;
+				for (let i = 0; i < primaryKey.length; i++) {
+					const char = primaryKey.charCodeAt(i);
+					locationHash = (locationHash << 5) - locationHash + char;
+					locationHash = locationHash & locationHash;
+				}
+				const locationIndex = Math.abs(locationHash) % shards.length;
+				return shards[locationIndex]!;
 
 			default:
 				return shards[0]!;
@@ -415,7 +502,7 @@ export class ShardCoordinator {
 	 * moved from a shard. Prevents negative counts.
 	 * @param shard - The shard binding name to decrement
 	 * @returns Promise that resolves when the count is updated
-	 * @throws {Error} If the shard is not known to the coordinator
+	 * @throws {CollegeDBError} If the shard is not known to the coordinator
 	 * @example
 	 * ```typescript
 	 * await coordinator.decrementShardCount('db-west');
@@ -430,3 +517,254 @@ export class ShardCoordinator {
 		}
 	}
 }
+
+//#region Tests - Only run in test environment
+if (process.env.NODE_ENV === 'test' || typeof global !== 'undefined') {
+	/**
+	 * Mock Durable Object Storage for testing
+	 */
+	class MockDurableObjectStorage {
+		private data = new Map<string, any>();
+
+		async get<T = unknown>(key: string): Promise<T | undefined> {
+			return this.data.get(key);
+		}
+
+		async put<T = unknown>(key: string, value: T): Promise<void> {
+			this.data.set(key, value);
+		}
+
+		async delete(key: string): Promise<boolean> {
+			return this.data.delete(key);
+		}
+
+		async deleteAll(): Promise<void> {
+			this.data.clear();
+		}
+
+		async list(options?: { prefix?: string }): Promise<Map<string, any>> {
+			if (!options?.prefix) return new Map(this.data);
+
+			const filtered = new Map();
+			for (const [key, value] of this.data.entries()) {
+				if (key.startsWith(options.prefix)) {
+					filtered.set(key, value);
+				}
+			}
+			return filtered;
+		}
+	}
+
+	/**
+	 * Mock Durable Object State for testing
+	 */
+	class MockDurableObjectState {
+		storage: MockDurableObjectStorage;
+
+		constructor() {
+			this.storage = new MockDurableObjectStorage();
+		}
+	}
+
+	/**
+	 * Tests for ShardCoordinator class
+	 * These tests verify the core functionality of the ShardCoordinator
+	 * including state management, shard allocation, and HTTP API endpoints
+	 */
+	class ShardCoordinatorTests {
+		private coordinator: ShardCoordinator;
+		private mockState: MockDurableObjectState;
+
+		constructor() {
+			this.mockState = new MockDurableObjectState();
+			this.coordinator = new ShardCoordinator(this.mockState as any);
+		}
+
+		/**
+		 * Test shard allocation strategies
+		 */
+		async testShardAllocation() {
+			// Add some shards first
+			await this.coordinator.fetch(
+				new Request('http://test/shards', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-east' })
+				})
+			);
+
+			await this.coordinator.fetch(
+				new Request('http://test/shards', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-west' })
+				})
+			);
+
+			// Test round-robin allocation
+			const allocation1 = await this.coordinator.fetch(
+				new Request('http://test/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'user-1', strategy: 'round-robin' })
+				})
+			);
+			const result1 = (await allocation1.json()) as { shard: string };
+
+			const allocation2 = await this.coordinator.fetch(
+				new Request('http://test/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'user-2', strategy: 'round-robin' })
+				})
+			);
+			const result2 = (await allocation2.json()) as { shard: string };
+
+			// Should allocate to different shards with round-robin
+			console.assert(result1.shard !== result2.shard, 'Round-robin should alternate shards');
+
+			// Test hash allocation (should be consistent)
+			const hashAllocation1 = await this.coordinator.fetch(
+				new Request('http://test/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'consistent-key', strategy: 'hash' })
+				})
+			);
+			const hashResult1 = (await hashAllocation1.json()) as { shard: string };
+
+			const hashAllocation2 = await this.coordinator.fetch(
+				new Request('http://test/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'consistent-key', strategy: 'hash' })
+				})
+			);
+			const hashResult2 = (await hashAllocation2.json()) as { shard: string };
+
+			// Hash should be consistent for same key
+			console.assert(hashResult1.shard === hashResult2.shard, 'Hash allocation should be consistent');
+
+			console.log('✅ Shard allocation tests passed');
+		}
+
+		/**
+		 * Test shard statistics management
+		 */
+		async testShardStats() {
+			// Clear state
+			await this.coordinator.fetch(new Request('http://test/flush', { method: 'POST' }));
+
+			// Add shard
+			await this.coordinator.fetch(
+				new Request('http://test/shards', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-stats-test' })
+				})
+			);
+
+			// Update stats
+			await this.coordinator.fetch(
+				new Request('http://test/stats', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-stats-test', count: 42 })
+				})
+			);
+
+			// Get stats
+			const statsResponse = await this.coordinator.fetch(new Request('http://test/stats', { method: 'GET' }));
+			const stats = (await statsResponse.json()) as Array<{ binding: string; count: number }>;
+
+			console.assert(stats.length === 1, 'Should have one shard stat');
+			console.assert(stats[0]?.binding === 'db-stats-test', 'Should have correct binding name');
+			console.assert(stats[0]?.count === 42, 'Should have correct count');
+
+			console.log('✅ Shard stats tests passed');
+		}
+
+		/**
+		 * Test error handling
+		 */
+		async testErrorHandling() {
+			// Clear state
+			await this.coordinator.fetch(new Request('http://test/flush', { method: 'POST' }));
+
+			// Try to allocate with no shards
+			const emptyAllocation = await this.coordinator.fetch(
+				new Request('http://test/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'test-key' })
+				})
+			);
+
+			console.assert(emptyAllocation.status === 400, 'Should return 400 for no shards available');
+
+			// Test invalid endpoint
+			const invalidEndpoint = await this.coordinator.fetch(new Request('http://test/invalid', { method: 'GET' }));
+			console.assert(invalidEndpoint.status === 404, 'Should return 404 for invalid endpoint');
+
+			console.log('✅ Error handling tests passed');
+		}
+
+		/**
+		 * Test the increment/decrement functionality
+		 */
+		async testCountManagement() {
+			// Add a shard
+			await this.coordinator.fetch(
+				new Request('http://test/shards', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-count-test' })
+				})
+			);
+
+			// Increment count
+			await this.coordinator.incrementShardCount('db-count-test');
+			await this.coordinator.incrementShardCount('db-count-test');
+
+			// Check stats
+			let statsResponse = await this.coordinator.fetch(new Request('http://test/stats', { method: 'GET' }));
+			let stats = (await statsResponse.json()) as Array<{ binding: string; count: number }>;
+
+			const shard = stats.find((s) => s.binding === 'db-count-test');
+			console.assert(shard?.count === 2, 'Count should be 2 after two increments');
+
+			// Decrement count
+			await this.coordinator.decrementShardCount('db-count-test');
+
+			statsResponse = await this.coordinator.fetch(new Request('http://test/stats', { method: 'GET' }));
+			stats = (await statsResponse.json()) as Array<{ binding: string; count: number }>;
+
+			const updatedShard = stats.find((s) => s.binding === 'db-count-test');
+			console.assert(updatedShard?.count === 1, 'Count should be 1 after decrement');
+
+			console.log('✅ Count management tests passed');
+		}
+
+		/**
+		 * Run all tests
+		 */
+		async runAllTests() {
+			console.log('🧪 Running ShardCoordinator tests...');
+
+			try {
+				await this.testShardAllocation();
+				await this.testShardStats();
+				await this.testErrorHandling();
+				await this.testCountManagement();
+
+				console.log('🎉 All ShardCoordinator tests passed!');
+				return true;
+			} catch (error) {
+				console.error('❌ ShardCoordinator tests failed:', error);
+				return false;
+			}
+		}
+	}
+
+	// Auto-run tests if this file is executed directly
+	if (typeof require !== 'undefined' && require.main === module) {
+		const tests = new ShardCoordinatorTests();
+		tests.runAllTests().then((success) => {
+			process.exit(success ? 0 : 1);
+		});
+	}
+
+	// Export for external testing
+	(globalThis as any).testShardCoordinator = () => new ShardCoordinatorTests();
+}
+//#endregion

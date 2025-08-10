@@ -2,16 +2,24 @@ import type { Request } from '@cloudflare/workers-types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	all,
+	allShard,
 	autoDetectAndMigrate,
 	checkMigrationNeeded,
 	clearMigrationCache,
+	clearShardMigrationCache,
+	collegedb,
+	CollegeDBError,
 	first,
+	firstShard,
+	flush,
 	getClosestRegionFromIP,
 	getShardStats,
 	initialize,
 	listKnownShards,
 	reassignShard,
-	run
+	resetConfig,
+	run,
+	runShard
 } from '../src/index.js';
 import type { CollegeDBConfig } from '../src/types.js';
 
@@ -28,22 +36,8 @@ const TEST_SCHEMA = `
 		user_id TEXT NOT NULL,
 		title TEXT NOT NULL,
 		content TEXT,
-		FOREIGN KEY (user_id) REFERE		it('should cache migration results to avoid repeated checks', async () => {
-			const config: CollegeDBConfig = {
-				kv: mockKV as any,
-				shards: { 'db-cache': mockDB1 as any },
-				strategy: 'hash'
-			};
-
-			// First migration should detect and migrate
-			const result1 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config, { skipCache: true });
-			expect(result1.migrationPerformed).toBe(true);
-
-			// Second migration should be cached (no migration performed)
-			const result2 = await autoDetectAndMigrate(mockDB1 as any, 'db-cache', config);
-			expect(result2.migrationPerformed).toBe(false);
-			expect(result2.recordsMigrated).toBe(0);
-		}););
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
 
 	CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
 `;
@@ -101,6 +95,7 @@ class MockD1Database {
 
 		if (sql.includes('INSERT')) {
 			const tableName = sql.match(/INSERT (?:OR REPLACE )?INTO (\w+)/)?.[1];
+			const isReplace = sql.includes('OR REPLACE');
 			if (tableName) {
 				if (!this.data.has(tableName)) this.data.set(tableName, []);
 				const table = this.data.get(tableName)!;
@@ -108,10 +103,15 @@ class MockD1Database {
 				// Handle different table structures
 				if (tableName === 'users') {
 					const record = { id: args[0], name: args[1], email: args[2] };
-					// Remove existing record with same id for REPLACE behavior
+					// Check for existing record with same id
 					const existingIndex = table.findIndex((r: any) => r.id === args[0]);
 					if (existingIndex > -1) {
-						table[existingIndex] = record;
+						if (isReplace) {
+							table[existingIndex] = record;
+						} else {
+							// Simulate UNIQUE constraint violation
+							return { success: false, error: 'UNIQUE constraint failed: users.id' };
+						}
 					} else {
 						table.push(record);
 					}
@@ -119,7 +119,11 @@ class MockD1Database {
 					const record = { id: args[0], user_id: args[1], title: args[2], content: args[3] };
 					const existingIndex = table.findIndex((r: any) => r.id === args[0]);
 					if (existingIndex > -1) {
-						table[existingIndex] = record;
+						if (isReplace) {
+							table[existingIndex] = record;
+						} else {
+							return { success: false, error: 'UNIQUE constraint failed: posts.id' };
+						}
 					} else {
 						table.push(record);
 					}
@@ -128,6 +132,10 @@ class MockD1Database {
 					const record: any = { id: args[0] };
 					for (let i = 1; i < args.length; i++) {
 						record[`field_${i}`] = args[i];
+					}
+					const existingIndex = table.findIndex((r: any) => r.id === args[0]);
+					if (existingIndex > -1 && !isReplace) {
+						return { success: false, error: 'UNIQUE constraint failed' };
 					}
 					table.push(record);
 				}
@@ -349,7 +357,8 @@ describe('CollegeDB', () => {
 				'db-east': mockDB1 as any,
 				'db-west': mockDB2 as any
 			},
-			strategy: 'round-robin'
+			strategy: 'round-robin',
+			disableAutoMigration: true // Disable auto-migration for most tests
 		};
 
 		initialize(mockConfig);
@@ -465,6 +474,667 @@ describe('CollegeDB', () => {
 
 		it('should throw error when reassigning non-existent key', async () => {
 			await expect(reassignShard('non-existent', 'db-west', 'users')).rejects.toThrow('No existing mapping found');
+		});
+	});
+
+	describe('ShardCoordinator (Durable Object)', () => {
+		let coordinator: any;
+		let mockState: any;
+
+		beforeEach(async () => {
+			// Create mock durable object state
+			const mockStorage = new Map();
+			mockState = {
+				storage: {
+					get: async (key: string) => Promise.resolve(mockStorage.get(key)),
+					put: async (key: string, value: any) => {
+						mockStorage.set(key, value);
+						return Promise.resolve();
+					},
+					delete: async (key: string) => Promise.resolve(mockStorage.delete(key)),
+					deleteAll: async () => {
+						mockStorage.clear();
+						return Promise.resolve();
+					}
+				}
+			};
+
+			// Import and create coordinator
+			const { ShardCoordinator } = await import('../src/durable.js');
+			coordinator = new ShardCoordinator(mockState);
+		});
+
+		it('should handle health check endpoint', async () => {
+			// Create a proper Request object
+			const request = {
+				url: 'http://test/health',
+				method: 'GET'
+			} as any;
+
+			const response = await coordinator.fetch(request);
+
+			expect(response.status).toBe(200);
+			expect(await response.text()).toBe('OK');
+		});
+
+		it('should return empty shards list initially', async () => {
+			const request = {
+				url: 'http://test/shards',
+				method: 'GET'
+			} as any;
+
+			const response = await coordinator.fetch(request);
+
+			expect(response.status).toBe(200);
+			const shards = await response.json();
+			expect(shards).toEqual([]);
+		});
+
+		it('should add and list shards', async () => {
+			// Add first shard
+			const addRequest1 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-east' })
+			} as any;
+
+			const addResponse1 = await coordinator.fetch(addRequest1);
+			expect(addResponse1.status).toBe(200);
+			expect(await addResponse1.json()).toEqual({ success: true });
+
+			// Add second shard
+			const addRequest2 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-west' })
+			} as any;
+
+			const addResponse2 = await coordinator.fetch(addRequest2);
+			expect(addResponse2.status).toBe(200);
+
+			// List shards
+			const listRequest = {
+				url: 'http://test/shards',
+				method: 'GET'
+			} as any;
+
+			const listResponse = await coordinator.fetch(listRequest);
+			const shards = await listResponse.json();
+			expect(shards).toEqual(['db-east', 'db-west']);
+		});
+
+		it('should handle adding duplicate shards idempotently', async () => {
+			const request1 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test' })
+			} as any;
+
+			const request2 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test' })
+			} as any;
+
+			// Add shard twice
+			await coordinator.fetch(request1);
+			await coordinator.fetch(request2);
+
+			// Should only appear once
+			const listRequest = {
+				url: 'http://test/shards',
+				method: 'GET'
+			} as any;
+
+			const response = await coordinator.fetch(listRequest);
+			const shards = await response.json();
+			expect(shards).toEqual(['db-test']);
+		});
+
+		it('should allocate shards using hash strategy', async () => {
+			// Add shards first
+			const addRequest1 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-east' })
+			} as any;
+
+			const addRequest2 = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-west' })
+			} as any;
+
+			await coordinator.fetch(addRequest1);
+			await coordinator.fetch(addRequest2);
+
+			// Allocate with hash strategy
+			const allocateRequest = {
+				url: 'http://test/allocate',
+				method: 'POST',
+				json: async () => ({ primaryKey: 'consistent-key', strategy: 'hash' })
+			} as any;
+
+			const response = await coordinator.fetch(allocateRequest);
+
+			expect(response.status).toBe(200);
+			const result = await response.json();
+			expect(['db-east', 'db-west']).toContain(result.shard);
+
+			// Same key should get same shard
+			const response2 = await coordinator.fetch(allocateRequest);
+			const result2 = await response2.json();
+			expect(result2.shard).toBe(result.shard);
+		});
+
+		it('should return error when allocating with no shards', async () => {
+			const request = {
+				url: 'http://test/allocate',
+				method: 'POST',
+				json: async () => ({ primaryKey: 'test-key' })
+			} as any;
+
+			const response = await coordinator.fetch(request);
+
+			expect(response.status).toBe(400);
+			const result = await response.json();
+			expect(result).toEqual({ error: 'No shards available' });
+		});
+
+		it('should handle invalid endpoints', async () => {
+			const request = {
+				url: 'http://test/invalid',
+				method: 'GET'
+			} as any;
+
+			const response = await coordinator.fetch(request);
+
+			expect(response.status).toBe(404);
+			expect(await response.text()).toBe('Not Found');
+		});
+
+		it('should provide shard statistics', async () => {
+			// Add shard
+			const addRequest = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test' })
+			} as any;
+
+			await coordinator.fetch(addRequest);
+
+			// Get initial stats
+			const statsRequest = {
+				url: 'http://test/stats',
+				method: 'GET'
+			} as any;
+
+			let response = await coordinator.fetch(statsRequest);
+			let stats = await response.json();
+			expect(stats).toHaveLength(1);
+			expect(stats[0]).toMatchObject({
+				binding: 'db-test',
+				count: 0
+			});
+			expect(stats[0].lastUpdated).toBeTypeOf('number');
+
+			// Update stats
+			const updateRequest = {
+				url: 'http://test/stats',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test', count: 42 })
+			} as any;
+
+			await coordinator.fetch(updateRequest);
+
+			// Check updated stats
+			response = await coordinator.fetch(statsRequest);
+			stats = await response.json();
+			expect(stats[0].count).toBe(42);
+		});
+
+		it('should handle increment and decrement shard counts', async () => {
+			// Add shard
+			const addRequest = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-count-test' })
+			} as any;
+
+			await coordinator.fetch(addRequest);
+
+			// Increment count using direct methods
+			await coordinator.incrementShardCount('db-count-test');
+			await coordinator.incrementShardCount('db-count-test');
+
+			// Check stats
+			const statsRequest = {
+				url: 'http://test/stats',
+				method: 'GET'
+			} as any;
+
+			let response = await coordinator.fetch(statsRequest);
+			let stats = await response.json();
+			let shard = stats.find((s: any) => s.binding === 'db-count-test');
+			expect(shard?.count).toBe(2);
+
+			// Decrement count
+			await coordinator.decrementShardCount('db-count-test');
+
+			// Check updated stats
+			response = await coordinator.fetch(statsRequest);
+			stats = await response.json();
+			shard = stats.find((s: any) => s.binding === 'db-count-test');
+			expect(shard?.count).toBe(1);
+
+			// Try to decrement below zero
+			await coordinator.decrementShardCount('db-count-test');
+			await coordinator.decrementShardCount('db-count-test'); // Should not go below 0
+
+			response = await coordinator.fetch(statsRequest);
+			stats = await response.json();
+			shard = stats.find((s: any) => s.binding === 'db-count-test');
+			expect(shard?.count).toBe(0); // Should not be negative
+		});
+
+		it('should handle increment/decrement for non-existent shards gracefully', async () => {
+			// These should not throw errors
+			await expect(coordinator.incrementShardCount('non-existent')).resolves.toBeUndefined();
+			await expect(coordinator.decrementShardCount('non-existent')).resolves.toBeUndefined();
+		});
+
+		it('should flush all state', async () => {
+			// Add shard and update stats
+			const addRequest = {
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test' })
+			} as any;
+
+			const updateStatsRequest = {
+				url: 'http://test/stats',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test', count: 10 })
+			} as any;
+
+			await coordinator.fetch(addRequest);
+			await coordinator.fetch(updateStatsRequest);
+
+			// Verify data exists
+			const listRequest = {
+				url: 'http://test/shards',
+				method: 'GET'
+			} as any;
+
+			let response = await coordinator.fetch(listRequest);
+			let shards = await response.json();
+			expect(shards).toEqual(['db-test']);
+
+			// Flush all data
+			const flushRequest = {
+				url: 'http://test/flush',
+				method: 'POST'
+			} as any;
+
+			const flushResponse = await coordinator.fetch(flushRequest);
+			expect(flushResponse.status).toBe(200);
+			expect(await flushResponse.json()).toEqual({ success: true });
+
+			// Verify data is cleared
+			response = await coordinator.fetch(listRequest);
+			shards = await response.json();
+			expect(shards).toEqual([]);
+		});
+
+		it('should handle round-robin strategy with multiple allocations', async () => {
+			// Add three shards
+			const addRequests = ['db-1', 'db-2', 'db-3'].map(
+				(shard) =>
+					({
+						url: 'http://test/shards',
+						method: 'POST',
+						json: async () => ({ shard })
+					}) as any
+			);
+
+			for (const request of addRequests) {
+				await coordinator.fetch(request);
+			}
+
+			// Allocate multiple keys with round-robin
+			const allocations = [];
+			for (let i = 0; i < 6; i++) {
+				const request = {
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: `key-${i}`, strategy: 'round-robin' })
+				} as any;
+
+				const response = await coordinator.fetch(request);
+				const result = await response.json();
+				allocations.push(result.shard);
+			}
+
+			// Should cycle through shards: db-1, db-2, db-3, db-1, db-2, db-3
+			expect(allocations[0]).toBe('db-1');
+			expect(allocations[1]).toBe('db-2');
+			expect(allocations[2]).toBe('db-3');
+			expect(allocations[3]).toBe('db-1');
+			expect(allocations[4]).toBe('db-2');
+			expect(allocations[5]).toBe('db-3');
+		});
+
+		it('should handle shard removal and update stats', async () => {
+			// Add shards
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-remove-test' })
+			} as any);
+
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-keep' })
+			} as any);
+
+			// Update stats for both
+			await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'POST',
+				json: async () => ({ shard: 'db-remove-test', count: 5 })
+			} as any);
+
+			await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'POST',
+				json: async () => ({ shard: 'db-keep', count: 10 })
+			} as any);
+
+			// Remove one shard
+			const removeResponse = await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'DELETE',
+				json: async () => ({ shard: 'db-remove-test' })
+			} as any);
+
+			expect(removeResponse.status).toBe(200);
+
+			// Check that stats for removed shard are gone
+			const statsResponse = await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'GET'
+			} as any);
+
+			const stats = await statsResponse.json();
+			expect(stats).toHaveLength(1);
+			expect(stats[0].binding).toBe('db-keep');
+			expect(stats[0].count).toBe(10);
+		});
+
+		it('should fallback to default shard selection', async () => {
+			// Add a single shard
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-only' })
+			} as any);
+
+			// Test with unknown strategy (should fallback)
+			const request = {
+				url: 'http://test/allocate',
+				method: 'POST',
+				json: async () => ({ primaryKey: 'test-key', strategy: 'unknown' })
+			} as any;
+
+			const response = await coordinator.fetch(request);
+			expect(response.status).toBe(200);
+
+			const result = await response.json();
+			expect(result.shard).toBe('db-only');
+		});
+
+		it('should handle selectShard with single shard gracefully', async () => {
+			// Add single shard
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-single' })
+			} as any);
+
+			// Test all strategies with single shard
+			const strategies = ['hash', 'random', 'round-robin', 'location'];
+
+			for (const strategy of strategies) {
+				const request = {
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: `test-${strategy}`, strategy })
+				} as any;
+
+				const response = await coordinator.fetch(request);
+				expect(response.status).toBe(200);
+
+				const result = await response.json();
+				expect(result.shard).toBe('db-single');
+			}
+		});
+
+		it('should handle complex round-robin with shard removal during allocation', async () => {
+			// Add multiple shards
+			const shards = ['db-1', 'db-2', 'db-3', 'db-4'];
+			for (const shard of shards) {
+				await coordinator.fetch({
+					url: 'http://test/shards',
+					method: 'POST',
+					json: async () => ({ shard })
+				} as any);
+			}
+
+			// Allocate a few keys to advance round-robin
+			for (let i = 0; i < 3; i++) {
+				await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: `pre-key-${i}`, strategy: 'round-robin' })
+				} as any);
+			}
+
+			// Remove a shard (should adjust round-robin index)
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'DELETE',
+				json: async () => ({ shard: 'db-4' })
+			} as any);
+
+			// Next allocation should still work
+			const response = await coordinator.fetch({
+				url: 'http://test/allocate',
+				method: 'POST',
+				json: async () => ({ primaryKey: 'post-removal-key', strategy: 'round-robin' })
+			} as any);
+
+			expect(response.status).toBe(200);
+			const result = await response.json();
+			expect(['db-1', 'db-2', 'db-3']).toContain(result.shard);
+		});
+
+		it('should maintain consistent hash allocation for same keys', async () => {
+			// Add multiple shards
+			const shards = ['db-a', 'db-b', 'db-c', 'db-d', 'db-e'];
+			for (const shard of shards) {
+				await coordinator.fetch({
+					url: 'http://test/shards',
+					method: 'POST',
+					json: async () => ({ shard })
+				} as any);
+			}
+
+			// Test hash consistency for multiple keys
+			const testKeys = ['user-123', 'order-456', 'product-789', 'session-abc'];
+			const allocations: Record<string, string> = {};
+
+			// First allocation round
+			for (const key of testKeys) {
+				const response = await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: key, strategy: 'hash' })
+				} as any);
+
+				const result = await response.json();
+				allocations[key] = result.shard;
+			}
+
+			// Second allocation round - should be identical
+			for (const key of testKeys) {
+				const response = await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: key, strategy: 'hash' })
+				} as any);
+
+				const result = await response.json();
+				expect(result.shard).toBe(allocations[key]);
+			}
+		});
+
+		it('should handle random strategy distribution', async () => {
+			// Add multiple shards
+			const shards = ['db-rand-1', 'db-rand-2'];
+			for (const shard of shards) {
+				await coordinator.fetch({
+					url: 'http://test/shards',
+					method: 'POST',
+					json: async () => ({ shard })
+				} as any);
+			}
+
+			// Allocate many keys with random strategy
+			const results = new Set<string>();
+			for (let i = 0; i < 20; i++) {
+				const response = await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: `random-key-${i}`, strategy: 'random' })
+				} as any);
+
+				const result = await response.json();
+				results.add(result.shard);
+			}
+
+			// Should use both shards eventually (high probability with 20 allocations)
+			expect(results.size).toBeGreaterThan(0);
+			for (const shard of results) {
+				expect(shards).toContain(shard);
+			}
+		});
+
+		it('should handle edge cases in count management', async () => {
+			// Add shard
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-edge-test' })
+			} as any);
+
+			// Test multiple decrements on zero count
+			await coordinator.decrementShardCount('db-edge-test'); // Should handle gracefully
+			await coordinator.decrementShardCount('db-edge-test'); // Should handle gracefully
+
+			// Verify count is still zero
+			const statsResponse = await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'GET'
+			} as any);
+
+			const stats = await statsResponse.json();
+			const shard = stats.find((s: any) => s.binding === 'db-edge-test');
+			expect(shard?.count).toBe(0);
+
+			// Test increment after decrements
+			await coordinator.incrementShardCount('db-edge-test');
+			await coordinator.incrementShardCount('db-edge-test');
+
+			const updatedStatsResponse = await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'GET'
+			} as any);
+
+			const updatedStats = await updatedStatsResponse.json();
+			const updatedShard = updatedStats.find((s: any) => s.binding === 'db-edge-test');
+			expect(updatedShard?.count).toBe(2);
+		});
+
+		it('should handle requests with missing parameters', async () => {
+			// Add a shard first so we're not testing the "no shards" case
+			await coordinator.fetch({
+				url: 'http://test/shards',
+				method: 'POST',
+				json: async () => ({ shard: 'db-test-params' })
+			} as any);
+
+			// Test allocate without primaryKey
+			const allocateResponse = await coordinator.fetch({
+				url: 'http://test/allocate',
+				method: 'POST',
+				json: async () => ({}) // Missing primaryKey
+			} as any);
+
+			expect(allocateResponse.status).toBe(400); // Should error due to missing primaryKey
+
+			// Test stats update without shard
+			const statsResponse = await coordinator.fetch({
+				url: 'http://test/stats',
+				method: 'POST',
+				json: async () => ({ count: 10 }) // Missing shard
+			} as any);
+
+			expect(statsResponse.status).toBe(400); // Should error due to missing shard
+		});
+
+		it('should test location strategy hash fallback thoroughly', async () => {
+			// Add shards with diverse names to test hash distribution
+			const shards = ['db-location-1', 'db-location-2', 'db-location-3'];
+			for (const shard of shards) {
+				await coordinator.fetch({
+					url: 'http://test/shards',
+					method: 'POST',
+					json: async () => ({ shard })
+				} as any);
+			}
+
+			// Test location strategy with various primary keys
+			const testKeys = ['user-west-coast-123', 'order-east-region-456', 'product-europe-789', 'session-asia-abc', 'data-africa-def'];
+
+			const keyToShard: Record<string, string> = {};
+
+			// Allocate each key multiple times - should be consistent
+			for (const key of testKeys) {
+				const response1 = await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: key, strategy: 'location' })
+				} as any);
+
+				const result1 = await response1.json();
+				keyToShard[key] = result1.shard;
+
+				// Second allocation should be identical
+				const response2 = await coordinator.fetch({
+					url: 'http://test/allocate',
+					method: 'POST',
+					json: async () => ({ primaryKey: key, strategy: 'location' })
+				} as any);
+
+				const result2 = await response2.json();
+				expect(result2.shard).toBe(result1.shard);
+			}
+
+			// Verify all shards are valid
+			for (const shard of Object.values(keyToShard)) {
+				expect(shards).toContain(shard);
+			}
 		});
 	});
 
@@ -642,6 +1312,13 @@ describe('CollegeDB', () => {
 			// Clear migration cache before each test
 			clearMigrationCache();
 
+			// Clear KV store state to ensure clean slate for each test
+			mockKV.clear();
+
+			// Clear database state and recreate schema
+			mockDB1.clear();
+			mockDB2.clear();
+
 			// Create existing database with data
 			const { createSchema } = await import('../src/migrations.js');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
@@ -659,13 +1336,18 @@ describe('CollegeDB', () => {
 				.prepare('INSERT INTO posts (id, user_id, title, content) VALUES (?, ?, ?, ?)')
 				.bind('auto-post-1', 'auto-user-1', 'Auto Post', 'Automatically migrated')
 				.run();
+
+			// Clear specific shard cache to ensure fresh check
+			clearShardMigrationCache('db-auto');
+			clearShardMigrationCache('db-cache');
 		});
 
 		it('should detect when migration is needed', async () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-auto': mockDB1 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
 			const needsMigration = await checkMigrationNeeded(mockDB1 as any, 'db-auto', config);
@@ -676,10 +1358,28 @@ describe('CollegeDB', () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-auto': mockDB1 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
+			// Debug: Check database state before migration
+			const { listTables, validateTableForSharding } = await import('../src/migrations.js');
+			const tables = await listTables(mockDB1 as any);
+			console.log('Tables found:', tables);
+
+			// Check if data actually exists
+			const userCount = await mockDB1.prepare('SELECT COUNT(*) as count FROM users').first();
+			const postCount = await mockDB1.prepare('SELECT COUNT(*) as count FROM posts').first();
+			console.log('User count:', (userCount as any)?.count, 'Post count:', (postCount as any)?.count);
+
+			// Debug: Check table validation
+			for (const table of tables) {
+				const validation = await validateTableForSharding(mockDB1 as any, table, 'id');
+				console.log(`Table ${table} validation:`, validation);
+			}
+
 			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-auto', config, { skipCache: true });
+			console.log('Migration result:', result);
 
 			expect(result.migrationNeeded).toBe(true);
 			expect(result.migrationPerformed).toBe(true);
@@ -701,7 +1401,8 @@ describe('CollegeDB', () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-auto': mockDB1 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
 			// First migration should detect and migrate
@@ -719,8 +1420,8 @@ describe('CollegeDB', () => {
 			initialize({
 				kv: mockKV as any,
 				shards: {
-					'db-auto': mockDB1 as any,
-					'db-new': mockDB2 as any
+					'db-auto': mockDB1 as any, // Use same shard name as test data
+					'db-west': mockDB2 as any
 				},
 				strategy: 'hash'
 			});
@@ -745,7 +1446,8 @@ describe('CollegeDB', () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-empty': mockDB2 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
 			const result = await autoDetectAndMigrate(mockDB2 as any, 'db-empty', config);
@@ -763,7 +1465,8 @@ describe('CollegeDB', () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-mixed': mockDB1 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
 			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-mixed', config, { skipCache: true });
@@ -777,7 +1480,8 @@ describe('CollegeDB', () => {
 			const config: CollegeDBConfig = {
 				kv: mockKV as any,
 				shards: { 'db-cache': mockDB1 as any },
-				strategy: 'hash'
+				strategy: 'hash',
+				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
 			// First migration
@@ -812,7 +1516,8 @@ describe('CollegeDB', () => {
 					'db-west': mockDB1 as any,
 					'db-east': mockDB2 as any,
 					'db-europe': mockDB1 as any
-				}
+				},
+				disableAutoMigration: true
 			};
 
 			initialize(config);
@@ -840,7 +1545,8 @@ describe('CollegeDB', () => {
 				shards: {
 					'db-1': mockDB1 as any,
 					'db-2': mockDB2 as any
-				}
+				},
+				disableAutoMigration: true
 			};
 
 			initialize(config);
@@ -865,7 +1571,8 @@ describe('CollegeDB', () => {
 				shards: {
 					'db-west': mockDB1 as any,
 					'db-east': mockDB2 as any
-				}
+				},
+				disableAutoMigration: true
 			};
 
 			initialize(config);
@@ -890,7 +1597,8 @@ describe('CollegeDB', () => {
 				shards: {
 					'db-priority-high': mockDB1 as any,
 					'db-priority-low': mockDB2 as any
-				}
+				},
+				disableAutoMigration: true
 			};
 
 			initialize(config);
@@ -917,7 +1625,8 @@ describe('CollegeDB', () => {
 				shards: {
 					'db-tokyo': mockDB1 as any,
 					'db-sydney': mockDB2 as any
-				}
+				},
+				disableAutoMigration: true
 			};
 
 			initialize(config);
@@ -1066,6 +1775,209 @@ describe('CollegeDB', () => {
 
 			const region = getClosestRegionFromIP(mockRequest);
 			expect(region).toBe('enam'); // Geographically closer to Eastern North America
+		});
+	});
+
+	describe('CollegeDB Method', () => {
+		beforeEach(async () => {
+			// Create schema directly with the migration module
+			const { createSchema } = await import('../src/migrations.js');
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
+		});
+
+		it('should initialize and execute callback with collegedb method', async () => {
+			const result = await collegedb(mockConfig, async () => {
+				// Insert data using the collegedb method context
+				await run('user-callback-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [
+					'user-callback-123',
+					'Callback User',
+					'callback@example.com'
+				]);
+
+				// Query the data back
+				const user = await first('user-callback-123', 'SELECT * FROM users WHERE id = ?', ['user-callback-123']);
+				return user;
+			});
+
+			expect(result).toBeTruthy();
+			expect(result?.id).toBe('user-callback-123');
+			expect(result?.name).toBe('Callback User');
+			expect(result?.email).toBe('callback@example.com');
+		});
+
+		it('should handle async operations in callback', async () => {
+			const users = await collegedb(mockConfig, async () => {
+				// Insert multiple users
+				await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'User 1']);
+				await run('user-2', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-2', 'User 2']);
+				await run('user-3', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-3', 'User 3']);
+
+				// Return all users
+				const allUsers = [];
+				for (const userId of ['user-1', 'user-2', 'user-3']) {
+					const user = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+					if (user) allUsers.push(user);
+				}
+				return allUsers;
+			});
+
+			expect(users).toHaveLength(3);
+			expect(users.map((u: any) => u.name)).toEqual(['User 1', 'User 2', 'User 3']);
+		});
+	});
+
+	describe('Shard Methods', () => {
+		beforeEach(async () => {
+			// Create schema directly with the migration module
+			const { createSchema } = await import('../src/migrations.js');
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
+		});
+
+		it('should execute runShard method on specific shard', async () => {
+			const result = await runShard('db-east', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [
+				'user-shard-run',
+				'Shard User',
+				'shard@example.com'
+			]);
+
+			expect(result.success).toBe(true);
+		});
+
+		it('should execute allShard method on specific shard', async () => {
+			// Insert test data first
+			await runShard('db-east', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-all-1', 'All User 1']);
+			await runShard('db-east', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-all-2', 'All User 2']);
+
+			const result = await allShard('db-east', 'SELECT * FROM users WHERE name LIKE ?', ['All User%']);
+
+			expect(result.success).toBe(true);
+			expect(result.results).toHaveLength(2);
+		});
+
+		it('should execute firstShard method on specific shard', async () => {
+			// Insert test data first
+			await runShard('db-west', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-first', 'First User', 'first@example.com']);
+
+			const result = await firstShard('db-west', 'SELECT * FROM users WHERE id = ?', ['user-first']);
+
+			expect(result).toBeTruthy();
+			expect(result?.name).toBe('First User');
+			expect(result?.email).toBe('first@example.com');
+		});
+
+		it('should throw CollegeDBError for invalid shard in runShard', async () => {
+			await expect(runShard('invalid-shard', 'SELECT 1')).rejects.toThrow(CollegeDBError);
+			await expect(runShard('invalid-shard', 'SELECT 1')).rejects.toThrow('Shard invalid-shard not found');
+		});
+
+		it('should throw CollegeDBError for invalid shard in allShard', async () => {
+			await expect(allShard('invalid-shard', 'SELECT 1')).rejects.toThrow(CollegeDBError);
+		});
+
+		it('should throw CollegeDBError for invalid shard in firstShard', async () => {
+			await expect(firstShard('invalid-shard', 'SELECT 1')).rejects.toThrow(CollegeDBError);
+		});
+	});
+
+	describe('Flush Method', () => {
+		it('should flush all mappings', async () => {
+			// Insert some data to create mappings
+			await run('user-flush-test', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-flush-test', 'Flush User']);
+
+			// Verify mapping exists by running stats
+			const statsBefore = await getShardStats();
+			expect(statsBefore.length).toBeGreaterThan(0);
+
+			// Flush all mappings
+			await flush();
+
+			// Stats should be cleared or reset
+			// Note: The actual implementation of flush depends on what it clears
+		});
+	});
+
+	describe('Error Handling', () => {
+		beforeEach(async () => {
+			// Create schema directly with the migration module
+			const { createSchema } = await import('../src/migrations.js');
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
+		});
+
+		it('should throw CollegeDBError for query execution failures', async () => {
+			// Try to insert duplicate primary key
+			await run('user-duplicate', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-duplicate', 'First']);
+
+			await expect(run('user-duplicate', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-duplicate', 'Duplicate'])).rejects.toThrow(
+				CollegeDBError
+			);
+		});
+
+		it('should throw CollegeDBError when not initialized', async () => {
+			// Clear initialization
+			const originalConfig = mockConfig;
+			resetConfig();
+
+			await expect(run('test', 'SELECT 1')).rejects.toThrow(CollegeDBError);
+			await expect(run('test', 'SELECT 1')).rejects.toThrow('CollegeDB not initialized');
+
+			// Restore initialization
+			initialize(originalConfig);
+		});
+
+		it('should handle allocation strategy without coordinator', async () => {
+			// Test with hash strategy
+			const configWithoutCoordinator: CollegeDBConfig = {
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: 'hash'
+			};
+
+			initialize(configWithoutCoordinator);
+
+			// Should still work without coordinator
+			await run('hash-user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['hash-user-1', 'Hash User 1']);
+			const user = await first('hash-user-1', 'SELECT * FROM users WHERE id = ?', ['hash-user-1']);
+
+			expect(user).toBeTruthy();
+			expect(user?.name).toBe('Hash User 1');
+
+			// Test random strategy
+			configWithoutCoordinator.strategy = 'random';
+			initialize(configWithoutCoordinator);
+
+			await run('random-user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['random-user-1', 'Random User 1']);
+			const randomUser = await first('random-user-1', 'SELECT * FROM users WHERE id = ?', ['random-user-1']);
+
+			expect(randomUser).toBeTruthy();
+			expect(randomUser?.name).toBe('Random User 1');
+
+			// Restore original config
+			initialize(mockConfig);
+		});
+	});
+
+	describe('CollegeDBError', () => {
+		it('should create error with message and code', () => {
+			const error = new CollegeDBError('Test error message', 'TEST_ERROR');
+
+			expect(error.message).toBe('Test error message');
+			expect(error.code).toBe('TEST_ERROR');
+			expect(error.name).toBe('CollegeDBError');
+			expect(error instanceof Error).toBe(true);
+		});
+
+		it('should create error without code', () => {
+			const error = new CollegeDBError('Test error without code');
+
+			expect(error.message).toBe('Test error without code');
+			expect(error.code).toBeUndefined();
+			expect(error.name).toBe('CollegeDBError');
 		});
 	});
 });

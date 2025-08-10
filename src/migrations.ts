@@ -32,6 +32,7 @@
  */
 
 import type { D1Database } from '@cloudflare/workers-types';
+import { CollegeDBError } from './errors.js';
 import type { KVShardMapper } from './kvmap.js';
 import type { CollegeDBConfig, ShardingStrategy } from './types.js';
 
@@ -79,7 +80,7 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
 			await d1.prepare(statement).run();
 		} catch (error) {
 			console.error('Failed to execute schema statement:', statement, error);
-			throw new Error(`Schema migration failed: ${error}`);
+			throw new CollegeDBError(`Schema migration failed: ${error}`, 'SCHEMA_MIGRATION_FAILED');
 		}
 	}
 }
@@ -117,7 +118,7 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
 export async function createSchemaAcrossShards(shards: Record<string, D1Database>, schema: string): Promise<void> {
 	const promises = Object.entries(shards).map(([shardName, db]) => {
 		return createSchema(db, schema).catch((error) => {
-			throw new Error(`Failed to create schema on shard ${shardName}: ${error.message}`);
+			throw new CollegeDBError(`Failed to create schema on shard ${shardName}: ${error.message}`, 'SCHEMA_CREATION_FAILED');
 		});
 	});
 
@@ -247,7 +248,7 @@ export async function migrateRecord(source: D1Database, target: D1Database, prim
 	const sourceRecord = await source.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).bind(primaryKey).first();
 
 	if (!sourceRecord) {
-		throw new Error(`Record with primary key ${primaryKey} not found in source database`);
+		throw new CollegeDBError(`Record with primary key ${primaryKey} not found in source database`, 'RECORD_NOT_FOUND');
 	}
 
 	// Create schema if it doesn't exist in target
@@ -296,7 +297,7 @@ export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: str
 		const result = await d1.prepare(`SELECT ${primaryKeyColumn} FROM ${tableName}`).all();
 		return result.results.map((row: any) => String(row[primaryKeyColumn]));
 	} catch (error) {
-		throw new Error(`Failed to discover primary keys in table ${tableName}: ${error}`);
+		throw new CollegeDBError(`Failed to discover primary keys in table ${tableName}: ${error}`, 'DISCOVERY_FAILED');
 	}
 }
 
@@ -784,7 +785,7 @@ export async function autoDetectAndMigrate(
 export async function checkMigrationNeeded(d1: D1Database, shardName: string, config: CollegeDBConfig): Promise<boolean> {
 	const cacheKey = `${shardName}_migration_check`;
 
-	// Check cache first
+	// Check cache first (but not during tests with skip cache)
 	if (migrationStatusCache.has(cacheKey)) {
 		return false; // Already checked/migrated
 	}
@@ -852,4 +853,22 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
  */
 export function clearMigrationCache(): void {
 	migrationStatusCache.clear();
+}
+
+/**
+ * Clears a specific migration cache entry
+ *
+ * Resets the cache for a specific shard, forcing re-check on next
+ * migration detection call.
+ *
+ * @param shardName - The shard name to clear from cache
+ * @example
+ * ```typescript
+ * // Force re-check of specific shard
+ * clearShardMigrationCache('db-auto');
+ * ```
+ */
+export function clearShardMigrationCache(shardName: string): void {
+	const cacheKey = `${shardName}_migration_check`;
+	migrationStatusCache.delete(cacheKey);
 }

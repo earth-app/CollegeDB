@@ -53,7 +53,8 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 ## 📦 Features
 
 - **🔀 Automatic Query Routing**: Primary key → shard mapping using Cloudflare KV
-- **🎯 Multiple Allocation Strategies**: Round-robin, random, or hash-based distribution
+- **🎯 Multiple Allocation Strategies**: Round-robin, random, hash-based, and location-aware distribution
+- **🔄 Mixed Strategy Support**: Different strategies for reads vs writes (e.g., location for writes, hash for reads)
 - **📊 Shard Coordination**: Durable Objects for allocation and statistics
 - **🛠 Migration Support**: Move data between shards with zero downtime
 - **🔄 Automatic Drop-in Replacement**: Zero-config integration with existing databases
@@ -136,6 +137,57 @@ collegedb(
 	}
 );
 ```
+
+### Mixed Strategy Example
+
+```typescript
+import { collegedb, first, run, type MixedShardingStrategy } from 'collegedb';
+
+// Use location strategy for writes (optimal data placement) and hash for reads (optimal performance)
+const mixedStrategy: MixedShardingStrategy = {
+	write: 'location', // New data goes to geographically optimal shards
+	read: 'hash' // Reads use consistent hashing for best performance
+};
+
+collegedb(
+	{
+		kv: env.KV,
+		strategy: mixedStrategy,
+		targetRegion: 'wnam', // Western North America for writes
+		shardLocations: {
+			'db-west': { region: 'wnam', priority: 2 },
+			'db-east': { region: 'enam', priority: 1 },
+			'db-central': { region: 'enam', priority: 1 }
+		},
+		shards: {
+			'db-west': env.DB_WEST,
+			'db-east': env.DB_EAST,
+			'db-central': env.DB_CENTRAL
+		}
+	},
+	async () => {
+		// Write operations use location strategy - new users placed optimally
+		await run('user-california-456', 'INSERT INTO users (id, name, location) VALUES (?, ?, ?)', [
+			'user-california-456',
+			'California User',
+			'Los Angeles'
+		]);
+
+		// Read operations use hash strategy - consistent and fast routing
+		const user = await first<User>('user-california-456', 'SELECT * FROM users WHERE id = ?', ['user-california-456']);
+
+		// Different operations can route to different shards based on strategy
+		// This optimizes both data placement (writes) and query performance (reads)
+		console.log(`User: ${user?.name}, Location: ${user?.location}`);
+	}
+);
+```
+
+This approach provides:
+
+- **Optimal data placement**: New records are written to geographically optimal shards using `location` strategy
+- **Optimal read performance**: Queries use `hash` strategy for consistent, high-performance routing
+- **Flexibility**: Each operation type can use the most appropriate routing strategy
 
 ## Drop-in Replacement for Existing Databases
 
@@ -389,18 +441,22 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 
 ## 📚 API Reference
 
-| Function                       | Description                                  | Parameters               |
-| ------------------------------ | -------------------------------------------- | ------------------------ |
-| `collegedb(config, callback)`  | Initialize CollegeDB, then run a callback    | `CollegeDBConfig, ()=>T` |
-| `initialize(config)`           | Initialize CollegeDB with configuration      | `CollegeDBConfig`        |
-| `createSchema(d1)`             | Create database schema on a D1 instance      | `D1Database`             |
-| `prepare(key, sql)`            | Prepare a SQL statement for execution        | `string, string`         |
-| `run(key, sql, bindings)`      | Execute a SQL query with primary key routing | `string, string, any[]`  |
-| `first(key, sql, bindings)`    | Execute a SQL query and return first result  | `string, string, any[]`  |
-| `all(key, sql, bindings)`      | Execute a SQL query and return all results   | `string, string, any[]`  |
-| `reassignShard(key, newShard)` | Move primary key to different shard          | `string, string`         |
-| `listKnownShards()`            | Get list of available shards                 | `void`                   |
-| `getShardStats()`              | Get statistics for all shards                | `void`                   |
+| Function                           | Description                                          | Parameters               |
+| ---------------------------------- | ---------------------------------------------------- | ------------------------ |
+| `collegedb(config, callback)`      | Initialize CollegeDB, then run a callback            | `CollegeDBConfig, ()=>T` |
+| `initialize(config)`               | Initialize CollegeDB with configuration              | `CollegeDBConfig`        |
+| `createSchema(d1)`                 | Create database schema on a D1 instance              | `D1Database`             |
+| `prepare(key, sql)`                | Prepare a SQL statement for execution                | `string, string`         |
+| `run(key, sql, bindings)`          | Execute a SQL query with primary key routing         | `string, string, any[]`  |
+| `first(key, sql, bindings)`        | Execute a SQL query and return first result          | `string, string, any[]`  |
+| `all(key, sql, bindings)`          | Execute a SQL query and return all results           | `string, string, any[]`  |
+| `runShard(shard, sql, bindings)`   | Execute a SQL query directly on a specific shard     | `string, string, any[]`  |
+| `allShard(shard, sql, bindings)`   | Execute query on specific shard, return all results  | `string, string, any[]`  |
+| `firstShard(shard, sql, bindings)` | Execute query on specific shard, return first result | `string, string, any[]`  |
+| `reassignShard(key, newShard)`     | Move primary key to different shard                  | `string, string`         |
+| `listKnownShards()`                | Get list of available shards                         | `void`                   |
+| `getShardStats()`                  | Get statistics for all shards                        | `void`                   |
+| `flush()`                          | Clear all shard mappings (development only)          | `void`                   |
 
 ### Drop-in Replacement Functions
 
@@ -414,6 +470,181 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | `createMappingsForExistingKeys(keys)`     | Create shard mappings for existing keys                 | `string[], string[], strategy` |
 | `listTables(d1)`                          | Get list of tables in database                          | `D1Database`                   |
 | `clearMigrationCache()`                   | Clear automatic migration cache                         | `void`                         |
+
+### Error Handling
+
+| Class            | Description                                 | Usage                                 |
+| ---------------- | ------------------------------------------- | ------------------------------------- |
+| `CollegeDBError` | Custom error class for CollegeDB operations | `throw new CollegeDBError(msg, code)` |
+
+The `CollegeDBError` class extends the native `Error` class and includes an optional error code for better error categorization:
+
+```typescript
+try {
+	await run('invalid-key', 'SELECT * FROM users WHERE id = ?', ['invalid-key']);
+} catch (error) {
+	if (error instanceof CollegeDBError) {
+		console.error(`CollegeDB Error (${error.code}): ${error.message}`);
+	}
+}
+```
+
+### ShardCoordinator (Durable Object) API
+
+The `ShardCoordinator` is an optional Durable Object that provides centralized shard allocation and statistics management. All endpoints return JSON responses.
+
+#### HTTP API Endpoints
+
+| Endpoint    | Method | Description                        | Request Body                                     | Response                               |
+| ----------- | ------ | ---------------------------------- | ------------------------------------------------ | -------------------------------------- |
+| `/shards`   | GET    | List all registered shards         | None                                             | `["db-east", "db-west"]`               |
+| `/shards`   | POST   | Register a new shard               | `{"shard": "db-new"}`                            | `{"success": true}`                    |
+| `/shards`   | DELETE | Unregister a shard                 | `{"shard": "db-old"}`                            | `{"success": true}`                    |
+| `/stats`    | GET    | Get shard statistics               | None                                             | `[{"binding":"db-east","count":1542}]` |
+| `/stats`    | POST   | Update shard statistics            | `{"shard": "db-east", "count": 1600}`            | `{"success": true}`                    |
+| `/allocate` | POST   | Allocate shard for primary key     | `{"primaryKey": "user-123"}`                     | `{"shard": "db-west"}`                 |
+| `/allocate` | POST   | Allocate with specific strategy    | `{"primaryKey": "user-123", "strategy": "hash"}` | `{"shard": "db-west"}`                 |
+| `/flush`    | POST   | Clear all state (development only) | None                                             | `{"success": true}`                    |
+| `/health`   | GET    | Health check                       | None                                             | `"OK"`                                 |
+
+#### Programmatic Methods
+
+| Method                        | Description                   | Parameters           | Returns             |
+| ----------------------------- | ----------------------------- | -------------------- | ------------------- |
+| `new ShardCoordinator(state)` | Create coordinator instance   | `DurableObjectState` | `ShardCoordinator`  |
+| `fetch(request)`              | Handle HTTP requests          | `Request`            | `Promise<Response>` |
+| `incrementShardCount(shard)`  | Increment key count for shard | `string`             | `Promise<void>`     |
+| `decrementShardCount(shard)`  | Decrement key count for shard | `string`             | `Promise<void>`     |
+
+#### Usage Example
+
+```typescript
+import { ShardCoordinator } from 'collegedb';
+
+// Export for Cloudflare Workers runtime
+export { ShardCoordinator };
+
+// Use in your worker
+export default {
+	async fetch(request: Request, env: Env) {
+		const coordinatorId = env.ShardCoordinator.idFromName('default');
+		const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+		// Allocate shard for user
+		const response = await coordinator.fetch('http://coordinator/allocate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ primaryKey: 'user-123', strategy: 'hash' })
+		});
+
+		const { shard } = await response.json();
+		// Use allocated shard for database operations...
+	}
+};
+```
+
+### Configuration Types
+
+#### CollegeDBConfig
+
+The main configuration interface supports both single strategies and mixed strategies:
+
+```typescript
+interface CollegeDBConfig {
+	kv: KVNamespace;
+	coordinator?: DurableObjectNamespace;
+	shards: Record<string, D1Database>;
+	strategy?: ShardingStrategy | MixedShardingStrategy;
+	targetRegion?: D1Region;
+	shardLocations?: Record<string, ShardLocation>;
+	disableAutoMigration?: boolean;
+}
+```
+
+#### Strategy Types
+
+```typescript
+// Single strategy for all operations
+type ShardingStrategy = 'round-robin' | 'random' | 'hash' | 'location';
+
+// Mixed strategy for different operation types
+interface MixedShardingStrategy {
+	read: ShardingStrategy; // Strategy for SELECT operations
+	write: ShardingStrategy; // Strategy for INSERT/UPDATE/DELETE operations
+}
+
+// Operation types for internal routing
+type OperationType = 'read' | 'write';
+```
+
+#### Example Configurations
+
+```typescript
+// Single strategy configuration (traditional)
+const singleStrategyConfig: CollegeDBConfig = {
+	kv: env.KV,
+	strategy: 'hash', // All operations use hash strategy
+	shards: {
+		/* ... */
+	}
+};
+
+// Mixed strategy configuration (new feature)
+const mixedStrategyConfig: CollegeDBConfig = {
+	kv: env.KV,
+	strategy: {
+		read: 'hash', // Fast, consistent reads
+		write: 'location' // Optimal data placement
+	},
+	targetRegion: 'wnam',
+	shardLocations: {
+		/* ... */
+	},
+	shards: {
+		/* ... */
+	}
+};
+```
+
+### Types
+
+CollegeDB exports TypeScript types for better development experience and type safety:
+
+| Type                    | Description                    | Example                                             |
+| ----------------------- | ------------------------------ | --------------------------------------------------- |
+| `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                          |
+| `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'` |
+| `MixedShardingStrategy` | Mixed strategy configuration   | `{ read: 'hash', write: 'location' }`               |
+| `OperationType`         | Database operation types       | `'read' \| 'write'`                                 |
+| `D1Region`              | Cloudflare D1 regions          | `'wnam' \| 'enam' \| 'weur' \| ...`                 |
+| `ShardLocation`         | Geographic shard configuration | `{ region: 'wnam', priority: 2 }`                   |
+| `ShardStats`            | Shard usage statistics         | `{ binding: 'db-east', count: 1542 }`               |
+
+#### Mixed Strategy Configuration
+
+```typescript
+import type { MixedShardingStrategy, CollegeDBConfig } from 'collegedb';
+
+// Type-safe mixed strategy configuration
+const mixedStrategy: MixedShardingStrategy = {
+	read: 'hash', // Fast, deterministic reads
+	write: 'location' // Geographically optimized writes
+};
+
+const config: CollegeDBConfig = {
+	kv: env.KV,
+	strategy: mixedStrategy, // Type-checked
+	targetRegion: 'wnam',
+	shardLocations: {
+		'db-west': { region: 'wnam', priority: 2 },
+		'db-east': { region: 'enam', priority: 1 }
+	},
+	shards: {
+		'db-west': env.DB_WEST,
+		'db-east': env.DB_EAST
+	}
+};
+```
 
 ## 🏗 Architecture
 
@@ -438,10 +669,46 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 
 ### Data Flow
 
+#### Without ShardCoordinator (Hash/Random/Location strategies)
+
 1. **Query Received**: Application sends query with primary key
-2. **Shard Resolution**: CollegeDB checks KV for existing mapping or allocates new shard
-3. **Query Execution**: SQL executed on appropriate D1 database
-4. **Response**: Results returned to application
+2. **Shard Resolution**: CollegeDB checks KV for existing mapping or calculates shard using strategy
+3. **Direct Allocation**: For new keys, shard selected using hash/random/location algorithm
+4. **Query Execution**: SQL executed on appropriate D1 database
+5. **Response**: Results returned to application
+
+#### With ShardCoordinator (Round-Robin strategy)
+
+1. **Query Received**: Application sends query with primary key
+2. **Shard Resolution**: CollegeDB checks KV for existing mapping
+3. **Coordinator Allocation**: For new keys, coordinator allocates shard using round-robin
+4. **State Update**: Coordinator updates round-robin index and shard statistics
+5. **Query Execution**: SQL executed on appropriate D1 database
+6. **Response**: Results returned to application
+
+#### ShardCoordinator Internal Flow
+
+```txt
+┌─────────────────────────────────────────────────────────────┐
+│              ShardCoordinator (Durable Object)             │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐  ┌─────────────────────────────────┐  │
+│  │  HTTP API       │  │       Persistent Storage        │  │
+│  │  - /allocate    │  │  - knownShards: string[]        │  │
+│  │  - /shards      │  │  - shardStats: ShardStats{}     │  │
+│  │  - /stats       │  │  - strategy: ShardingStrategy   │  │
+│  │  - /health      │  │  - roundRobinIndex: number      │  │
+│  └─────────────────┘  └─────────────────────────────────┘  │
+│                                  │                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │           Allocation Algorithms                     │   │
+│  │  - Round-Robin: state.roundRobinIndex               │   │
+│  │  - Hash: consistent hash(primaryKey)                │   │
+│  │  - Random: Math.random() * shards.length            │   │
+│  │  - Location: region proximity + priority            │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Shard Allocation Strategies
 
@@ -490,6 +757,114 @@ name = "ShardCoordinator"
 class_name = "ShardCoordinator"
 ```
 
+#### Complete wrangler.toml with ShardCoordinator
+
+```toml
+name = "collegedb-app"
+main = "src/index.ts"
+compatibility_date = "2024-08-10"
+
+# D1 Database bindings
+[[d1_databases]]
+binding = "db-east"
+database_name = "collegedb-east"
+database_id = "your-east-database-id"
+
+[[d1_databases]]
+binding = "db-west"
+database_name = "collegedb-west"
+database_id = "your-west-database-id"
+
+[[d1_databases]]
+binding = "db-central"
+database_name = "collegedb-central"
+database_id = "your-central-database-id"
+
+# KV namespace for shard mappings
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"
+preview_id = "your-kv-preview-id" # For local development
+
+# Durable Object for shard coordination
+[[durable_objects.bindings]]
+name = "ShardCoordinator"
+class_name = "ShardCoordinator"
+
+# Environment-specific configurations
+[env.production]
+[[env.production.d1_databases]]
+binding = "db-east"
+database_name = "collegedb-prod-east"
+database_id = "your-prod-east-id"
+
+[[env.production.d1_databases]]
+binding = "db-west"
+database_name = "collegedb-prod-west"
+database_id = "your-prod-west-id"
+
+[[env.production.kv_namespaces]]
+binding = "KV"
+id = "your-prod-kv-namespace-id"
+
+[[env.production.durable_objects.bindings]]
+name = "ShardCoordinator"
+class_name = "ShardCoordinator"
+```
+
+### 3.1. Worker Script Setup (Required for ShardCoordinator)
+
+Create your main worker file with ShardCoordinator export:
+
+```typescript
+// src/index.ts
+import { collegedb, ShardCoordinator, first, run } from 'collegedb';
+
+// IMPORTANT: Export ShardCoordinator for Cloudflare Workers runtime
+export { ShardCoordinator };
+
+interface Env {
+	KV: KVNamespace;
+	ShardCoordinator: DurableObjectNamespace;
+	'db-east': D1Database;
+	'db-west': D1Database;
+	'db-central': D1Database;
+}
+
+export default {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		return await collegedb(
+			{
+				kv: env.KV,
+				coordinator: env.ShardCoordinator, // Optional: only needed for round-robin
+				strategy: 'hash', // or 'round-robin', 'random', 'location'
+				shards: {
+					'db-east': env['db-east'],
+					'db-west': env['db-west'],
+					'db-central': env['db-central']
+				}
+			},
+			async () => {
+				// Your application logic here
+				const url = new URL(request.url);
+
+				if (url.pathname === '/user') {
+					const userId = url.searchParams.get('id');
+					if (!userId) {
+						return new Response('Missing user ID', { status: 400 });
+					}
+
+					const user = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+					return Response.json(user);
+				}
+
+				return new Response('CollegeDB API', { status: 200 });
+			}
+		);
+	}
+};
+```
+
 ### 4. Deploy
 
 ```bash
@@ -503,6 +878,8 @@ wrangler deploy --env production
 ## 📊 Monitoring and Maintenance
 
 ### Shard Statistics
+
+#### Using CollegeDB Functions
 
 ```typescript
 import { getShardStats, listKnownShards } from 'collegedb';
@@ -518,6 +895,96 @@ console.log(stats);
 // List available shards
 const shards = await listKnownShards();
 console.log(shards); // ['db-east', 'db-west']
+```
+
+#### Using ShardCoordinator Directly
+
+```typescript
+// Get coordinator instance
+const coordinatorId = env.ShardCoordinator.idFromName('default');
+const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+// Get real-time shard statistics
+const statsResponse = await coordinator.fetch('http://coordinator/stats');
+const detailedStats = await statsResponse.json();
+console.log(detailedStats);
+/* Returns:
+[
+  {
+    "binding": "db-east",
+    "count": 1542,
+    "lastUpdated": 1672531200000
+  },
+  {
+    "binding": "db-west",
+    "count": 1458,
+    "lastUpdated": 1672531205000
+  }
+]
+*/
+
+// List registered shards
+const shardsResponse = await coordinator.fetch('http://coordinator/shards');
+const allShards = await shardsResponse.json();
+console.log(allShards); // ['db-east', 'db-west', 'db-central']
+```
+
+#### Advanced Monitoring Dashboard
+
+```typescript
+async function createMonitoringDashboard(env: Env) {
+	const coordinatorId = env.ShardCoordinator.idFromName('default');
+	const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+	// Get comprehensive metrics
+	const [shardsResponse, statsResponse, healthResponse] = await Promise.all([
+		coordinator.fetch('http://coordinator/shards'),
+		coordinator.fetch('http://coordinator/stats'),
+		coordinator.fetch('http://coordinator/health')
+	]);
+
+	const shards = await shardsResponse.json();
+	const stats = await statsResponse.json();
+	const isHealthy = healthResponse.ok;
+
+	// Calculate distribution metrics
+	const totalKeys = stats.reduce((sum: number, shard: any) => sum + shard.count, 0);
+	const avgKeysPerShard = totalKeys / stats.length;
+	const maxKeys = Math.max(...stats.map((s: any) => s.count));
+	const minKeys = Math.min(...stats.map((s: any) => s.count));
+	const distributionRatio = maxKeys / (minKeys || 1);
+
+	// Check for stale statistics (>5 minutes)
+	const now = Date.now();
+	const staleThreshold = 5 * 60 * 1000; // 5 minutes
+	const staleShards = stats.filter((shard: any) => now - shard.lastUpdated > staleThreshold);
+
+	return {
+		healthy: isHealthy,
+		totalShards: shards.length,
+		totalKeys,
+		avgKeysPerShard: Math.round(avgKeysPerShard),
+		distributionRatio: Math.round(distributionRatio * 100) / 100,
+		isBalanced: distributionRatio < 1.5, // Less than 50% difference
+		staleShards: staleShards.length,
+		shardDetails: stats.map((shard: any) => ({
+			...shard,
+			loadPercentage: Math.round((shard.count / totalKeys) * 100),
+			isStale: now - shard.lastUpdated > staleThreshold
+		}))
+	};
+}
+
+// Usage in monitoring endpoint
+export default {
+	async fetch(request: Request, env: Env) {
+		if (new URL(request.url).pathname === '/monitor') {
+			const dashboard = await createMonitoringDashboard(env);
+			return Response.json(dashboard);
+		}
+		// ... rest of your app
+	}
+};
 ```
 
 ### Shard Rebalancing
@@ -537,14 +1004,170 @@ Monitor your CollegeDB deployment by tracking:
 - **Query latency per shard**
 - **Error rates and failed queries**
 - **KV operation metrics**
+- **ShardCoordinator health and availability**
 
-## � Performance Analysis
+#### Automated Health Checks
+
+```typescript
+async function performHealthChecks(env: Env): Promise<HealthReport> {
+	const results: HealthReport = {
+		overall: 'healthy',
+		timestamp: new Date().toISOString(),
+		checks: {}
+	};
+
+	// 1. Test KV availability
+	try {
+		await env.KV.put('health-check', 'ok', { expirationTtl: 60 });
+		const kvTest = await env.KV.get('health-check');
+		results.checks.kv = kvTest === 'ok' ? 'healthy' : 'degraded';
+	} catch (error) {
+		results.checks.kv = 'unhealthy';
+		results.overall = 'unhealthy';
+	}
+
+	// 2. Test ShardCoordinator availability
+	if (env.ShardCoordinator) {
+		try {
+			const coordinatorId = env.ShardCoordinator.idFromName('default');
+			const coordinator = env.ShardCoordinator.get(coordinatorId);
+			const healthResponse = await coordinator.fetch('http://coordinator/health');
+			results.checks.coordinator = healthResponse.ok ? 'healthy' : 'unhealthy';
+
+			if (!healthResponse.ok) {
+				results.overall = 'degraded';
+			}
+		} catch (error) {
+			results.checks.coordinator = 'unhealthy';
+			results.overall = 'degraded'; // Can fallback to hash allocation
+		}
+	}
+
+	// 3. Test each D1 shard
+	const shardTests = Object.entries(env)
+		.filter(([key]) => key.startsWith('db-'))
+		.map(async ([shardName, db]: [string, any]) => {
+			try {
+				// Simple query to test connectivity
+				await db.prepare('SELECT 1 as test').first();
+				results.checks[shardName] = 'healthy';
+			} catch (error) {
+				results.checks[shardName] = 'unhealthy';
+				results.overall = 'unhealthy';
+			}
+		});
+
+	await Promise.all(shardTests);
+
+	// 4. Check shard distribution balance
+	if (results.checks.coordinator === 'healthy') {
+		try {
+			const coordinatorId = env.ShardCoordinator.idFromName('default');
+			const coordinator = env.ShardCoordinator.get(coordinatorId);
+			const statsResponse = await coordinator.fetch('http://coordinator/stats');
+			const stats = await statsResponse.json();
+
+			const totalKeys = stats.reduce((sum: number, shard: any) => sum + shard.count, 0);
+			if (totalKeys > 0) {
+				const avgKeys = totalKeys / stats.length;
+				const maxKeys = Math.max(...stats.map((s: any) => s.count));
+				const distributionRatio = maxKeys / avgKeys;
+
+				results.checks.distribution = distributionRatio < 2 ? 'healthy' : 'degraded';
+				results.distributionRatio = distributionRatio;
+
+				if (distributionRatio >= 3 && results.overall === 'healthy') {
+					results.overall = 'degraded';
+				}
+			}
+		} catch (error) {
+			results.checks.distribution = 'unknown';
+		}
+	}
+
+	return results;
+}
+
+interface HealthReport {
+	overall: 'healthy' | 'degraded' | 'unhealthy';
+	timestamp: string;
+	checks: Record<string, 'healthy' | 'degraded' | 'unhealthy' | 'unknown'>;
+	distributionRatio?: number;
+}
+
+// Health endpoint example
+export default {
+	async fetch(request: Request, env: Env) {
+		if (new URL(request.url).pathname === '/health') {
+			const health = await performHealthChecks(env);
+			const statusCode = health.overall === 'healthy' ? 200 : health.overall === 'degraded' ? 206 : 503;
+			return Response.json(health, { status: statusCode });
+		}
+		// ... rest of your app
+	}
+};
+```
+
+#### Alerting and Monitoring Integration
+
+```typescript
+// Integration with external monitoring services
+async function sendAlert(severity: 'warning' | 'critical', message: string, env: Env) {
+	// Example: Slack webhook
+	if (env.SLACK_WEBHOOK_URL) {
+		await fetch(env.SLACK_WEBHOOK_URL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				text: `🚨 CollegeDB ${severity.toUpperCase()}: ${message}`,
+				username: 'CollegeDB Monitor'
+			})
+		});
+	}
+
+	// Example: Custom webhook
+	if (env.MONITORING_WEBHOOK_URL) {
+		await fetch(env.MONITORING_WEBHOOK_URL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				service: 'collegedb',
+				severity,
+				message,
+				timestamp: new Date().toISOString()
+			})
+		});
+	}
+}
+
+// Scheduled monitoring (using Cron Triggers)
+export default {
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+		const health = await performHealthChecks(env);
+
+		if (health.overall === 'unhealthy') {
+			await sendAlert('critical', `System unhealthy: ${JSON.stringify(health.checks)}`, env);
+		} else if (health.overall === 'degraded') {
+			await sendAlert('warning', `System degraded: ${JSON.stringify(health.checks)}`, env);
+		}
+
+		// Check for severe shard imbalance
+		if (health.distributionRatio && health.distributionRatio > 5) {
+			await sendAlert('warning', `Severe shard imbalance detected: ${health.distributionRatio}x difference`, env);
+		}
+	}
+};
+```
+
+## ⚙️ Performance Analysis
 
 ### Scaling Performance Comparison
 
 CollegeDB provides significant performance improvements through horizontal scaling. Here are mathematical estimates comparing single D1 database vs CollegeDB with different shard counts:
 
-#### Query Performance (SELECT operations)
+#### Query Performance
+
+_SELECT, VALUES, TABLE, PRAGMA, ..._
 
 | Configuration           | Query Latency\* | Concurrent Queries      | Throughput Gain |
 | ----------------------- | --------------- | ----------------------- | --------------- |
@@ -555,7 +1178,9 @@ CollegeDB provides significant performance improvements through horizontal scali
 
 \*Includes KV lookup overhead (~5-15ms)
 
-#### Write Performance (INSERT/UPDATE operations)
+#### Write Performance
+
+_INSERT, UPDATE, DELETE, ..._
 
 | Configuration           | Write Latency\* | Concurrent Writes  | Throughput Gain |
 | ----------------------- | --------------- | ------------------ | --------------- |
@@ -616,6 +1241,195 @@ CollegeDB provides significant performance improvements through horizontal scali
 | 100    | +10ms       | Excellent (-20-40ms) | Optional               |
 | 1000   | +12ms       | Excellent (-20-40ms) | Optional               |
 
+#### Mixed Strategy
+
+- **Best for**: Optimizing both read and write performance independently
+- **Latency**: Best of both strategies combined
+- **Throughput**: Optimal for workloads with different read/write patterns
+
+**High-Performance Mix**: `{ read: 'hash', write: 'location' }`
+
+| Operation | Strategy | Latency Impact           | Throughput Benefit | Geographic Benefit   |
+| --------- | -------- | ------------------------ | ------------------ | -------------------- |
+| Reads     | Hash     | +5ms                     | Excellent          | None                 |
+| Writes    | Location | +8ms (-20-40ms regional) | Good               | Excellent (-20-40ms) |
+
+**Balanced Mix**: `{ read: 'location', write: 'hash' }`
+
+| Operation | Strategy | Latency Impact           | Throughput Benefit | Geographic Benefit   |
+| --------- | -------- | ------------------------ | ------------------ | -------------------- |
+| Reads     | Location | +8ms (-20-40ms regional) | Good               | Excellent (-20-40ms) |
+| Writes    | Hash     | +5ms                     | Excellent          | None                 |
+
+**Enterprise Mix**: `{ read: 'hash', write: 'round-robin' }`
+
+| Operation | Strategy    | Latency Impact | Distribution Quality | Coordinator Dependency |
+| --------- | ----------- | -------------- | -------------------- | ---------------------- |
+| Reads     | Hash        | +5ms           | Excellent            | None                   |
+| Writes    | Round-Robin | +15-25ms       | Perfect              | High                   |
+
+##### By Shard Count
+
+**Hash + Location Mix** (`{ read: 'hash', write: 'location' }`)
+
+| Shards | Read Latency | Write Latency          | Combined Benefit      | Best Use Case    |
+| ------ | ------------ | ---------------------- | --------------------- | ---------------- |
+| 10     | +5ms         | +8ms (-30ms regional)  | ~22ms net improvement | Global apps      |
+| 100    | +5ms         | +10ms (-30ms regional) | ~20ms net improvement | Enterprise scale |
+| 1000   | +5ms         | +12ms (-30ms regional) | ~18ms net improvement | Massive scale    |
+
+**Location + Hash Mix** (`{ read: 'location', write: 'hash' }`)
+
+| Shards | Read Latency           | Write Latency | Combined Benefit      | Best Use Case         |
+| ------ | ---------------------- | ------------- | --------------------- | --------------------- |
+| 10     | +8ms (-30ms regional)  | +5ms          | ~17ms net improvement | Read-heavy regional   |
+| 100    | +10ms (-30ms regional) | +5ms          | ~15ms net improvement | Analytics workloads   |
+| 1000   | +12ms (-30ms regional) | +5ms          | ~13ms net improvement | Large-scale reporting |
+
+**Hash + Round-Robin Mix** (`{ read: 'hash', write: 'round-robin' }`)
+
+| Shards | Read Latency | Write Latency | Distribution Quality            | Best Use Case      |
+| ------ | ------------ | ------------- | ------------------------------- | ------------------ |
+| 10     | +5ms         | +15ms         | Perfect writes, Excellent reads | Balanced workloads |
+| 100    | +5ms         | +20ms         | Perfect writes, Excellent reads | Large databases    |
+| 1000   | +5ms         | +25ms         | Perfect writes, Excellent reads | Enterprise scale   |
+
+### Mixed Strategy Scenarios & Recommendations
+
+#### Large Database Scenarios (>10M records)
+
+**Scenario**: Massive datasets requiring optimal query performance and balanced growth
+
+```typescript
+// Recommended: Hash reads + Round-Robin writes
+{
+  strategy: { read: 'hash', write: 'round-robin' },
+  coordinator: env.ShardCoordinator // Required for round-robin
+}
+```
+
+**Performance Profile**:
+
+- Read latency: +5ms (fastest possible routing)
+- Write latency: +15-25ms (coordinator overhead)
+- Data distribution: Perfect balance over time
+- **Ideal for**: Analytics platforms, data warehouses, reporting systems
+
+#### Vast Geographic Spread Scenarios
+
+**Scenario**: Global applications with users across multiple continents
+
+```typescript
+// Recommended: Hash reads + Location writes
+{
+  strategy: { read: 'hash', write: 'location' },
+  targetRegion: 'auto', // Or specific region like 'wnam'
+  shardLocations: {
+    'db-americas': { region: 'wnam', priority: 2 },
+    'db-europe': { region: 'weur', priority: 2 },
+    'db-asia': { region: 'apac', priority: 2 }
+  }
+}
+```
+
+**Performance Profile**:
+
+- Read latency: +5ms (consistent global performance)
+- Write latency: +8ms baseline (-20-40ms regional benefit)
+- **Net improvement**: 15-35ms for geographically distributed users
+- **Ideal for**: Social networks, e-commerce, content platforms
+
+#### High-Volume Write Scenarios
+
+**Scenario**: Applications with heavy write loads (IoT, logging, real-time data)
+
+```typescript
+// Recommended: Location reads + Hash writes
+{
+  strategy: { read: 'location', write: 'hash' },
+  targetRegion: 'wnam',
+  shardLocations: {
+    'db-west': { region: 'wnam', priority: 3 },
+    'db-central': { region: 'enam', priority: 2 },
+    'db-east': { region: 'enam', priority: 1 }
+  }
+}
+```
+
+**Performance Profile**:
+
+- Read latency: +8ms baseline (-20-40ms regional benefit)
+- Write latency: +5ms (fastest write routing)
+- Write throughput: Maximum possible for hash strategy
+- **Ideal for**: IoT data collection, real-time analytics, logging systems
+
+#### Multi-Tenant SaaS Scenarios
+
+**Scenario**: SaaS applications with predictable performance requirements
+
+```typescript
+// Recommended: Hash reads + Hash writes (consistent performance)
+{
+  strategy: { read: 'hash', write: 'hash' }
+  // No coordinator needed, predictable routing for both operations
+}
+```
+
+**Performance Profile**:
+
+- Read latency: +5ms (most predictable)
+- Write latency: +5ms (most predictable)
+- Tenant isolation: Natural sharding by tenant ID
+- **Ideal for**: B2B SaaS, multi-tenant platforms, predictable workloads
+
+#### Read-Heavy Analytics Scenarios
+
+**Scenario**: Analytics and reporting workloads with occasional writes
+
+```typescript
+// Recommended: Random reads + Location writes
+{
+  strategy: { read: 'random', write: 'location' },
+  targetRegion: 'wnam',
+  shardLocations: { /* geographic configuration */ }
+}
+```
+
+**Performance Profile**:
+
+- Read latency: +3ms (lowest overhead, good load balancing)
+- Write latency: +8ms baseline (-20-40ms regional benefit)
+- Read load distribution: Excellent across all shards
+- **Ideal for**: Business intelligence, data analysis, reporting dashboards
+
+### Mixed Strategy Performance Comparison
+
+#### By Database Size
+
+| Database Size                 | Best Mixed Strategy                        | Read Performance      | Write Performance    | Overall Benefit       |
+| ----------------------------- | ------------------------------------------ | --------------------- | -------------------- | --------------------- |
+| **Small (1K-100K records)**   | `{read: 'hash', write: 'hash'}`            | Excellent             | Excellent            | Consistent, simple    |
+| **Medium (100K-1M records)**  | `{read: 'hash', write: 'location'}`        | Excellent             | Good + Regional      | 15-35ms improvement   |
+| **Large (1M-10M records)**    | `{read: 'hash', write: 'round-robin'}`     | Excellent             | Perfect distribution | Optimal scaling       |
+| **Very Large (10M+ records)** | `{read: 'location', write: 'round-robin'}` | Regional optimization | Perfect distribution | Best for global scale |
+
+#### By Geographic Distribution
+
+| Geographic Spread | Best Mixed Strategy                     | Latency Improvement     | Use Case                        |
+| ----------------- | --------------------------------------- | ----------------------- | ------------------------------- |
+| **Single Region** | `{read: 'hash', write: 'hash'}`         | +5ms both operations    | Simple, fast                    |
+| **Multi-Region**  | `{read: 'hash', write: 'location'}`     | 15-35ms net improvement | Global apps                     |
+| **Global**        | `{read: 'location', write: 'location'}` | 20-40ms both operations | Maximum geographic optimization |
+
+#### By Workload Pattern
+
+| Workload Type   | Read/Write Ratio | Best Mixed Strategy                        | Primary Benefit                 |
+| --------------- | ---------------- | ------------------------------------------ | ------------------------------- |
+| **Read-Heavy**  | 90% reads        | `{read: 'random', write: 'location'}`      | Load-balanced queries           |
+| **Write-Heavy** | 70% writes       | `{read: 'location', write: 'hash'}`        | Fast write processing           |
+| **Balanced**    | 50/50            | `{read: 'hash', write: 'hash'}`            | Consistent performance          |
+| **Analytics**   | 95% reads        | `{read: 'location', write: 'round-robin'}` | Regional + perfect distribution |
+
 ### Real-World Scaling Benefits
 
 #### Database Size Limits
@@ -667,12 +1481,21 @@ initialize({
 - Applications needing >50 concurrent operations
 - Systems requiring fault tolerance
 
+✅ **Mixed Strategy specifically recommended for:**
+
+- **Global applications** needing both fast queries and optimal data placement
+- **Large-scale databases** requiring different optimization for reads vs writes
+- **Multi-workload systems** with distinct read/write patterns
+- **Geographic optimization** while maintaining query performance
+- **Enterprise applications** needing fine-tuned performance control
+
 ❌ **Not recommended for:**
 
 - Small applications (<100 QPS)
 - Simple CRUD operations with minimal scale
 - Applications without geographic spread
 - Cost-sensitive deployments at small scale
+- **Single-strategy applications** where reads and writes have identical performance needs
 
 ## �🔧 Advanced Configuration
 
@@ -698,16 +1521,312 @@ const config = {
 initialize(config);
 ```
 
+### Durable Objects Integration (ShardCoordinator)
+
+CollegeDB includes an optional **ShardCoordinator** Durable Object that provides centralized shard allocation and statistics management. This is particularly useful for round-robin allocation strategies and monitoring shard utilization across your application.
+
+#### Durable Object Setup
+
+First, configure the Durable Object in your `wrangler.toml`:
+
+```toml
+[[durable_objects.bindings]]
+name = "ShardCoordinator"
+class_name = "ShardCoordinator"
+
+# Export the ShardCoordinator class
+[durable_objects.bindings.script_name]
+# If using modules format
+[[durable_objects.bindings]]
+name = "ShardCoordinator"
+class_name = "ShardCoordinator"
+```
+
+#### Basic Usage with ShardCoordinator
+
+```typescript
+import { collegedb, ShardCoordinator } from 'collegedb';
+
+// Export the Durable Object class for Cloudflare Workers
+export { ShardCoordinator };
+
+export default {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		// Initialize CollegeDB with coordinator support
+		await collegedb(
+			{
+				kv: env.KV,
+				coordinator: env.ShardCoordinator, // Add coordinator binding
+				strategy: 'round-robin',
+				shards: {
+					'db-east': env.DB_EAST,
+					'db-west': env.DB_WEST,
+					'db-central': env.DB_CENTRAL
+				}
+			},
+			async () => {
+				// Your application logic here
+				const user = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+				return Response.json(user);
+			}
+		);
+	}
+};
+```
+
+#### ShardCoordinator HTTP API
+
+The ShardCoordinator exposes a comprehensive HTTP API for managing shards and allocation:
+
+##### Shard Management
+
+```typescript
+// Get coordinator instance
+const coordinatorId = env.ShardCoordinator.idFromName('default');
+const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+// List all registered shards
+const shardsResponse = await coordinator.fetch('http://coordinator/shards');
+const shards = await shardsResponse.json();
+// Returns: ["db-east", "db-west", "db-central"]
+
+// Register a new shard
+await coordinator.fetch('http://coordinator/shards', {
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify({ shard: 'db-new-region' })
+});
+
+// Remove a shard
+await coordinator.fetch('http://coordinator/shards', {
+	method: 'DELETE',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify({ shard: 'db-old-region' })
+});
+```
+
+##### Statistics and Monitoring
+
+```typescript
+// Get shard statistics
+const statsResponse = await coordinator.fetch('http://coordinator/stats');
+const stats = await statsResponse.json();
+/* Returns:
+[
+  {
+    "binding": "db-east",
+    "count": 1542,
+    "lastUpdated": 1672531200000
+  },
+  {
+    "binding": "db-west", 
+    "count": 1458,
+    "lastUpdated": 1672531205000
+  }
+]
+*/
+
+// Update shard statistics manually
+await coordinator.fetch('http://coordinator/stats', {
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify({
+		shard: 'db-east',
+		count: 1600
+	})
+});
+```
+
+##### Shard Allocation
+
+```typescript
+// Allocate a shard for a primary key
+const allocationResponse = await coordinator.fetch('http://coordinator/allocate', {
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify({
+		primaryKey: 'user-123',
+		strategy: 'round-robin' // Optional, uses coordinator default if not specified
+	})
+});
+
+const { shard } = await allocationResponse.json();
+// Returns: { "shard": "db-west" }
+
+// Hash-based allocation (consistent for same key)
+const hashAllocation = await coordinator.fetch('http://coordinator/allocate', {
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify({
+		primaryKey: 'user-456',
+		strategy: 'hash'
+	})
+});
+```
+
+##### Health Check and Development
+
+```typescript
+// Health check endpoint
+const healthResponse = await coordinator.fetch('http://coordinator/health');
+// Returns: "OK" with 200 status
+
+// Clear all coordinator state (DEVELOPMENT ONLY!)
+await coordinator.fetch('http://coordinator/flush', {
+	method: 'POST'
+});
+// WARNING: This removes all shard registrations and statistics
+```
+
+#### Programmatic Shard Management
+
+The ShardCoordinator also provides methods for direct programmatic access:
+
+```typescript
+// Get coordinator instance
+const coordinatorId = env.ShardCoordinator.idFromName('default');
+const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+// Increment shard count (when adding new keys)
+await coordinator.incrementShardCount('db-east');
+
+// Decrement shard count (when removing keys)
+await coordinator.decrementShardCount('db-west');
+```
+
+#### Advanced Monitoring Setup
+
+Set up comprehensive monitoring of your shard distribution:
+
+```typescript
+async function monitorShardHealth(env: Env) {
+	const coordinatorId = env.ShardCoordinator.idFromName('default');
+	const coordinator = env.ShardCoordinator.get(coordinatorId);
+
+	// Get current statistics
+	const statsResponse = await coordinator.fetch('http://coordinator/stats');
+	const stats = await statsResponse.json();
+
+	// Calculate distribution balance
+	const totalKeys = stats.reduce((sum: number, shard: any) => sum + shard.count, 0);
+	const avgKeysPerShard = totalKeys / stats.length;
+
+	// Check for imbalanced shards (>20% deviation from average)
+	const imbalancedShards = stats.filter((shard: any) => {
+		const deviation = Math.abs(shard.count - avgKeysPerShard) / avgKeysPerShard;
+		return deviation > 0.2;
+	});
+
+	if (imbalancedShards.length > 0) {
+		console.warn('Shard imbalance detected:', imbalancedShards);
+		// Trigger rebalancing logic or alerts
+	}
+
+	// Check for stale statistics (>1 hour old)
+	const now = Date.now();
+	const staleShards = stats.filter((shard: any) => {
+		return now - shard.lastUpdated > 3600000; // 1 hour in ms
+	});
+
+	if (staleShards.length > 0) {
+		console.warn('Stale shard statistics detected:', staleShards);
+	}
+
+	return {
+		totalKeys,
+		avgKeysPerShard,
+		balance: imbalancedShards.length === 0,
+		freshStats: staleShards.length === 0,
+		shards: stats
+	};
+}
+```
+
+#### Error Handling
+
+```typescript
+try {
+	const coordinator = env.ShardCoordinator.get(coordinatorId);
+	const response = await coordinator.fetch('http://coordinator/allocate', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ primaryKey: 'user-123' })
+	});
+
+	if (!response.ok) {
+		const error = await response.json();
+		throw new Error(`ShardCoordinator error: ${error.error}`);
+	}
+
+	const { shard } = await response.json();
+	return shard;
+} catch (error) {
+	console.error('Failed to allocate shard:', error);
+	// Fallback to hash-based allocation without coordinator
+	return hashFunction('user-123', availableShards);
+}
+```
+
+#### Performance Considerations
+
+- **Coordinator Latency**: Round-robin allocation adds ~10-20ms latency due to coordinator communication
+- **Scalability**: Single coordinator instance can handle thousands of allocations per second
+- **Fault Tolerance**: Design fallback allocation strategies when coordinator is unavailable
+- **Caching**: Consider caching allocation results for frequently accessed keys
+
+```typescript
+// Fallback allocation when coordinator is unavailable
+function fallbackAllocation(primaryKey: string, shards: string[]): string {
+	// Use hash-based allocation as fallback
+	const hash = simpleHash(primaryKey);
+	return shards[hash % shards.length];
+}
+
+async function allocateWithFallback(coordinator: DurableObjectNamespace, primaryKey: string, shards: string[]): Promise<string> {
+	try {
+		const coordinatorId = coordinator.idFromName('default');
+		const instance = coordinator.get(coordinatorId);
+
+		const response = await instance.fetch('http://coordinator/allocate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ primaryKey })
+		});
+
+		if (response.ok) {
+			const { shard } = await response.json();
+			return shard;
+		}
+	} catch (error) {
+		console.warn('Coordinator unavailable, using fallback allocation:', error);
+	}
+
+	// Fallback to hash-based allocation
+	return fallbackAllocation(primaryKey, shards);
+}
+```
+
 ## 🚀 Quick Reference
 
 ### Strategy Selection Guide
 
-| Strategy      | Use Case                                 | Latency          | Distribution | Coordinator Required |
-| ------------- | ---------------------------------------- | ---------------- | ------------ | -------------------- |
-| `hash`        | High-volume apps, consistent performance | Lowest           | Excellent    | No                   |
-| `round-robin` | Guaranteed even distribution             | Medium           | Perfect      | Yes                  |
-| `random`      | Simple setup, good enough distribution   | Low              | Good         | No                   |
-| `location`    | Geographic optimization, reduced latency | Region-optimized | Good         | No                   |
+| Strategy      | Use Case                                 | Latency            | Distribution | Coordinator Required |
+| ------------- | ---------------------------------------- | ------------------ | ------------ | -------------------- |
+| `hash`        | High-volume apps, consistent performance | Lowest             | Excellent    | No                   |
+| `round-robin` | Guaranteed even distribution             | Medium             | Perfect      | Yes                  |
+| `random`      | Simple setup, good enough distribution   | Low                | Good         | No                   |
+| `location`    | Geographic optimization, reduced latency | Region-optimized   | Good         | No                   |
+| `mixed`       | Optimized read/write performance         | Strategy-dependent | Variable     | Strategy-dependent   |
+
+#### Mixed Strategy Recommendations by Scenario
+
+| Scenario                           | Recommended Mix                        | Read Strategy | Write Strategy | Benefits                                       |
+| ---------------------------------- | -------------------------------------- | ------------- | -------------- | ---------------------------------------------- |
+| **Large Databases (>10M records)** | `{read: 'hash', write: 'round-robin'}` | Hash          | Round-Robin    | Fastest reads, even data distribution          |
+| **Global Applications**            | `{read: 'hash', write: 'location'}`    | Hash          | Location       | Fast queries, optimal geographic placement     |
+| **High Write Volume**              | `{read: 'location', write: 'hash'}`    | Location      | Hash           | Regional read optimization, fast write routing |
+| **Analytics Workloads**            | `{read: 'random', write: 'location'}`  | Random        | Location       | Load-balanced queries, optimal data placement  |
+| **Multi-Tenant SaaS**              | `{read: 'hash', write: 'hash'}`        | Hash          | Hash           | Consistent performance, predictable routing    |
 
 ### Configuration Templates
 
@@ -744,6 +1863,51 @@ initialize(config);
   coordinator: env.ShardCoordinator,
   strategy: 'round-robin',
   shards: { 'db-1': env.DB_1, 'db-2': env.DB_2, 'db-3': env.DB_3 }
+}
+```
+
+**Mixed Strategy (Global applications):**
+
+```typescript
+{
+  kv: env.KV,
+  strategy: {
+    read: 'hash',      // Fast, consistent reads
+    write: 'location'  // Optimal geographic placement
+  },
+  targetRegion: 'wnam',
+  shardLocations: {
+    'db-west': { region: 'wnam', priority: 2 },
+    'db-east': { region: 'enam', priority: 1 }
+  },
+  shards: { 'db-west': env.DB_WEST, 'db-east': env.DB_EAST }
+}
+```
+
+**Mixed Strategy (Large databases):**
+
+```typescript
+{
+  kv: env.KV,
+  coordinator: env.ShardCoordinator,
+  strategy: {
+    read: 'hash',         // Fastest possible reads
+    write: 'round-robin'  // Perfect distribution
+  },
+  shards: { 'db-1': env.DB_1, 'db-2': env.DB_2, 'db-3': env.DB_3 }
+}
+```
+
+**Mixed Strategy (High-performance consistent):**
+
+```typescript
+{
+  kv: env.KV,
+  strategy: {
+    read: 'hash',   // Predictable read performance
+    write: 'hash'   // Predictable write performance
+  },
+  shards: { 'db-1': env.DB_1, 'db-2': env.DB_2 }
 }
 ```
 

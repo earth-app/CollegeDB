@@ -33,6 +33,7 @@
  */
 
 import type { KVNamespace } from '@cloudflare/workers-types';
+import { CollegeDBError } from './errors.js';
 import type { ShardMapping } from './types.js';
 
 /**
@@ -169,7 +170,7 @@ export class KVShardMapper {
 	async updateShardMapping(primaryKey: string, newShard: string): Promise<void> {
 		const existing = await this.getShardMapping(primaryKey);
 		if (!existing) {
-			throw new Error(`No existing mapping found for primary key: ${primaryKey}`);
+			throw new CollegeDBError(`No existing mapping found for primary key: ${primaryKey}`, 'MAPPING_NOT_FOUND');
 		}
 
 		const key = `${SHARD_MAPPING_PREFIX}${primaryKey}`;

@@ -25,12 +25,14 @@ export {
 	listKnownShards,
 	prepare,
 	reassignShard,
+	resetConfig,
 	run,
 	runShard
 } from './router.js';
 
 // Export utility classes
 export { ShardCoordinator } from './durable.js';
+export { CollegeDBError } from './errors.js';
 export { KVShardMapper } from './kvmap.js';
 
 // Export migration functions
@@ -38,6 +40,7 @@ export {
 	autoDetectAndMigrate,
 	checkMigrationNeeded,
 	clearMigrationCache,
+	clearShardMigrationCache,
 	createMappingsForExistingKeys,
 	createSchemaAcrossShards,
 	discoverExistingPrimaryKeys,
@@ -57,6 +60,8 @@ export type {
 	CollegeDBConfig,
 	D1Region,
 	Env,
+	MixedShardingStrategy,
+	OperationType,
 	ShardCoordinatorState,
 	ShardLocation,
 	ShardMapping,

@@ -61,6 +61,23 @@ export interface ShardLocation {
 export type ShardingStrategy = 'round-robin' | 'random' | 'hash' | 'location';
 
 /**
+ * Mixed sharding strategy configuration for different operation types
+ * @since 1.0.2
+ */
+export interface MixedShardingStrategy {
+	/** Strategy for read operations (SELECT) */
+	read: ShardingStrategy;
+	/** Strategy for write operations (INSERT, UPDATE, DELETE) */
+	write: ShardingStrategy;
+}
+
+/**
+ * Database operation types for strategy selection
+ * @since 1.0.2
+ */
+export type OperationType = 'read' | 'write';
+
+/**
  * Environment bindings for the Cloudflare Worker
  */
 export interface Env {
@@ -82,12 +99,17 @@ export interface CollegeDBConfig {
 	coordinator?: DurableObjectNamespace;
 	/** Available D1 database bindings */
 	shards: Record<string, D1Database>;
-	/** Default shard allocation strategy */
-	strategy?: ShardingStrategy;
+	/** Default shard allocation strategy (can be single strategy or mixed strategy object) */
+	strategy?: ShardingStrategy | MixedShardingStrategy;
 	/** Target region for location-based sharding */
 	targetRegion?: D1Region;
 	/** Geographic locations of each shard (required for location strategy) */
 	shardLocations?: Record<string, ShardLocation>;
+	/**
+	 * Disable automatic migration detection and background migration (useful for testing)
+	 * @since 1.0.2
+	 */
+	disableAutoMigration?: boolean;
 }
 
 /**
@@ -136,8 +158,9 @@ export interface ShardCoordinatorState {
 	 * `random` - selects a random shard for each key
 	 * `hash` - uses a hash function to determine shard based on primary key (default)
 	 * `location` - selects shards based on geographic proximity to reduce latency
+	 * Can also be a mixed strategy object with separate read/write strategies
 	 */
-	strategy: ShardingStrategy;
+	strategy: ShardingStrategy | MixedShardingStrategy;
 	/** Round-robin counter for allocation */
 	roundRobinIndex: number;
 	/** Target region for location-based allocation */
