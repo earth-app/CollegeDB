@@ -8,6 +8,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Set up Bun
       uses: oven-sh/setup-bun@v2
     - name: Install dependencies
@@ -28,6 +30,11 @@ jobs:
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: earth-app/CollegeDB
+        fail_ci_if_error: true
+        flags: unittests
+        files: |
+          coverage/coverage-final.json
+          coverage/clover.xml
     - name: Upload coverage to GitHub
       uses: actions/upload-artifact@v4
       with:
