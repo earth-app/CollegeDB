@@ -531,35 +531,38 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 
 ## 📚 API Reference
 
-| Function                           | Description                                          | Parameters               |
-| ---------------------------------- | ---------------------------------------------------- | ------------------------ |
-| `collegedb(config, callback)`      | Initialize CollegeDB, then run a callback            | `CollegeDBConfig, ()=>T` |
-| `initialize(config)`               | Initialize CollegeDB with configuration              | `CollegeDBConfig`        |
-| `createSchema(d1)`                 | Create database schema on a D1 instance              | `D1Database`             |
-| `prepare(key, sql)`                | Prepare a SQL statement for execution                | `string, string`         |
-| `run(key, sql, bindings)`          | Execute a SQL query with primary key routing         | `string, string, any[]`  |
-| `first(key, sql, bindings)`        | Execute a SQL query and return first result          | `string, string, any[]`  |
-| `all(key, sql, bindings)`          | Execute a SQL query and return all results           | `string, string, any[]`  |
-| `runShard(shard, sql, bindings)`   | Execute a SQL query directly on a specific shard     | `string, string, any[]`  |
-| `allShard(shard, sql, bindings)`   | Execute query on specific shard, return all results  | `string, string, any[]`  |
-| `firstShard(shard, sql, bindings)` | Execute query on specific shard, return first result | `string, string, any[]`  |
-| `reassignShard(key, newShard)`     | Move primary key to different shard                  | `string, string`         |
-| `listKnownShards()`                | Get list of available shards                         | `void`                   |
-| `getShardStats()`                  | Get statistics for all shards                        | `void`                   |
-| `flush()`                          | Clear all shard mappings (development only)          | `void`                   |
+| Function                                   | Description                                                      | Parameters                 |
+| ------------------------------------------ | ---------------------------------------------------------------- | -------------------------- |
+| `collegedb(config, callback)`              | Initialize CollegeDB, then run a callback                        | `CollegeDBConfig, () => T` |
+| `initialize(config)`                       | Initialize CollegeDB with configuration                          | `CollegeDBConfig`          |
+| `createSchema(d1)`                         | Create database schema on a D1 instance                          | `D1Database`               |
+| `prepare(key, sql)`                        | Prepare a SQL statement for execution                            | `string, string`           |
+| `run(key, sql, bindings)`                  | Execute a SQL query with primary key routing                     | `string, string, any[]`    |
+| `first(key, sql, bindings)`                | Execute a SQL query and return first result                      | `string, string, any[]`    |
+| `all(key, sql, bindings)`                  | Execute a SQL query and return all results                       | `string, string, any[]`    |
+| `runShard(shard, sql, bindings)`           | Execute a query directly on a specific shard                     | `string, string, any[]`    |
+| `allShard(shard, sql, bindings)`           | Execute a query on specific shard, return all results            | `string, string, any[]`    |
+| `firstShard(shard, sql, bindings)`         | Execute a query on specific shard, return first result           | `string, string, any[]`    |
+| `runAllShards(sql, bindings, batchSize)`   | Execute query on all shards                                      | `string, any[], number`    |
+| `allAllShards(sql, bindings, batchSize)`   | Execute query on all shards, return all results from all shards  | `string, any[], number`    |
+| `firstAllShards(sql, bindings, batchSize)` | Execute query on all shards, return first result from all shards | `string, any[], number`    |
+| `reassignShard(key, newShard)`             | Move primary key to different shard                              | `string, string`           |
+| `listKnownShards()`                        | Get list of available shards                                     | `void`                     |
+| `getShardStats()`                          | Get statistics for all shards                                    | `void`                     |
+| `flush()`                                  | Clear all shard mappings (development only)                      | `void`                     |
 
 ### Drop-in Replacement Functions
 
-| Function                                  | Description                                             | Parameters                     |
-| ----------------------------------------- | ------------------------------------------------------- | ------------------------------ |
-| `autoDetectAndMigrate(d1, shard, config)` | **NEW**: Automatically detect and migrate existing data | `D1Database, string, config`   |
-| `checkMigrationNeeded(d1, shard, config)` | **NEW**: Check if database needs migration              | `D1Database, string, config`   |
-| `validateTableForSharding(d1, table)`     | Check if table is suitable for sharding                 | `D1Database, string`           |
-| `discoverExistingPrimaryKeys(d1, table)`  | Find all primary keys in existing table                 | `D1Database, string`           |
-| `integrateExistingDatabase(d1, shard)`    | Complete drop-in integration of existing DB             | `D1Database, string, mapper`   |
-| `createMappingsForExistingKeys(keys)`     | Create shard mappings for existing keys                 | `string[], string[], strategy` |
-| `listTables(d1)`                          | Get list of tables in database                          | `D1Database`                   |
-| `clearMigrationCache()`                   | Clear automatic migration cache                         | `void`                         |
+| Function                                  | Description                                    | Parameters                     |
+| ----------------------------------------- | ---------------------------------------------- | ------------------------------ |
+| `autoDetectAndMigrate(d1, shard, config)` | Automatically detect and migrate existing data | `D1Database, string, config`   |
+| `checkMigrationNeeded(d1, shard, config)` | Check if database needs migration              | `D1Database, string, config`   |
+| `validateTableForSharding(d1, table)`     | Check if table is suitable for sharding        | `D1Database, string`           |
+| `discoverExistingPrimaryKeys(d1, table)`  | Find all primary keys in existing table        | `D1Database, string`           |
+| `integrateExistingDatabase(d1, shard)`    | Complete drop-in integration of existing DB    | `D1Database, string, mapper`   |
+| `createMappingsForExistingKeys(keys)`     | Create shard mappings for existing keys        | `string[], string[], strategy` |
+| `listTables(d1)`                          | Get list of tables in database                 | `D1Database`                   |
+| `clearMigrationCache()`                   | Clear automatic migration cache                | `void`                         |
 
 ### Error Handling
 

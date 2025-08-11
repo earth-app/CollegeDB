@@ -15,13 +15,16 @@ import {
 	getClosestRegionFromIP,
 	getShardStats,
 	initialize,
+	integrateExistingDatabase,
+	KVShardMapper,
 	listKnownShards,
 	reassignShard,
 	resetConfig,
 	run,
 	runShard
 } from '../src/index.js';
-import type { CollegeDBConfig } from '../src/types.js';
+import { discoverExistingRecordsWithColumns } from '../src/migrations.js';
+import type { CollegeDBConfig, MixedShardingStrategy } from '../src/types.js';
 
 // Test schema for creating tables
 const TEST_SCHEMA = `
@@ -258,6 +261,15 @@ class MockD1Database {
 			}
 		}
 		return { success: true, results: [] };
+	}
+
+	addTestData(tableName: string, records: any[]) {
+		this.data.set(tableName.toLowerCase(), records);
+		this.schema.add(tableName.toLowerCase());
+	}
+
+	hasTable(tableName: string): boolean {
+		return this.schema.has(tableName.toLowerCase());
 	}
 
 	clear() {
@@ -1362,22 +1374,6 @@ describe('CollegeDB', () => {
 				disableAutoMigration: true // Disable auto-migration for this test
 			};
 
-			// Debug: Check database state before migration
-			const { listTables, validateTableForSharding } = await import('../src/migrations.js');
-			const tables = await listTables(mockDB1 as any);
-			console.log('Tables found:', tables);
-
-			// Check if data actually exists
-			const userCount = await mockDB1.prepare('SELECT COUNT(*) as count FROM users').first();
-			const postCount = await mockDB1.prepare('SELECT COUNT(*) as count FROM posts').first();
-			console.log('User count:', (userCount as any)?.count, 'Post count:', (postCount as any)?.count);
-
-			// Debug: Check table validation
-			for (const table of tables) {
-				const validation = await validateTableForSharding(mockDB1 as any, table, 'id');
-				console.log(`Table ${table} validation:`, validation);
-			}
-
 			const result = await autoDetectAndMigrate(mockDB1 as any, 'db-auto', config, { skipCache: true });
 			console.log('Migration result:', result);
 
@@ -1978,6 +1974,420 @@ describe('CollegeDB', () => {
 			expect(error.message).toBe('Test error without code');
 			expect(error.code).toBeUndefined();
 			expect(error.name).toBe('CollegeDBError');
+		});
+	});
+
+	describe('Mixed Strategy Support', () => {
+		it('should use different strategies for read and write operations', async () => {
+			const mixedStrategy: MixedShardingStrategy = {
+				read: 'hash',
+				write: 'hash' // Using same strategy for deterministic testing
+			};
+
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: mixedStrategy
+			});
+
+			// Insert a user (write operation)
+			await run('user-123', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-123', 'John Doe']);
+
+			// Query the user (read operation) - should go to same shard due to existing mapping
+			const result = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+
+			expect(result).toBeDefined();
+			expect((result as any).name).toBe('John Doe');
+		});
+
+		it('should handle location strategy for writes and hash for reads', async () => {
+			const mixedStrategy: MixedShardingStrategy = {
+				read: 'hash',
+				write: 'location'
+			};
+
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: mixedStrategy,
+				targetRegion: 'wnam',
+				shardLocations: {
+					'db-west': { region: 'wnam', priority: 2 },
+					'db-east': { region: 'enam', priority: 1 }
+				}
+			});
+
+			// Write operation should use location strategy
+			await run('user-west-456', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-west-456', 'West User']);
+
+			// Read operation should use hash strategy (but will find existing mapping)
+			const result = await first('user-west-456', 'SELECT * FROM users WHERE id = ?', ['user-west-456']);
+
+			expect(result).toBeDefined();
+			expect((result as any).name).toBe('West User');
+		});
+
+		it('should resolve strategy type correctly for different SQL operations', async () => {
+			const mixedStrategy: MixedShardingStrategy = {
+				read: 'random',
+				write: 'hash'
+			};
+
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: mixedStrategy
+			});
+
+			// Test different SQL operations
+
+			// INSERT (write)
+			await run('user-789', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-789', 'Insert User']);
+
+			// UPDATE (write)
+			await run('user-789', 'UPDATE users SET name = ? WHERE id = ?', ['Updated User', 'user-789']);
+
+			// DELETE (write)
+			await run('user-delete', 'DELETE FROM users WHERE id = ?', ['user-delete']);
+
+			// SELECT (read) - should work even though it might route to different shard due to random strategy
+			// In practice, existing mappings ensure consistency
+			const result = await first('user-789', 'SELECT * FROM users WHERE id = ?', ['user-789']);
+
+			// The result should be from the write operations
+			expect(result).toBeDefined();
+			expect((result as any).name).toBe('Updated User');
+		});
+
+		it('should fall back to single strategy when mixed strategy is not provided', async () => {
+			// Using a single strategy (string) instead of mixed strategy object
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: 'hash' // Single strategy
+			});
+
+			// Both read and write should use hash strategy
+			await run('user-single', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-single', 'Single Strategy User']);
+			const result = await first('user-single', 'SELECT * FROM users WHERE id = ?', ['user-single']);
+
+			expect(result).toBeDefined();
+			expect((result as any).name).toBe('Single Strategy User');
+		});
+
+		it('should handle complex mixed strategy scenarios', async () => {
+			const mixedStrategy: MixedShardingStrategy = {
+				read: 'hash', // Consistent reads
+				write: 'random' // Distributed writes
+			};
+
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: mixedStrategy
+			});
+
+			// Create multiple users with different IDs
+			const userIds = ['user-1', 'user-2', 'user-3', 'user-4', 'user-5'];
+
+			for (const userId of userIds) {
+				await run(userId, 'INSERT INTO users (id, name) VALUES (?, ?)', [userId, `User ${userId}`]);
+			}
+
+			// Read all users back
+			for (const userId of userIds) {
+				const result = await first(userId, 'SELECT * FROM users WHERE id = ?', [userId]);
+				expect(result).toBeDefined();
+				expect((result as any).name).toBe(`User ${userId}`);
+			}
+		});
+
+		it('should use default strategy when none specified in mixed configuration', async () => {
+			const mixedStrategy: MixedShardingStrategy = {
+				read: 'hash',
+				write: 'hash'
+			};
+
+			// Initialize without specifying strategy (should default to hash)
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				}
+				// No strategy specified - should default to 'hash'
+			});
+
+			await run('user-default', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-default', 'Default User']);
+			const result = await first('user-default', 'SELECT * FROM users WHERE id = ?', ['user-default']);
+
+			expect(result).toBeDefined();
+			expect((result as any).name).toBe('Default User');
+		});
+	});
+
+	describe('Multi-Column Migration', () => {
+		let mockKV: MockKVNamespace;
+		let mockDB: MockD1Database;
+		let mapper: KVShardMapper;
+		let config: CollegeDBConfig;
+
+		beforeEach(() => {
+			mockKV = new MockKVNamespace();
+			mockDB = new MockD1Database();
+			mapper = new KVShardMapper(mockKV as any, { hashShardMappings: true });
+
+			config = {
+				kv: mockKV as any,
+				shards: {
+					'db-test': mockDB as any
+				},
+				strategy: 'hash',
+				hashShardMappings: true
+			};
+
+			clearMigrationCache();
+		});
+
+		afterEach(() => {
+			mockKV.clear();
+		});
+
+		describe('discoverExistingRecordsWithColumns', () => {
+			it('should discover records with all available columns', async () => {
+				// Setup test data
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: 'john@example.com',
+						name: 'John Doe',
+						created_at: 1234567890
+					},
+					{
+						id: 'user-2',
+						username: 'janesmith',
+						email: 'jane@example.com',
+						name: 'Jane Smith',
+						created_at: 1234567891
+					}
+				]);
+
+				const records = await discoverExistingRecordsWithColumns(mockDB as any, 'users');
+
+				expect(records).toHaveLength(2);
+				expect(records[0]).toMatchObject({
+					id: 'user-1',
+					username: 'johndoe',
+					email: 'john@example.com',
+					name: 'John Doe'
+				});
+			});
+
+			it('should handle records with missing optional columns', async () => {
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: null, // Missing email
+						name: 'John Doe',
+						created_at: 1234567890
+					},
+					{
+						id: 'user-2',
+						username: null, // Missing username
+						email: 'jane@example.com',
+						name: 'Jane Smith',
+						created_at: 1234567891
+					}
+				]);
+
+				const records = await discoverExistingRecordsWithColumns(mockDB as any, 'users');
+
+				expect(records).toHaveLength(2);
+				expect(records[0]?.email).toBeNull();
+				expect(records[1]?.username).toBeNull();
+			});
+		});
+
+		describe('integrateExistingDatabase with migrateOtherColumns', () => {
+			it('should create mappings for additional columns when enabled', async () => {
+				// Setup test data
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: 'john@example.com',
+						name: 'John Doe',
+						created_at: 1234567890
+					}
+				]);
+
+				console.log('Starting integration test with mockDB:', mockDB, 'mapper:', mapper);
+
+				// First, let's test if basic mapping works
+				await mapper.setShardMapping('test-key', 'db-test');
+				const testMapping = await mapper.getShardMapping('test-key');
+				console.log('Basic mapping test result:', testMapping);
+
+				const result = await integrateExistingDatabase(mockDB as any, 'db-test', mapper, {
+					tables: ['users'],
+					migrateOtherColumns: true
+				});
+				console.log('Integration result:', result);
+
+				expect(result.success).toBe(true);
+				if (!result.success) {
+					console.log('Integration failed with issues:', result.issues);
+				}
+				expect(result.mappingsCreated).toBe(1);
+
+				// Check that multiple lookup keys were created
+				const primaryMapping = await mapper.getShardMapping('user-1');
+				const usernameMapping = await mapper.getShardMapping('username:johndoe');
+				const emailMapping = await mapper.getShardMapping('email:john@example.com');
+				const nameMapping = await mapper.getShardMapping('name:John Doe');
+
+				expect(primaryMapping?.shard).toBe('db-test');
+				expect(usernameMapping?.shard).toBe('db-test');
+				expect(emailMapping?.shard).toBe('db-test');
+				expect(nameMapping?.shard).toBe('db-test');
+			});
+
+			it('should only create mappings for primary key when disabled', async () => {
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: 'john@example.com',
+						name: 'John Doe',
+						created_at: 1234567890
+					}
+				]);
+
+				console.log('Starting second integration test');
+				const result = await integrateExistingDatabase(mockDB as any, 'db-test', mapper, {
+					tables: ['users'],
+					migrateOtherColumns: false
+				});
+				console.log('Second integration result:', result);
+
+				expect(result.success).toBe(true);
+				if (!result.success) {
+					console.log('Integration failed with issues:', result.issues);
+				}
+				expect(result.mappingsCreated).toBe(1);
+
+				// Check that only primary key mapping was created
+				const primaryMapping = await mapper.getShardMapping('user-1');
+				const usernameMapping = await mapper.getShardMapping('username:johndoe');
+
+				expect(primaryMapping?.shard).toBe('db-test');
+				expect(usernameMapping).toBeNull();
+			});
+
+			it('should skip null/undefined columns', async () => {
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: null,
+						name: undefined,
+						created_at: 1234567890
+					}
+				]);
+
+				const result = await integrateExistingDatabase(mockDB as any, 'db-test', mapper, {
+					tables: ['users'],
+					migrateOtherColumns: true
+				});
+
+				expect(result.success).toBe(true);
+
+				// Only primary key and username should have mappings
+				const primaryMapping = await mapper.getShardMapping('user-1');
+				const usernameMapping = await mapper.getShardMapping('username:johndoe');
+				const emailMapping = await mapper.getShardMapping('email:null');
+				const nameMapping = await mapper.getShardMapping('name:undefined');
+
+				expect(primaryMapping?.shard).toBe('db-test');
+				expect(usernameMapping?.shard).toBe('db-test');
+				expect(emailMapping).toBeNull();
+				expect(nameMapping).toBeNull();
+			});
+		});
+
+		describe('autoDetectAndMigrate with migrateOtherColumns', () => {
+			it('should perform auto-migration with multi-column lookup', async () => {
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: 'john@example.com',
+						name: 'John Doe',
+						created_at: 1234567890
+					}
+				]);
+
+				console.log('Starting auto-migrate test');
+				const result = await autoDetectAndMigrate(mockDB as any, 'db-test', config, {
+					migrateOtherColumns: true,
+					tablesToCheck: ['users'],
+					skipCache: true
+				});
+				console.log('Auto-migrate result:', result);
+
+				expect(result.migrationPerformed).toBe(true);
+				if (!result.migrationPerformed) {
+					console.log('Auto-migration result:', result);
+				}
+				expect(result.recordsMigrated).toBe(1); // Check that multiple lookup keys were created
+				const usernameMapping = await mapper.getShardMapping('username:johndoe');
+				const emailMapping = await mapper.getShardMapping('email:john@example.com');
+
+				expect(usernameMapping?.shard).toBe('db-test');
+				expect(emailMapping?.shard).toBe('db-test');
+			});
+
+			it('should not migrate already mapped records', async () => {
+				mockDB.addTestData('users', [
+					{
+						id: 'user-1',
+						username: 'johndoe',
+						email: 'john@example.com',
+						name: 'John Doe',
+						created_at: 1234567890
+					}
+				]);
+
+				// Pre-create a mapping
+				await mapper.setShardMapping('user-1', 'db-test');
+
+				const result = await autoDetectAndMigrate(mockDB as any, 'db-test', config, {
+					migrateOtherColumns: true,
+					tablesToCheck: ['users'],
+					skipCache: true
+				});
+
+				// Should not perform migration since mapping already exists
+				expect(result.migrationPerformed).toBe(false);
+				expect(result.recordsMigrated).toBe(0);
+			});
 		});
 	});
 });

@@ -143,7 +143,7 @@ export async function createSchemaAcrossShards(shards: Record<string, D1Database
  */
 export async function schemaExists(d1: D1Database, table: string): Promise<boolean> {
 	try {
-		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='?'").bind(table).first();
+		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").bind(table).first();
 		return result !== null;
 	} catch {
 		return false;
@@ -302,6 +302,59 @@ export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: str
 }
 
 /**
+ * Discovers existing records with additional columns for multi-key mapping support.
+ * Scans a table to find primary keys along with username, email, and name columns
+ * when they exist, allowing these additional columns to be used as lookup keys.
+ *
+ * @param d1 - The D1 database instance to scan
+ * @param tableName - Name of the table to discover records from
+ * @param primaryKeyColumn - Name of the primary key column (defaults to 'id')
+ * @returns Promise resolving to array of record data with available columns
+ * @throws {Error} If table doesn't exist or database query fails
+ * @example
+ * ```typescript
+ * // Discover all user records with available lookup columns
+ * const records = await discoverExistingRecordsWithColumns(env.DB_EXISTING, 'users');
+ * console.log(`Found ${records.length} user records`);
+ * records.forEach(record => {
+ *   console.log(`ID: ${record.id}, Email: ${record.email || 'N/A'}`);
+ * });
+ * ```
+ */
+export async function discoverExistingRecordsWithColumns(
+	d1: D1Database,
+	tableName: string,
+	primaryKeyColumn: string = 'id'
+): Promise<Array<{ [key: string]: any }>> {
+	try {
+		// First, discover what columns exist in the table
+		const columnInfo = await d1.prepare(`PRAGMA table_info(${tableName})`).all();
+		const availableColumns = (columnInfo.results as any[]).map((col) => col.name as string);
+
+		// Build SELECT statement with available columns
+		const columnsToSelect = [primaryKeyColumn];
+
+		// Add optional columns if they exist
+		if (availableColumns.includes('username')) {
+			columnsToSelect.push('username');
+		}
+		if (availableColumns.includes('email')) {
+			columnsToSelect.push('email');
+		}
+		if (availableColumns.includes('name')) {
+			columnsToSelect.push('name');
+		}
+
+		const selectQuery = `SELECT ${columnsToSelect.join(', ')} FROM ${tableName}`;
+		const result = await d1.prepare(selectQuery).all();
+
+		return result.results as Array<{ [key: string]: any }>;
+	} catch (error) {
+		throw new CollegeDBError(`Failed to discover records with columns in table ${tableName}: ${error}`, 'DISCOVERY_FAILED');
+	}
+}
+
+/**
  * Takes a list of existing primary keys and creates shard mappings for them using
  * the specified allocation strategy. This allows existing data to be integrated
  * into the CollegeDB sharding system without data migration.
@@ -451,6 +504,7 @@ export type IntegrationOptions = {
 	strategy?: ShardingStrategy;
 	addShardMappingsTable?: boolean;
 	dryRun?: boolean;
+	migrateOtherColumns?: boolean;
 };
 
 /**
@@ -474,10 +528,15 @@ export type IntegrationResult = {
  * that already contains data. It discovers tables, validates them, creates shard
  * mappings, and optionally adds the shard_mappings table if needed.
  *
+ * When `migrateOtherColumns` is enabled, the function will also create additional
+ * lookup keys for username, email, and name columns if they exist in the table.
+ * This allows these fields to be used as lookup keys in addition to the primary key.
+ *
  * @param d1 - The existing D1 database to integrate
  * @param shardName - The shard binding name for this database
  * @param mapper - KVShardMapper instance for storing mappings
  * @param options - Configuration options for the integration
+ * @param options.migrateOtherColumns - When true, creates additional lookup keys for username, email, and name columns
  * @returns Promise resolving to integration summary
  * @throws {Error} If integration fails
  * @example
@@ -488,10 +547,12 @@ export type IntegrationResult = {
  * const result = await integrateExistingDatabase(env.DB_EXISTING, 'db-existing', mapper, {
  *   tables: ['users', 'posts'],
  *   strategy: 'hash',
- *   addShardMappingsTable: true
+ *   addShardMappingsTable: true,
+ *   migrateOtherColumns: true  // Creates additional lookup keys
  * });
  *
  * console.log(`Integrated ${result.totalRecords} records from ${result.tablesProcessed} tables`);
+ * // Now users can be looked up by username:john, email:john@example.com, or name:John Doe
  * ```
  */
 export async function integrateExistingDatabase(
@@ -500,7 +561,14 @@ export async function integrateExistingDatabase(
 	mapper: KVShardMapper,
 	options: IntegrationOptions = {}
 ): Promise<IntegrationResult> {
-	const { tables, primaryKeyColumn = 'id', strategy = 'hash', addShardMappingsTable = true, dryRun = false } = options;
+	const {
+		tables,
+		primaryKeyColumn = 'id',
+		strategy = 'hash',
+		addShardMappingsTable = true,
+		dryRun = false,
+		migrateOtherColumns = false
+	} = options;
 
 	const issues: string[] = [];
 	let tablesProcessed = 0;
@@ -524,21 +592,57 @@ export async function integrateExistingDatabase(
 					continue;
 				}
 
-				const primaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
-				if (primaryKeys.length === 0) {
-					issues.push(`Table ${tableName} has no records to process`);
-					continue;
-				}
-
-				if (!dryRun) {
-					for (const primaryKey of primaryKeys) {
-						await mapper.setShardMapping(primaryKey, shardName);
-						mappingsCreated++;
+				if (migrateOtherColumns) {
+					// Use the new function to get records with additional columns
+					const records = await discoverExistingRecordsWithColumns(d1, tableName, primaryKeyColumn);
+					if (records.length === 0) {
+						issues.push(`Table ${tableName} has no records to process`);
+						continue;
 					}
+
+					if (!dryRun) {
+						for (const record of records) {
+							const primaryKey = String(record[primaryKeyColumn]);
+
+							// Create additional lookup keys based on available columns
+							const additionalKeys: string[] = [];
+
+							if (record.username && typeof record.username === 'string') {
+								additionalKeys.push(`username:${record.username}`);
+							}
+							if (record.email && typeof record.email === 'string') {
+								additionalKeys.push(`email:${record.email}`);
+							}
+							if (record.name && typeof record.name === 'string') {
+								additionalKeys.push(`name:${record.name}`);
+							}
+
+							// Set the primary mapping with additional lookup keys
+							await mapper.setShardMapping(primaryKey, shardName, additionalKeys);
+							mappingsCreated++;
+						}
+					}
+
+					totalRecords += records.length;
+				} else {
+					// Original behavior: only use primary keys
+					const primaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
+					if (primaryKeys.length === 0) {
+						issues.push(`Table ${tableName} has no records to process`);
+						continue;
+					}
+
+					if (!dryRun) {
+						for (const primaryKey of primaryKeys) {
+							await mapper.setShardMapping(primaryKey, shardName);
+							mappingsCreated++;
+						}
+					}
+
+					totalRecords += primaryKeys.length;
 				}
 
 				tablesProcessed++;
-				totalRecords += primaryKeys.length;
 			} catch (error) {
 				issues.push(`Failed to process table ${tableName}: ${error}`);
 			}
@@ -592,15 +696,21 @@ export async function integrateExistingDatabase(
  * 3. If unmapped data is found, performs automatic integration
  * 4. Caches results to avoid repeated checks
  *
+ * When `migrateOtherColumns` is enabled, additional lookup keys will be created
+ * for username, email, and name columns if they exist in the tables.
+ *
  * @param d1 - The D1 database instance to check and potentially migrate
  * @param shardName - The shard binding name for this database
  * @param config - CollegeDB configuration containing KV and strategy
  * @param options - Optional migration configuration
+ * @param options.migrateOtherColumns - When true, creates additional lookup keys for username, email, and name columns
  * @returns Promise resolving to migration result summary
  * @example
  * ```typescript
  * // Called automatically by CollegeDB operations
- * const result = await autoDetectAndMigrate(env.DB_EXISTING, 'db-existing', config);
+ * const result = await autoDetectAndMigrate(env.DB_EXISTING, 'db-existing', config, {
+ *   migrateOtherColumns: true
+ * });
  * if (result.migrationPerformed) {
  *   console.log(`Auto-migrated ${result.recordsMigrated} records`);
  * }
@@ -615,6 +725,7 @@ export async function autoDetectAndMigrate(
 		tablesToCheck?: string[];
 		skipCache?: boolean;
 		maxRecordsToCheck?: number;
+		migrateOtherColumns?: boolean;
 	} = {}
 ): Promise<{
 	migrationNeeded: boolean;
@@ -623,7 +734,7 @@ export async function autoDetectAndMigrate(
 	tablesProcessed: number;
 	issues: string[];
 }> {
-	const { primaryKeyColumn = 'id', tablesToCheck, skipCache = false, maxRecordsToCheck = 1000 } = options;
+	const { primaryKeyColumn = 'id', tablesToCheck, skipCache = false, maxRecordsToCheck = 1000, migrateOtherColumns = false } = options;
 
 	const cacheKey = `${shardName}_migration_check`;
 
@@ -702,23 +813,57 @@ export async function autoDetectAndMigrate(
 				if (unmappedCount > 0) {
 					console.log(`Auto-migrating table ${tableName} in shard ${shardName} (${validation.recordCount} records)`);
 
-					const allPrimaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
+					if (migrateOtherColumns) {
+						// Use multi-column discovery for migration with additional lookup keys
+						const allRecords = await discoverExistingRecordsWithColumns(d1, tableName, primaryKeyColumn);
 
-					// Create mappings for all unmapped keys
-					let newMappings = 0;
-					for (const primaryKey of allPrimaryKeys) {
-						const existingMapping = await mapper.getShardMapping(primaryKey);
-						if (!existingMapping) {
-							await mapper.setShardMapping(primaryKey, shardName);
-							newMappings++;
+						// Create mappings for all unmapped keys with additional lookup keys
+						let newMappings = 0;
+						for (const record of allRecords) {
+							const primaryKey = String(record[primaryKeyColumn]);
+							const existingMapping = await mapper.getShardMapping(primaryKey);
+							if (!existingMapping) {
+								// Create additional lookup keys based on available columns
+								const additionalKeys: string[] = [];
+
+								if (record.username && typeof record.username === 'string') {
+									additionalKeys.push(`username:${record.username}`);
+								}
+								if (record.email && typeof record.email === 'string') {
+									additionalKeys.push(`email:${record.email}`);
+								}
+								if (record.name && typeof record.name === 'string') {
+									additionalKeys.push(`name:${record.name}`);
+								}
+
+								// Set the primary mapping with additional lookup keys
+								await mapper.setShardMapping(primaryKey, shardName, additionalKeys);
+								newMappings++;
+							}
 						}
+
+						recordsMigrated += newMappings;
+					} else {
+						// Original behavior: only use primary keys
+						const allPrimaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
+
+						// Create mappings for all unmapped keys
+						let newMappings = 0;
+						for (const primaryKey of allPrimaryKeys) {
+							const existingMapping = await mapper.getShardMapping(primaryKey);
+							if (!existingMapping) {
+								await mapper.setShardMapping(primaryKey, shardName);
+								newMappings++;
+							}
+						}
+
+						recordsMigrated += newMappings;
 					}
 
-					recordsMigrated += newMappings;
 					tablesProcessed++;
 					migrationPerformed = true;
 
-					console.log(`Auto-migrated ${newMappings} records from table ${tableName}`);
+					console.log(`Auto-migrated ${recordsMigrated} records from table ${tableName}`);
 				}
 			} catch (error) {
 				issues.push(`Auto-migration failed for table ${tableName}: ${error}`);
