@@ -12,10 +12,12 @@
 // Export main API functions
 export {
 	all,
+	allAllShards,
 	allShard,
 	collegedb,
 	createSchema,
 	first,
+	firstAllShards,
 	firstShard,
 	flush,
 	getClosestRegionFromIP,
@@ -27,6 +29,7 @@ export {
 	reassignShard,
 	resetConfig,
 	run,
+	runAllShards,
 	runShard
 } from './router.js';
 
@@ -44,6 +47,7 @@ export {
 	createMappingsForExistingKeys,
 	createSchemaAcrossShards,
 	discoverExistingPrimaryKeys,
+	discoverExistingRecordsWithColumns,
 	dropSchema,
 	integrateExistingDatabase,
 	listTables,

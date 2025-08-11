@@ -320,6 +320,7 @@ export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: str
  *   console.log(`ID: ${record.id}, Email: ${record.email || 'N/A'}`);
  * });
  * ```
+ * @since 1.0.4
  */
 export async function discoverExistingRecordsWithColumns(
 	d1: D1Database,
