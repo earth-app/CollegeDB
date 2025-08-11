@@ -16,7 +16,7 @@ jobs:
       pages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
       - name: Install dependencies
