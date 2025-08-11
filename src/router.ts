@@ -1237,6 +1237,139 @@ export async function firstShard<T = Record<string, unknown>>(shardBinding: stri
 }
 
 /**
+ * Executes a query on all shards and returns the results from each shard.
+ *
+ * This function is useful for scenarios where you need to aggregate data
+ * from multiple shards, such as running analytics or cross-shard queries.
+ * It executes the same SQL statement on each shard and collects the results.
+ * @param sql - The SQL statement to execute on each shard
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param batchSize - Number of concurrent queries to run at once (default: 50)
+ * @returns Promise resolving to an array of results from each shard
+ * @since 1.0.4
+ */
+export async function runAllShards<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<D1Result<T>[]> {
+	const config = getConfig();
+	const results: Promise<D1Result<T>>[] = [];
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		try {
+			const result = db
+				.prepare(sql)
+				.bind(...bindings)
+				.all<T>()
+				.catch((error) => {
+					console.error(`Error executing query on shard ${binding}:`, error);
+					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
+				});
+			results.push(result);
+		} catch (error) {
+			console.error(`Error running on shard ${binding}:`, error);
+		}
+	}
+
+	const batch: D1Result<T>[] = [];
+	for (let i = 0; i < results.length; i += batchSize) {
+		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	}
+
+	return batch;
+}
+
+/**
+ * Executes a query on all shards and returns all matching records from each shard.
+ *
+ * This function is useful for scenarios where you need to retrieve all records
+ * matching a query across multiple shards, such as aggregating data or running
+ * cross-shard analytics.
+ * @param sql - The SQL statement to execute on each shard
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param batchSize - Number of concurrent queries to run at once (default: 50)
+ * @returns Promise resolving to an array of results from each shard
+ * @since 1.0.4
+ */
+export async function allAllShards<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<D1Result<T>[]> {
+	const config = getConfig();
+	const results: Promise<D1Result<T>>[] = [];
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		try {
+			const result = db
+				.prepare(sql)
+				.bind(...bindings)
+				.all<T>()
+				.catch((error) => {
+					console.error(`Error executing query on shard ${binding}:`, error);
+					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
+				});
+			results.push(result);
+		} catch (error) {
+			console.error(`Error running on shard ${binding}:`, error);
+		}
+	}
+
+	const batch: D1Result<T>[] = [];
+	for (let i = 0; i < results.length; i += batchSize) {
+		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	}
+
+	return batch;
+}
+
+/**
+ * Executes a query on all shards and returns the first matching record from each shard.
+ *
+ * This function is useful for scenarios where you need to retrieve a single record
+ * from each shard, such as fetching the latest entry or a specific item that may
+ * exist on multiple shards.
+ * @param sql - The SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param batchSize - Number of concurrent queries to run at once (default: 50)
+ * @returns Promise resolving to an array of first matching records from each shard
+ * @since 1.0.4
+ */
+export async function firstAllShards<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<(T | null)[]> {
+	const config = getConfig();
+	const results: Promise<T | null>[] = [];
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		try {
+			const result = db
+				.prepare(sql)
+				.bind(...bindings)
+				.first<T>()
+				.catch((error) => {
+					console.error(`Error executing query on shard ${binding}:`, error);
+					return null;
+				});
+			3;
+			results.push(result);
+		} catch (error) {
+			console.error(`Error running on shard ${binding}:`, error);
+		}
+	}
+
+	const batch: (T | null)[] = [];
+	for (let i = 0; i < results.length; i += batchSize) {
+		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	}
+
+	return batch;
+}
+
+/**
  * Flushes all shard mappings (development only)
  *
  * Completely clears all primary key to shard mappings from both KV storage
