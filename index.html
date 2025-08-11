@@ -164,7 +164,7 @@ env.db-central (Shard 3)
 <tr>
 <td><code>collegedb(config, callback)</code></td>
 <td>Initialize CollegeDB, then run a callback</td>
-<td><code>CollegeDBConfig, ()=&gt;T</code></td>
+<td><code>CollegeDBConfig, () =&gt; T</code></td>
 </tr>
 <tr>
 <td><code>initialize(config)</code></td>
@@ -198,18 +198,33 @@ env.db-central (Shard 3)
 </tr>
 <tr>
 <td><code>runShard(shard, sql, bindings)</code></td>
-<td>Execute a SQL query directly on a specific shard</td>
+<td>Execute a query directly on a specific shard</td>
 <td><code>string, string, any[]</code></td>
 </tr>
 <tr>
 <td><code>allShard(shard, sql, bindings)</code></td>
-<td>Execute query on specific shard, return all results</td>
+<td>Execute a query on specific shard, return all results</td>
 <td><code>string, string, any[]</code></td>
 </tr>
 <tr>
 <td><code>firstShard(shard, sql, bindings)</code></td>
-<td>Execute query on specific shard, return first result</td>
+<td>Execute a query on specific shard, return first result</td>
 <td><code>string, string, any[]</code></td>
+</tr>
+<tr>
+<td><code>runAllShards(sql, bindings, batchSize)</code></td>
+<td>Execute query on all shards</td>
+<td><code>string, any[], number</code></td>
+</tr>
+<tr>
+<td><code>allAllShards(sql, bindings, batchSize)</code></td>
+<td>Execute query on all shards, return all results from all shards</td>
+<td><code>string, any[], number</code></td>
+</tr>
+<tr>
+<td><code>firstAllShards(sql, bindings, batchSize)</code></td>
+<td>Execute query on all shards, return first result from all shards</td>
+<td><code>string, any[], number</code></td>
 </tr>
 <tr>
 <td><code>reassignShard(key, newShard)</code></td>
@@ -244,12 +259,12 @@ env.db-central (Shard 3)
 <tbody>
 <tr>
 <td><code>autoDetectAndMigrate(d1, shard, config)</code></td>
-<td><strong>NEW</strong>: Automatically detect and migrate existing data</td>
+<td>Automatically detect and migrate existing data</td>
 <td><code>D1Database, string, config</code></td>
 </tr>
 <tr>
 <td><code>checkMigrationNeeded(d1, shard, config)</code></td>
-<td><strong>NEW</strong>: Check if database needs migration</td>
+<td>Check if database needs migration</td>
 <td><code>D1Database, string, config</code></td>
 </tr>
 <tr>
