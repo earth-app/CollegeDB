@@ -197,7 +197,9 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 		const { autoDetectAndMigrate } = await import('./migrations.js');
 		const shardNames = Object.keys(config.shards);
 
-		console.log(`🔍 Checking ${shardNames.length} shards for existing data...`);
+		if (config.debug) {
+			console.log(`🔍 Checking ${shardNames.length} shards for existing data...`);
+		}
 
 		// Check each shard for migration needs
 		const migrationPromises = shardNames.map(async (shardName) => {
@@ -614,31 +616,6 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 	const availableShards = Object.keys(config.shards);
 	if (availableShards.length === 0) {
 		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
-	}
-
-	// Check existing shards for unmapped data containing this primary key
-	for (const shardName of availableShards) {
-		const database = config.shards[shardName];
-		if (!database) continue;
-
-		try {
-			// Quick check if this primary key exists in any table in this shard
-			const { autoDetectAndMigrate } = await import('./migrations.js');
-			const migrationResult = await autoDetectAndMigrate(database, shardName, config, {
-				maxRecordsToCheck: 100 // Limit check for performance
-			});
-
-			if (migrationResult.migrationPerformed) {
-				// Re-check mapping after migration
-				const newMapping = await mapper.getShardMapping(primaryKey);
-				if (newMapping) {
-					return newMapping.shard;
-				}
-			}
-		} catch (error) {
-			// Don't fail the operation if auto-migration fails
-			console.warn(`Auto-migration check failed for shard ${shardName}:`, error);
-		}
 	}
 
 	// If no existing mapping found after auto-migration, allocate a new shard
