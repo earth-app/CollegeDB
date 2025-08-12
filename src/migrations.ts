@@ -43,6 +43,12 @@ import type { CollegeDBConfig, ShardingStrategy } from './types.js';
 const migrationStatusCache = new Map<string, boolean>();
 
 /**
+ * Cache for table structure information to avoid repeated PRAGMA queries
+ * @private
+ */
+const tableInfoCache = new Map<string, Array<{ name: string; type: string }>>();
+
+/**
  * Executes SQL statements to create the default table structure and indexes
  * in the specified D1 database. Supports custom schemas and handles SQL
  * statement parsing with comment filtering.
@@ -328,9 +334,21 @@ export async function discoverExistingRecordsWithColumns(
 	primaryKeyColumn: string = 'id'
 ): Promise<Array<{ [key: string]: any }>> {
 	try {
-		// First, discover what columns exist in the table
-		const columnInfo = await d1.prepare(`PRAGMA table_info(${tableName})`).all();
-		const availableColumns = (columnInfo.results as any[]).map((col) => col.name as string);
+		// Check cache first to avoid repeated PRAGMA queries
+		const cacheKey = `${tableName}_columns`;
+		let availableColumns: string[];
+
+		if (tableInfoCache.has(cacheKey)) {
+			availableColumns = tableInfoCache.get(cacheKey)!.map((col) => col.name);
+		} else {
+			// First, discover what columns exist in the table
+			const columnInfo = await d1.prepare(`PRAGMA table_info(${tableName})`).all();
+			const columnData = (columnInfo.results as any[]).map((col) => ({ name: col.name as string, type: col.type as string }));
+
+			// Cache the result
+			tableInfoCache.set(cacheKey, columnData);
+			availableColumns = columnData.map((col) => col.name);
+		}
 
 		// Build SELECT statement with available columns
 		const columnsToSelect = [primaryKeyColumn];
@@ -802,10 +820,19 @@ export async function autoDetectAndMigrate(
 				let unmappedCount = 0;
 				const keysToCheck = sampleKeys.results.slice(0, 10); // Check first 10 as sample
 
-				for (const row of keysToCheck) {
+				// OPTIMIZATION: Batch check multiple keys instead of one-by-one
+				const keyCheckPromises = keysToCheck.map(async (row) => {
 					const primaryKey = String((row as any)[primaryKeyColumn]);
-					const mapping = await mapper.getShardMapping(primaryKey);
-					if (!mapping) {
+					return {
+						key: primaryKey,
+						mapping: await mapper.getShardMapping(primaryKey)
+					};
+				});
+
+				const keyResults = await Promise.all(keyCheckPromises);
+
+				for (const result of keyResults) {
+					if (!result.mapping) {
 						unmappedCount++;
 						migrationNeeded = true;
 					}
