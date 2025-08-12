@@ -118,6 +118,12 @@ export interface CollegeDBConfig {
 	 * @since 1.0.3
 	 */
 	hashShardMappings?: boolean;
+	/**
+	 * Enable debug logging for development and troubleshooting
+	 * @default false
+	 * @since 1.0.6
+	 */
+	debug?: boolean;
 }
 
 /**

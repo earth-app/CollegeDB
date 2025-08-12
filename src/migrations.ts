@@ -812,7 +812,7 @@ export async function autoDetectAndMigrate(
 				}
 
 				if (unmappedCount > 0) {
-					console.log(`Auto-migrating table ${tableName} in shard ${shardName} (${validation.recordCount} records)`);
+					if (config.debug) console.log(`Auto-migrating table ${tableName} in shard ${shardName} (${validation.recordCount} records)`);
 
 					if (migrateOtherColumns) {
 						// Use multi-column discovery for migration with additional lookup keys
@@ -864,7 +864,7 @@ export async function autoDetectAndMigrate(
 					tablesProcessed++;
 					migrationPerformed = true;
 
-					console.log(`Auto-migrated ${recordsMigrated} records from table ${tableName}`);
+					if (config.debug) console.log(`Auto-migrated ${recordsMigrated} records from table ${tableName}`);
 				}
 			} catch (error) {
 				issues.push(`Auto-migration failed for table ${tableName}: ${error}`);
@@ -895,7 +895,7 @@ export async function autoDetectAndMigrate(
 		// Cache the result to avoid repeated checks
 		migrationStatusCache.set(cacheKey, true);
 
-		if (migrationPerformed) {
+		if (migrationPerformed && config.debug) {
 			console.log(`Auto-migration completed for shard ${shardName}: ${recordsMigrated} records from ${tablesProcessed} tables`);
 		}
 	} catch (error) {

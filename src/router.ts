@@ -222,16 +222,18 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 		const results = await Promise.all(migrationPromises);
 		const successfulMigrations = results.filter((r) => r?.migrationPerformed);
 
-		if (successfulMigrations.length > 0) {
-			const totalRecords = successfulMigrations.reduce((sum, r) => sum + (r?.recordsMigrated || 0), 0);
-			console.log(`🎉 Auto-migration completed! Migrated ${totalRecords} records across ${successfulMigrations.length} shards`);
-			successfulMigrations.forEach((result) => {
-				if (result) {
-					console.log(`   ✅ ${result.shardName}: ${result.recordsMigrated} records from ${result.tablesProcessed} tables`);
-				}
-			});
-		} else {
-			console.log('✅ All shards ready - no migration needed');
+		if (config.debug) {
+			if (successfulMigrations.length > 0) {
+				const totalRecords = successfulMigrations.reduce((sum, r) => sum + (r?.recordsMigrated || 0), 0);
+				console.log(`🎉 Auto-migration completed! Migrated ${totalRecords} records across ${successfulMigrations.length} shards`);
+				successfulMigrations.forEach((result) => {
+					if (result) {
+						console.log(`   ✅ ${result.shardName}: ${result.recordsMigrated} records from ${result.tablesProcessed} tables`);
+					}
+				});
+			} else {
+				console.log('✅ All shards ready - no migration needed');
+			}
 		}
 	} catch (error) {
 		console.warn('Background auto-migration setup failed:', error);
