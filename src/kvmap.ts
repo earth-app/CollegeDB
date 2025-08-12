@@ -116,6 +116,12 @@ export class KVShardMapper {
 	private readonly hashKeys: boolean;
 
 	/**
+	 * Cache for hashed keys to avoid repeated crypto operations
+	 * @private
+	 */
+	private readonly hashCache = new Map<string, string>();
+
+	/**
 	 * Creates a new KVShardMapper instance
 	 * @param kv - Cloudflare KV namespace
 	 * @param config - Configuration options including hashing preference
@@ -136,6 +142,12 @@ export class KVShardMapper {
 			return key;
 		}
 
+		// Check cache first to avoid repeated crypto operations
+		const cached = this.hashCache.get(key);
+		if (cached) {
+			return cached;
+		}
+
 		const encoder = new TextEncoder();
 		const data = encoder.encode(key);
 		const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -143,6 +155,12 @@ export class KVShardMapper {
 		const hashHex = Array.from(hashArray)
 			.map((b) => b.toString(16).padStart(2, '0'))
 			.join('');
+
+		// Cache the result (limit cache size to prevent memory issues)
+		if (this.hashCache.size < 10000) {
+			this.hashCache.set(key, hashHex);
+		}
+
 		return hashHex;
 	}
 
