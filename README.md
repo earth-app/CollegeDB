@@ -1,6 +1,5 @@
 # CollegeDB
-
-> Cloudflare D1 Horizontal Sharding Router
+*Cloudflare D1 Horizontal Sharding Router*
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![GitHub Issues](https://img.shields.io/github/issues/earth-app/CollegeDB)](https://github.com/earth-app/CollegeDB/issues)
@@ -65,15 +64,15 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 ## Installation
 
 ```bash
-bun add collegedb
+bun add @earth-app/collegedb
 # or
-npm install collegedb
+npm install @earth-app/collegedb
 ```
 
 ## Basic Usage
 
 ```typescript
-import { collegedb, createSchema, run, first } from 'collegedb';
+import { collegedb, createSchema, run, first } from '@earth-app/collegedb';
 
 // Initialize with your Cloudflare bindings (existing databases work automatically!)
 collegedb(
@@ -104,7 +103,7 @@ collegedb(
 ### Geographic Distribution Example
 
 ```typescript
-import { collegedb, first, run } from 'collegedb';
+import { collegedb, first, run } from '@earth-app/collegedb';
 
 // Optimize for North American users with geographic sharding
 collegedb(
@@ -141,7 +140,7 @@ collegedb(
 ### Mixed Strategy Example
 
 ```typescript
-import { collegedb, first, run, type MixedShardingStrategy } from 'collegedb';
+import { collegedb, first, run, type MixedShardingStrategy } from '@earth-app/collegedb';
 
 // Use location strategy for writes (optimal data placement) and hash for reads (optimal performance)
 const mixedStrategy: MixedShardingStrategy = {
@@ -194,7 +193,7 @@ This approach provides:
 CollegeDB supports **multiple lookup keys** for the same record, allowing you to query by username, email, ID, or any unique identifier. Keys are automatically hashed with SHA-256 for security and privacy.
 
 ```typescript
-import { collegedb, first, run, KVShardMapper } from 'collegedb';
+import { collegedb, first, run, KVShardMapper } from '@earth-app/collegedb';
 
 collegedb(
 	{
@@ -291,7 +290,7 @@ CollegeDB supports **seamless, automatic integration** with existing D1 database
 4. **KV Namespace**: A Cloudflare KV namespace for storing shard mappings
 
 ```typescript
-import { collegedb, first, run } from 'collegedb';
+import { collegedb, first, run } from '@earth-app/collegedb';
 
 // Add your existing databases as shards - that's it!
 collegedb(
@@ -321,7 +320,7 @@ collegedb(
 You can manually validate databases before integration if needed:
 
 ```typescript
-import { validateTableForSharding, listTables } from 'collegedb';
+import { validateTableForSharding, listTables } from '@earth-app/collegedb';
 
 // Check database structure
 const tables = await listTables(env.ExistingDB);
@@ -343,7 +342,7 @@ for (const table of tables) {
 If you want to inspect existing data before automatic migration:
 
 ```typescript
-import { discoverExistingPrimaryKeys } from 'collegedb';
+import { discoverExistingPrimaryKeys } from '@earth-app/collegedb';
 
 // Discover all user IDs in existing users table
 const userIds = await discoverExistingPrimaryKeys(env.ExistingDB, 'users');
@@ -358,7 +357,7 @@ const orderIds = await discoverExistingPrimaryKeys(env.ExistingDB, 'orders', 'or
 For complete control over the integration process:
 
 ```typescript
-import { integrateExistingDatabase, KVShardMapper } from 'collegedb';
+import { integrateExistingDatabase, KVShardMapper } from '@earth-app/collegedb';
 
 const mapper = new KVShardMapper(env.KV);
 
@@ -386,7 +385,7 @@ if (result.success) {
 After integration, initialize CollegeDB with your existing databases as shards:
 
 ```typescript
-import { initialize, first } from 'collegedb';
+import { initialize, first } from '@earth-app/collegedb';
 
 // Include existing databases as shards
 initialize({
@@ -409,7 +408,7 @@ const user = await first('existing-user-123', 'SELECT * FROM users WHERE id = ?'
 The simplest possible integration - just add your existing databases:
 
 ```typescript
-import { initialize, first, run } from 'collegedb';
+import { initialize, first, run } from '@earth-app/collegedb';
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -479,12 +478,12 @@ console.log(`Would process ${testResult.totalRecords} records from ${testResult.
 
 ```typescript
 // Simple rollback - clear all mappings
-import { KVShardMapper } from 'collegedb';
+import { KVShardMapper } from '@earth-app/collegedb';
 const mapper = new KVShardMapper(env.KV);
 await mapper.clearAllMappings(); // Returns to pre-migration state
 
 // Or clear cache to force re-detection
-import { clearMigrationCache } from 'collegedb';
+import { clearMigrationCache } from '@earth-app/collegedb';
 clearMigrationCache(); // Forces fresh migration check
 ```
 
@@ -612,7 +611,7 @@ The `ShardCoordinator` is an optional Durable Object that provides centralized s
 #### Usage Example
 
 ```typescript
-import { ShardCoordinator } from 'collegedb';
+import { ShardCoordinator } from '@earth-app/collegedb';
 
 // Export for Cloudflare Workers runtime
 export { ShardCoordinator };
@@ -719,7 +718,7 @@ CollegeDB exports TypeScript types for better development experience and type sa
 #### Mixed Strategy Configuration
 
 ```typescript
-import type { MixedShardingStrategy, CollegeDBConfig } from 'collegedb';
+import type { MixedShardingStrategy, CollegeDBConfig } from '@earth-app/collegedb';
 
 // Type-safe mixed strategy configuration
 const mixedStrategy: MixedShardingStrategy = {
@@ -914,7 +913,7 @@ Create your main worker file with ShardCoordinator export:
 
 ```typescript
 // src/index.ts
-import { collegedb, ShardCoordinator, first, run } from 'collegedb';
+import { collegedb, ShardCoordinator, first, run } from '@earth-app/collegedb';
 
 // IMPORTANT: Export ShardCoordinator for Cloudflare Workers runtime
 export { ShardCoordinator };
@@ -978,7 +977,7 @@ wrangler deploy --env production
 #### Using CollegeDB Functions
 
 ```typescript
-import { getShardStats, listKnownShards } from 'collegedb';
+import { getShardStats, listKnownShards } from '@earth-app/collegedb';
 
 // Get detailed statistics
 const stats = await getShardStats();
@@ -1086,7 +1085,7 @@ export default {
 ### Shard Rebalancing
 
 ```typescript
-import { reassignShard } from 'collegedb';
+import { reassignShard } from '@earth-app/collegedb';
 
 // Move a primary key to a different shard
 await reassignShard('user-123', 'db-west');
@@ -1693,7 +1692,7 @@ class_name = "ShardCoordinator"
 #### Basic Usage with ShardCoordinator
 
 ```typescript
-import { collegedb, ShardCoordinator } from 'collegedb';
+import { collegedb, ShardCoordinator } from '@earth-app/collegedb';
 
 // Export the Durable Object class for Cloudflare Workers
 export { ShardCoordinator };
