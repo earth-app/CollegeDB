@@ -1,5 +1,6 @@
 # CollegeDB
-*Cloudflare D1 Horizontal Sharding Router*
+
+_Cloudflare D1 Horizontal Sharding Router_
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![GitHub Issues](https://img.shields.io/github/issues/earth-app/CollegeDB)](https://github.com/earth-app/CollegeDB/issues)
@@ -548,6 +549,7 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | `reassignShard(key, newShard)`             | Move primary key to different shard                              | `string, string`           |
 | `listKnownShards()`                        | Get list of available shards                                     | `void`                     |
 | `getShardStats()`                          | Get statistics for all shards                                    | `void`                     |
+| `getDatabaseSizeForShard(shard)`           | Get size of a specific shard in bytes                            | `string`                   |
 | `flush()`                                  | Clear all shard mappings (development only)                      | `void`                     |
 
 ### Drop-in Replacement Functions
@@ -651,6 +653,7 @@ interface CollegeDBConfig {
 	shardLocations?: Record<string, ShardLocation>;
 	disableAutoMigration?: boolean; // Default: false
 	hashShardMappings?: boolean; // Default: true
+	maxDatabaseSize?: number; // Default: undefined (no limit)
 }
 ```
 
@@ -700,6 +703,91 @@ const mixedStrategyConfig: CollegeDBConfig = {
 	}
 };
 ```
+
+### Database Size Management
+
+CollegeDB supports automatic size-based shard exclusion to prevent individual shards from becoming too large. This feature helps maintain optimal performance and prevents hitting D1 storage limits.
+
+#### Configuration
+
+```typescript
+const config: CollegeDBConfig = {
+	kv: env.KV,
+	shards: {
+		'db-east': env.DB_EAST,
+		'db-west': env.DB_WEST,
+		'db-central': env.DB_CENTRAL
+	},
+	strategy: 'hash',
+	maxDatabaseSize: 500 * 1024 * 1024 // 500 MB limit per shard
+};
+```
+
+#### How It Works
+
+When `maxDatabaseSize` is configured:
+
+1. **Allocation Phase**: Before allocating new records, CollegeDB checks each shard's size using efficient SQLite pragmas
+2. **Size Filtering**: Shards exceeding the limit are excluded from new allocations
+3. **Fallback Protection**: If all shards exceed the limit, allocation continues to prevent complete failure
+4. **Existing Records**: Records already mapped to oversized shards remain accessible
+
+#### Size Check Implementation
+
+The size check uses SQLite's `PRAGMA page_count` and `PRAGMA page_size` for accurate, low-overhead size calculation:
+
+```sql
+-- Efficient size calculation (used internally)
+PRAGMA page_count;  -- Returns number of database pages
+PRAGMA page_size;   -- Returns size of each page in bytes
+-- Total size = page_count × page_size
+```
+
+#### Usage Examples
+
+```typescript
+// Conservative limit for high-performance scenarios
+const performanceConfig: CollegeDBConfig = {
+	// ... other config
+	maxDatabaseSize: 100 * 1024 * 1024, // 100 MB per shard
+	strategy: 'round-robin' // Ensures even distribution
+};
+
+// Standard production limit
+const productionConfig: CollegeDBConfig = {
+	// ... other config
+	maxDatabaseSize: 1024 * 1024 * 1024, // 1 GB per shard
+	strategy: 'hash' // Consistent allocation
+};
+
+// Check individual shard sizes
+import { getDatabaseSizeForShard } from '@earth-app/collegedb';
+
+const eastSize = await getDatabaseSizeForShard('db-east');
+console.log(`East shard: ${Math.round(eastSize / 1024 / 1024)} MB`);
+```
+
+#### Debug Logging
+
+Enable debug logging to monitor size-based exclusions:
+
+```typescript
+const config: CollegeDBConfig = {
+	// ... other config
+	maxDatabaseSize: 500 * 1024 * 1024,
+	debug: true // Logs when shards are excluded due to size
+};
+
+// Console output example:
+// "Excluded 2 shards due to size limits: db-east, db-central"
+```
+
+#### Performance Impact
+
+- **Size Check Frequency**: Only performed during new allocations (not on reads)
+- **Query Efficiency**: Uses fast SQLite pragmas (microsecond execution time)
+- **Parallel Execution**: Size checks run concurrently across all shards
+- **Caching**: No caching implemented to ensure accurate real-time limits
 
 ### Types
 
