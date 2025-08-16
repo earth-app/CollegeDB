@@ -2390,4 +2390,219 @@ describe('CollegeDB', () => {
 			});
 		});
 	});
+
+	describe('KVShardMapper', () => {
+		let mapper: KVShardMapper;
+		let nonHashMapper: KVShardMapper;
+		let multiColumnMapper: KVShardMapper;
+
+		beforeEach(() => {
+			mapper = new KVShardMapper(mockKV as any, { hashShardMappings: true });
+			nonHashMapper = new KVShardMapper(mockKV as any, { hashShardMappings: false });
+		});
+
+		it('should create a new mapping', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+		});
+
+		it('should retrieve an existing mapping', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			const mapping = await mapper.getShardMapping('user-1');
+			expect(mapping?.shard).toBe('db-test');
+
+			const allMappings = await mapper.getAllLookupKeys('user-1');
+			expect(allMappings).toHaveLength(1);
+			expect(allMappings).toContain('user-1');
+		});
+
+		it('should return null for non-existing mapping', async () => {
+			const mapping = await mapper.getShardMapping('non-existing');
+			expect(mapping).toBeNull();
+		});
+
+		it('should handle hash mappings correctly', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			const hashMapping = await mapper.getShardMapping('user-1');
+			expect(hashMapping?.shard).toBe('db-test');
+
+			await nonHashMapper.setShardMapping('user-2', 'db-test-non-hash');
+			const nonHashMapping = await nonHashMapper.getShardMapping('user-2');
+			expect(nonHashMapping?.shard).toBe('db-test-non-hash');
+		});
+
+		it('should add additional lookup keys for multi-column mappings', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			const originalMapping = await mapper.getShardMapping('user-1');
+			const usernameMapping = await mapper.getShardMapping('username:johndoe');
+			const emailMapping = await mapper.getShardMapping('email:john@example.com');
+
+			expect(originalMapping?.shard).toBe('db-test');
+			expect(usernameMapping?.shard).toBe('db-test');
+			expect(emailMapping?.shard).toBe('db-test');
+		});
+
+		it('should update additional lookup keys for existing mappings', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			await mapper.updateShardMapping('user-1', 'db-test-updated');
+
+			const updatedMapping = await mapper.getShardMapping('user-1');
+			const usernameMapping = await mapper.getShardMapping('username:johndoe');
+			const emailMapping = await mapper.getShardMapping('email:john@example.com');
+
+			expect(updatedMapping?.shard).toBe('db-test-updated');
+			expect(usernameMapping?.shard).toBe('db-test-updated');
+			expect(emailMapping?.shard).toBe('db-test-updated');
+		});
+
+		it('should delete a mapping and its additional keys', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			const mapping = await mapper.getShardMapping('user-1');
+			expect(mapping?.shard).toBe('db-test');
+
+			await mapper.deleteShardMapping('user-1');
+			const deletedMapping = await mapper.getShardMapping('user-1');
+			expect(deletedMapping).toBeNull();
+		});
+
+		it('should retrieve all mappings for a primary key', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			const allMappings = await mapper.getAllLookupKeys('user-1');
+			expect(allMappings).toHaveLength(3);
+
+			await nonHashMapper.setShardMapping('user-2', 'db-test-non-hash');
+			await nonHashMapper.addLookupKeys('user-2', ['username:janesmith', 'email:janesmith@example.com']);
+			const nonHashMappings = await nonHashMapper.getAllLookupKeys('user-2');
+			expect(nonHashMappings).toHaveLength(3);
+			expect(nonHashMappings).toContain('user-2');
+			expect(nonHashMappings).toContain('username:janesmith');
+			expect(nonHashMappings).toContain('email:janesmith@example.com');
+		});
+
+		it('should retrieve all mapping counts for a shard', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			await mapper.setShardMapping('user-2', 'db-test');
+			await mapper.addLookupKeys('user-2', ['username:janesmith', 'email:janesmith@example.com']);
+
+			const counts = await mapper.getKeysForShard('db-test');
+			expect(counts).toHaveLength(6); // 2 primary keys + 3 additional keys each
+
+			await nonHashMapper.setShardMapping('user-3', 'db-test-non-hash');
+			await nonHashMapper.addLookupKeys('user-3', ['username:alice']);
+
+			const nonHashCounts = await nonHashMapper.getKeysForShard('db-test-non-hash');
+			expect(nonHashCounts).toHaveLength(2); // 1 primary key + 1 additional key
+			expect(nonHashCounts).toContain('user-3');
+			expect(nonHashCounts).toContain('username:alice');
+		});
+
+		it('should retrieve all mapping counts on all shards', async () => {
+			await mapper.setShardMapping('user-1', 'db-test');
+			await mapper.addLookupKeys('user-1', ['username:johndoe', 'email:john@example.com']);
+
+			await mapper.setShardMapping('user-2', 'db-test');
+			await mapper.addLookupKeys('user-2', ['username:janesmith', 'email:janesmith@example.com']);
+
+			await mapper.setShardMapping('user-3', 'db-test-2');
+			await mapper.addLookupKeys('user-3', ['username:alice', 'email:alice@example.com']);
+
+			const counts = await mapper.getShardKeyCounts();
+			expect(counts['db-test']).toBe(12); // 3 primary keys + 2 additional keys, plus reversed mappings
+			expect(counts['db-test-2']).toBe(6); // 1 primary key + 2 additional keys, plus reversed mappings
+		});
+
+		it('should throw on non-existing shard in updateShardMapping', async () => {
+			await expect(mapper.updateShardMapping('non-existing', 'db-test')).rejects.toThrow(CollegeDBError);
+			await expect(mapper.updateShardMapping('non-existing', 'db-test')).rejects.toThrow(
+				'No existing mapping found for primary key: non-existing'
+			);
+		});
+	});
+
+	describe('Database Size Limits', () => {
+		beforeEach(async () => {
+			// Create schema for testing
+			const { createSchema } = await import('../src/migrations.js');
+			await createSchema(mockDB1 as any, TEST_SCHEMA);
+			await createSchema(mockDB2 as any, TEST_SCHEMA);
+		});
+
+		it('should exclude shards that exceed maxDatabaseSize from allocation', async () => {
+			// Mock the database size function to return large sizes for db-east
+			const originalGetSize = (await import('../src/router.js')).getDatabaseSizeForShard;
+
+			// Initialize with a small size limit
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: 'hash',
+				maxDatabaseSize: 1000 // Very small limit (1KB)
+			});
+
+			// Add some data to make db-east appear "large"
+			for (let i = 0; i < 100; i++) {
+				await runShard('db-east', 'INSERT INTO users (id, name) VALUES (?, ?)', [`user-${i}`, `User ${i}`]);
+			}
+
+			// Try to allocate a new user - should avoid db-east due to size
+			await run('new-user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['new-user-1', 'New User 1']);
+
+			// The user should exist (allocation succeeded)
+			const result = await first('new-user-1', 'SELECT * FROM users WHERE id = ?', ['new-user-1']);
+			expect(result).toBeTruthy();
+			expect((result as any).name).toBe('New User 1');
+		});
+
+		it('should still work when all shards exceed maxDatabaseSize', async () => {
+			// Initialize with a very small size limit that all shards will exceed
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: 'hash',
+				maxDatabaseSize: 1 // Impossibly small limit (1 byte)
+			});
+
+			// Should still be able to allocate (fallback behavior)
+			await run('fallback-user', 'INSERT INTO users (id, name) VALUES (?, ?)', ['fallback-user', 'Fallback User']);
+
+			const result = await first('fallback-user', 'SELECT * FROM users WHERE id = ?', ['fallback-user']);
+			expect(result).toBeTruthy();
+			expect((result as any).name).toBe('Fallback User');
+		});
+
+		it('should work normally when maxDatabaseSize is not configured', async () => {
+			// Initialize without maxDatabaseSize
+			initialize({
+				kv: mockKV as any,
+				shards: {
+					'db-east': mockDB1 as any,
+					'db-west': mockDB2 as any
+				},
+				strategy: 'hash'
+				// No maxDatabaseSize configured
+			});
+
+			// Should work normally
+			await run('unlimited-user', 'INSERT INTO users (id, name) VALUES (?, ?)', ['unlimited-user', 'Unlimited User']);
+
+			const result = await first('unlimited-user', 'SELECT * FROM users WHERE id = ?', ['unlimited-user']);
+			expect(result).toBeTruthy();
+			expect((result as any).name).toBe('Unlimited User');
+		});
+	});
 });

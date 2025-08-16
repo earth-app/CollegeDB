@@ -133,11 +133,10 @@ export class KVShardMapper {
 
 	/**
 	 * Hashes a key using SHA-256 if hashing is enabled
-	 * @private
 	 * @param key - The key to hash
 	 * @returns The hashed key or original key if hashing is disabled
 	 */
-	private async hashKey(key: string): Promise<string> {
+	async hashKey(key: string): Promise<string> {
 		if (!this.hashKeys) {
 			return key;
 		}
@@ -195,7 +194,6 @@ export class KVShardMapper {
 		// Try multi-key mapping lookup
 		const multiKeyMapping = await this.kv.get<MultiKeyShardMapping>(`${MULTI_KEY_MAPPING_PREFIX}${hashedKey}`, 'json');
 		if (multiKeyMapping) {
-			// Convert multi-key mapping to single mapping format for compatibility
 			return {
 				shard: multiKeyMapping.shard,
 				createdAt: multiKeyMapping.createdAt,
@@ -246,11 +244,14 @@ export class KVShardMapper {
 			const primaryHashedKey = await this.hashKey(primaryKey);
 			const primaryMappingKey = `${MULTI_KEY_MAPPING_PREFIX}${primaryHashedKey}`;
 
+			// Store hashed keys when hashing is enabled to avoid leaking originals while enabling updates
+			const storedKeys = this.hashKeys ? await Promise.all(allKeys.map((k) => this.hashKey(k))) : allKeys;
+
 			const multiKeyMapping: MultiKeyShardMapping = {
 				shard,
 				createdAt: timestamp,
 				updatedAt: timestamp,
-				keys: this.hashKeys ? [] : allKeys // Only store original keys if hashing is disabled
+				keys: storedKeys
 			};
 
 			// Store the primary multi-key mapping
@@ -310,21 +311,24 @@ export class KVShardMapper {
 
 		if (multiKeyMapping) {
 			// Update multi-key mapping
+			const timestamp = Date.now();
 			const updatedMultiKeyMapping: MultiKeyShardMapping = {
 				...multiKeyMapping,
 				shard: newShard,
-				updatedAt: Date.now()
+				updatedAt: timestamp
 			};
 			await this.kv.put(multiKeyMappingKey, JSON.stringify(updatedMultiKeyMapping));
 
-			// Update all lookup entries
-			const lookupPromises = multiKeyMapping.keys.map(async (lookupKey) => {
-				const hashedLookupKey = await this.hashKey(lookupKey);
-				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${hashedLookupKey}`;
+			// Update all lookup entries. Keys are stored hashed when hashing is enabled.
+			const keysToUpdate =
+				multiKeyMapping.keys.length > 0 ? (this.hashKeys ? multiKeyMapping.keys : multiKeyMapping.keys) : [await this.hashKey(primaryKey)]; // Fallback for legacy empty key lists
+
+			const lookupPromises = keysToUpdate.map(async (keyId) => {
+				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${keyId}`;
 				const lookupMapping: ShardMapping = {
 					...existing,
 					shard: newShard,
-					updatedAt: Date.now()
+					updatedAt: timestamp
 				};
 				return this.kv.put(lookupMappingKey, JSON.stringify(lookupMapping));
 			});
@@ -371,10 +375,12 @@ export class KVShardMapper {
 			// Delete multi-key mapping
 			await this.kv.delete(multiKeyMappingKey);
 
-			// Delete all lookup entries
-			const deletePromises = multiKeyMapping.keys.map(async (lookupKey) => {
-				const hashedLookupKey = await this.hashKey(lookupKey);
-				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${hashedLookupKey}`;
+			// Delete all lookup entries. Keys are stored hashed when hashing is enabled.
+			const keysToDelete =
+				multiKeyMapping.keys.length > 0 ? (this.hashKeys ? multiKeyMapping.keys : multiKeyMapping.keys) : [await this.hashKey(primaryKey)]; // Fallback for legacy empty key lists
+
+			const deletePromises = keysToDelete.map(async (keyId) => {
+				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${keyId}`;
 				return this.kv.delete(lookupMappingKey);
 			});
 
@@ -603,18 +609,20 @@ export class KVShardMapper {
 
 		if (!multiKeyMapping) {
 			// Convert single-key to multi-key mapping
+			const storedAllKeys = this.hashKeys ? await Promise.all(allKeys.map((k) => this.hashKey(k))) : allKeys;
 			multiKeyMapping = {
 				shard: existing.shard,
 				createdAt: existing.createdAt,
 				updatedAt: timestamp,
-				keys: this.hashKeys ? [] : allKeys
+				keys: storedAllKeys
 			};
 		} else {
 			// Add to existing multi-key mapping
+			const storedAllKeys = this.hashKeys ? await Promise.all(allKeys.map((k) => this.hashKey(k))) : allKeys;
 			multiKeyMapping = {
 				...multiKeyMapping,
 				updatedAt: timestamp,
-				keys: this.hashKeys ? [] : [...new Set([...multiKeyMapping.keys, ...allKeys])]
+				keys: [...new Set([...multiKeyMapping.keys, ...storedAllKeys])]
 			};
 		}
 

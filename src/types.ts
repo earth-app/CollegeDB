@@ -104,7 +104,7 @@ export interface CollegeDBConfig {
 	/** Target region for location-based sharding */
 	targetRegion?: D1Region;
 	/** Geographic locations of each shard (required for location strategy) */
-	shardLocations?: Record<string, ShardLocation>;
+	shardLocations?: Record<string, ShardLocation | D1Region>;
 	/**
 	 * Disable automatic migration detection and background migration (useful for testing)
 	 * @since 1.0.2
@@ -124,6 +124,13 @@ export interface CollegeDBConfig {
 	 * @since 1.0.6
 	 */
 	debug?: boolean;
+	/**
+	 * Maximum database size in bytes. Shards that exceed this size will be excluded
+	 * from new allocations (existing mappings remain intact).
+	 * @default 10683731148 // 9.95 GB, close to D1's 10 GB limit
+	 * @since 1.0.8
+	 */
+	maxDatabaseSize?: number;
 }
 
 /**

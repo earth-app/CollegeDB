@@ -27,7 +27,7 @@
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors.js';
-import type { MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types.js';
+import type { D1Region, MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types.js';
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
@@ -328,13 +328,13 @@ export class ShardCoordinator {
 	 * @example Response body: `{"shard": "db-west"}`
 	 */
 	private async handleAllocateShard(request: Request): Promise<Response> {
-		const { primaryKey, strategy, operationType } = (await request.json()) as {
+		const { primaryKey, strategy, operationType, availableShards } = (await request.json()) as {
 			primaryKey: string;
 			strategy?: ShardingStrategy;
 			operationType?: OperationType;
+			availableShards?: string[];
 		};
 
-		// Validate required parameters
 		if (!primaryKey || typeof primaryKey !== 'string') {
 			return new Response(JSON.stringify({ error: 'Missing or invalid primaryKey parameter' }), {
 				status: 400,
@@ -343,21 +343,20 @@ export class ShardCoordinator {
 		}
 
 		const state = await this.getState();
+		const eligibleShards = availableShards || state.knownShards;
 
-		if (state.knownShards.length === 0) {
+		if (eligibleShards.length === 0) {
 			return new Response(JSON.stringify({ error: 'No shards available' }), {
 				status: 400,
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}
 
-		// Resolve the effective strategy based on state strategy and operation type
 		const effectiveStrategy = this.resolveStrategy(state.strategy, strategy, operationType || 'write');
-		const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy);
+		const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy, eligibleShards);
 
-		// Update round-robin index for next allocation
 		if (effectiveStrategy === 'round-robin') {
-			state.roundRobinIndex = (state.roundRobinIndex + 1) % state.knownShards.length;
+			state.roundRobinIndex = (state.roundRobinIndex + 1) % eligibleShards.length;
 			await this.saveState(state);
 		}
 
@@ -425,6 +424,7 @@ export class ShardCoordinator {
 	 * @param primaryKey - The primary key to allocate a shard for
 	 * @param state - Current coordinator state containing available shards
 	 * @param strategy - The allocation strategy to use
+	 * @param eligibleShards - Optional filtered list of shards to choose from
 	 * @returns The selected shard binding name
 	 * @throws {CollegeDBError} If no shards are available
 	 * @example
@@ -433,8 +433,8 @@ export class ShardCoordinator {
 	 * // Returns: "db-west" (consistent for this key)
 	 * ```
 	 */
-	private selectShard(primaryKey: string, state: ShardCoordinatorState, strategy: ShardingStrategy): string {
-		const shards = state.knownShards;
+	private selectShard(primaryKey: string, state: ShardCoordinatorState, strategy: ShardingStrategy, eligibleShards?: string[]): string {
+		const shards = eligibleShards || state.knownShards;
 
 		if (shards.length === 0) {
 			throw new CollegeDBError('No shards available', 'NO_SHARDS');
@@ -443,12 +443,9 @@ export class ShardCoordinator {
 		switch (strategy) {
 			case 'round-robin':
 				return shards[state.roundRobinIndex] ?? shards[0]!;
-
 			case 'random':
 				return shards[Math.floor(Math.random() * shards.length)]!;
-
-			case 'hash':
-				// Simple hash function for consistent shard selection
+			case 'hash': {
 				let hash = 0;
 				for (let i = 0; i < primaryKey.length; i++) {
 					const char = primaryKey.charCodeAt(i);
@@ -457,18 +454,75 @@ export class ShardCoordinator {
 				}
 				const index = Math.abs(hash) % shards.length;
 				return shards[index]!;
-
-			case 'location':
-				// For location strategy in coordinator, fallback to hash
-				// The actual location logic is handled in router.ts
-				let locationHash = 0;
-				for (let i = 0; i < primaryKey.length; i++) {
-					const char = primaryKey.charCodeAt(i);
-					locationHash = (locationHash << 5) - locationHash + char;
-					locationHash = locationHash & locationHash;
+			}
+			case 'location': {
+				// If location config missing, fallback to hash
+				const region = state.targetRegion;
+				const locations = state.shardLocations || {};
+				const located = shards.filter((s) => locations[s]);
+				if (!region || located.length === 0) {
+					let h = 0;
+					for (let i = 0; i < primaryKey.length; i++) {
+						const c = primaryKey.charCodeAt(i);
+						h = (h << 5) - h + c;
+						h = h & h;
+					}
+					const idx = Math.abs(h) % shards.length;
+					return shards[idx]!;
 				}
-				const locationIndex = Math.abs(locationHash) % shards.length;
-				return shards[locationIndex]!;
+
+				// Simple location scoring similar to router.ts
+				const coords: Record<D1Region, { lat: number; lon: number }> = {
+					// Western North America - San Francisco, CA
+					wnam: { lat: 37.7749, lon: -122.4194 },
+					// Eastern North America - Newark, NJ
+					enam: { lat: 40.7357, lon: -74.1724 },
+					// Western Europe - London, UK
+					weur: { lat: 51.5074, lon: -0.1278 },
+					// Eastern Europe - Warsaw, Poland
+					eeur: { lat: 52.2297, lon: 21.0122 },
+					// Asia Pacific - Tokyo, Japan
+					apac: { lat: 35.6762, lon: 139.6503 },
+					// Oceania - Sydney, Australia
+					oc: { lat: -33.8688, lon: 151.2093 },
+					// Middle East - Dubai, UAE
+					me: { lat: 25.2048, lon: 55.2708 },
+					// Africa - Johannesburg, South Africa
+					af: { lat: -26.2041, lon: 28.0473 }
+				};
+
+				const hasCoordKey = (obj: typeof coords, key: D1Region) => key in obj;
+				const getKey = (k: D1Region): keyof typeof coords => (hasCoordKey(coords, k) ? (k as keyof typeof coords) : 'wnam');
+				const dist = (from: D1Region, to: D1Region) => {
+					const a = coords[getKey(from)];
+					const b = coords[getKey(to)];
+					const lat = a.lat - b.lat;
+					const lon = a.lon - b.lon;
+					return Math.sqrt(lat * lat + lon * lon);
+				};
+
+				const scores = located.map((shard) => {
+					const meta = locations[shard]!;
+					const distance = dist(region, meta.region);
+					const priority = meta.priority || 1;
+					return { shard, score: distance - priority * 0.1 };
+				});
+
+				scores.sort((a, b) => a.score - b.score);
+				const bestScore = scores[0]!.score;
+				const best = scores.filter((s) => Math.abs(s.score - bestScore) < 0.01);
+				if (best.length === 1) return best[0]!.shard;
+
+				// Tie-breaker by consistent hash
+				let h2 = 0;
+				for (let i = 0; i < primaryKey.length; i++) {
+					const c = primaryKey.charCodeAt(i);
+					h2 = (h2 << 5) - h2 + c;
+					h2 = h2 & h2;
+				}
+				const idx2 = Math.abs(h2) % best.length;
+				return best[idx2]!.shard;
+			}
 
 			default:
 				return shards[0]!;

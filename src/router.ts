@@ -96,6 +96,12 @@ let globalConfig: CollegeDBConfig | null = null;
 export function initialize(config: CollegeDBConfig) {
 	globalConfig = config;
 
+	// Background: sync KV known shards with configured shards
+	try {
+		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		Promise.all(Object.keys(config.shards).map((s) => mapper.addKnownShard(s))).catch(() => void 0);
+	} catch {}
+
 	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration) {
 		performAutoMigration(config).catch((error) => {
 			console.warn('Background auto-migration failed:', error);
@@ -145,6 +151,12 @@ export function initialize(config: CollegeDBConfig) {
  */
 export async function initializeAsync(config: CollegeDBConfig) {
 	globalConfig = config;
+
+	// Sync KV known shards with configured shards (awaited in async init)
+	try {
+		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		await Promise.all(Object.keys(config.shards).map((s) => mapper.addKnownShard(s)));
+	} catch {}
 
 	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration)
 		try {
@@ -309,7 +321,9 @@ function resolveStrategy(config: CollegeDBConfig, type: OperationType): Sharding
 		return strategy;
 	}
 
-	return strategy[type];
+	// Fallbacks for partially specified mixed strategies
+	const mixed = strategy as Partial<Record<OperationType, ShardingStrategy>>;
+	return (mixed[type] || mixed.write || mixed.read || 'hash') as ShardingStrategy;
 }
 
 /**
@@ -505,6 +519,97 @@ export function getClosestRegionFromIP(request: Request): D1Region {
 	return 'wnam';
 }
 
+function parseRegion(location: ShardLocation | D1Region): D1Region {
+	if (typeof location === 'string') {
+		return location;
+	}
+
+	return location.region || 'wnam';
+}
+
+/**
+ * Gets the approximate size of a D1 database in bytes using an efficient SQL query.
+ * Uses SQLite's page_count and page_size pragmas for accurate size calculation.
+ *
+ * @private
+ * @param database - The D1 database instance to measure
+ * @returns Promise resolving to the database size in bytes
+ * @throws {CollegeDBError} If the size query fails
+ */
+async function getDatabaseSize(database: D1Database): Promise<number> {
+	try {
+		// Get page count and page size efficiently
+		const [pageCountResult, pageSizeResult] = await Promise.all([
+			database.prepare('PRAGMA page_count').first<{ page_count: number }>(),
+			database.prepare('PRAGMA page_size').first<{ page_size: number }>()
+		]);
+
+		if (!pageCountResult?.page_count || !pageSizeResult?.page_size) {
+			throw new CollegeDBError('Failed to retrieve database size information', 'SIZE_QUERY_FAILED');
+		}
+
+		return pageCountResult.page_count * pageSizeResult.page_size;
+	} catch (error) {
+		throw new CollegeDBError(
+			`Failed to get database size: ${error instanceof Error ? error.message : 'Unknown error'}`,
+			'SIZE_QUERY_FAILED'
+		);
+	}
+}
+
+/**
+ * Filters available shards to exclude those that exceed the configured maximum size.
+ * This is used during shard allocation to prevent new data from being assigned to
+ * shards that are approaching or exceeding their size limits.
+ *
+ * @private
+ * @param availableShards - List of shard names to filter
+ * @param config - CollegeDB configuration containing maxDatabaseSize setting
+ * @returns Promise resolving to filtered list of shard names
+ */
+async function filterShardsBySize(availableShards: string[], config: CollegeDBConfig): Promise<string[]> {
+	const limit = config.maxDatabaseSize || 10683731148; // 9.95 GB (default limit, close to CF D1 max size)
+
+	const sizeChecks = await Promise.allSettled(
+		availableShards.map(async (shardName) => {
+			const database = config.shards[shardName];
+			if (!database) {
+				throw new CollegeDBError(`Shard ${shardName} not found in configuration`, 'SHARD_NOT_FOUND');
+			}
+
+			const size = await getDatabaseSize(database);
+			return {
+				shard: shardName,
+				size,
+				withinLimit: size < limit
+			};
+		})
+	);
+
+	const validShards = sizeChecks
+		.filter(
+			(result): result is PromiseFulfilledResult<{ shard: string; size: number; withinLimit: boolean }> =>
+				result.status === 'fulfilled' && result.value.withinLimit
+		)
+		.map((result) => result.value.shard);
+
+	// If all shards exceed the size limit, log warning and return all shards
+	// to prevent complete failure (existing mappings should still work)
+	if (validShards.length === 0) {
+		if (config.debug) {
+			console.warn('All shards exceed maxDatabaseSize limit. Allowing allocation to prevent failure.');
+		}
+		return availableShards;
+	}
+
+	if (config.debug && validShards.length < availableShards.length) {
+		const excludedShards = availableShards.filter((shard) => !validShards.includes(shard));
+		console.log(`Excluded ${excludedShards.length} shards due to size limits: ${excludedShards.join(', ')}`);
+	}
+
+	return validShards;
+}
+
 /**
  * Selects the optimal shard for location-based allocation strategy.
  * Prioritizes shards in the target region, then nearby regions by distance.
@@ -519,7 +624,7 @@ export function getClosestRegionFromIP(request: Request): D1Region {
 function selectShardByLocation(
 	targetRegion: D1Region,
 	availableShards: string[],
-	shardLocations: Record<string, ShardLocation>,
+	shardLocations: Record<string, ShardLocation | D1Region>,
 	primaryKey: string
 ): string {
 	// Filter shards that have location information
@@ -540,10 +645,9 @@ function selectShardByLocation(
 	// Calculate distances and priorities
 	const shardScores = locatedShards.map((shard) => {
 		const location = shardLocations[shard]!;
-		const distance = calculateRegionDistance(targetRegion, location.region);
-		const priority = location.priority || 1;
+		const distance = calculateRegionDistance(targetRegion, parseRegion(location));
 
-		// Lower score is better (distance penalty, priority bonus)
+		const priority = typeof location === 'object' ? location.priority || 1 : 1;
 		const score = distance - priority * 0.1;
 
 		return { shard, score, distance, priority };
@@ -552,7 +656,6 @@ function selectShardByLocation(
 	// Sort by score (lower is better)
 	shardScores.sort((a, b) => a.score - b.score);
 
-	// For ties in the best score range, use consistent hashing
 	const bestScore = shardScores[0]!.score;
 	const bestShards = shardScores.filter((s) => Math.abs(s.score - bestScore) < 0.01);
 
@@ -569,6 +672,43 @@ function selectShardByLocation(
 	}
 	const index = Math.abs(hash) % bestShards.length;
 	return bestShards[index]!.shard;
+}
+
+/**
+ * Helper to select a shard locally based on the effective strategy when the coordinator
+ * is unavailable or not configured. Provides sensible fallbacks to avoid hotspotting.
+ * @private
+ */
+function selectShardByStrategy(
+	effectiveStrategy: ShardingStrategy,
+	primaryKey: string,
+	availableShards: string[],
+	config: CollegeDBConfig
+): string {
+	switch (effectiveStrategy) {
+		case 'hash': {
+			let hash = 0;
+			for (let i = 0; i < primaryKey.length; i++) {
+				const char = primaryKey.charCodeAt(i);
+				hash = (hash << 5) - hash + char;
+				hash = hash & hash;
+			}
+			const index = Math.abs(hash) % availableShards.length;
+			return availableShards[index] || availableShards[0]!;
+		}
+		case 'location': {
+			if (!config.targetRegion) {
+				return selectShardByStrategy('hash', primaryKey, availableShards, config);
+			}
+			return selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
+		}
+		case 'random': {
+			return availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
+		}
+		default: {
+			return selectShardByStrategy('hash', primaryKey, availableShards, config);
+		}
+	}
 }
 
 /**
@@ -612,16 +752,16 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 	}
 
 	// Before allocating a new shard, check if any existing shards contain this key
-	// and perform automatic migration if needed
 	const availableShards = Object.keys(config.shards);
 	if (availableShards.length === 0) {
 		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
 	}
 
+	// Filter shards by size limit if configured
+	const eligibleShards = await filterShardsBySize(availableShards, config);
+
 	// If no existing mapping found after auto-migration, allocate a new shard
 	let selectedShard: string;
-
-	// Resolve the effective strategy for this operation type
 	const effectiveStrategy = resolveStrategy(config, operationType);
 
 	// Use coordinator if available for allocation
@@ -638,7 +778,8 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 					strategy: effectiveStrategy, // Use resolved strategy instead of config.strategy
 					operationType, // Pass operation type for coordinator awareness
 					targetRegion: config.targetRegion,
-					shardLocations: config.shardLocations
+					shardLocations: config.shardLocations,
+					availableShards: eligibleShards // Pass filtered shards to coordinator
 				})
 			});
 
@@ -646,49 +787,14 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 				const result = (await response.json()) as { shard: string };
 				selectedShard = result.shard;
 			} else {
-				// Fallback to simple round-robin
-				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
+				selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
 			}
 		} catch (error) {
 			console.warn('Coordinator allocation failed, falling back to local strategy:', error);
-			selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)]!;
+			selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
 		}
 	} else {
-		// Simple allocation strategy without coordinator
-		switch (effectiveStrategy) {
-			case 'hash':
-				let hash = 0;
-				for (let i = 0; i < primaryKey.length; i++) {
-					const char = primaryKey.charCodeAt(i);
-					hash = (hash << 5) - hash + char;
-					hash = hash & hash;
-				}
-				const index = Math.abs(hash) % availableShards.length;
-				selectedShard = availableShards[index] || availableShards[0]!;
-				break;
-			case 'location':
-				if (!config.targetRegion) {
-					console.warn('Location strategy requires targetRegion in config, falling back to hash');
-					// Fallback to hash
-					let fallbackHash = 0;
-					for (let i = 0; i < primaryKey.length; i++) {
-						const char = primaryKey.charCodeAt(i);
-						fallbackHash = (fallbackHash << 5) - fallbackHash + char;
-						fallbackHash = fallbackHash & fallbackHash;
-					}
-					const fallbackIndex = Math.abs(fallbackHash) % availableShards.length;
-					selectedShard = availableShards[fallbackIndex] || availableShards[0]!;
-				} else {
-					selectedShard = selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
-				}
-				break;
-			case 'random':
-				selectedShard = availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
-				break;
-			default: // round-robin
-				selectedShard = availableShards[0]!; // Simplified without state
-				break;
-		}
+		selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
 	}
 
 	// Store the mapping
@@ -1018,8 +1124,16 @@ export async function listKnownShards(): Promise<string[]> {
 		}
 	}
 
-	// Fallback to configured shards
-	return Object.keys(config.shards);
+	// Fallback: merge configured shards with KV-known shards
+	try {
+		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		const kvShards = await mapper.getKnownShards();
+		const merged = new Set<string>([...Object.keys(config.shards), ...kvShards]);
+		return Array.from(merged);
+	} catch {
+		// If KV lookup fails, just return configured shards
+		return Object.keys(config.shards);
+	}
 }
 
 /**
@@ -1075,7 +1189,14 @@ export async function getShardStats(): Promise<ShardStats[]> {
 	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
 	const counts = await mapper.getShardKeyCounts();
 
-	return Object.entries(config.shards).map(([binding, _]) => ({
+	// Merge shards from config and KV known shards
+	let shardNames = Object.keys(config.shards);
+	try {
+		const kvKnown = await mapper.getKnownShards();
+		shardNames = Array.from(new Set([...shardNames, ...kvKnown]));
+	} catch {}
+
+	return shardNames.map((binding) => ({
 		binding,
 		count: counts[binding] || 0
 	}));
@@ -1233,30 +1354,33 @@ export async function runAllShards<T = Record<string, unknown>>(
 	batchSize: number = 50
 ): Promise<D1Result<T>[]> {
 	const config = getConfig();
-	const results: Promise<D1Result<T>>[] = [];
+	const tasks: Array<() => Promise<D1Result<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
-		try {
-			const result = db
+		if (!binding || !db) {
+			console.error(`Shard ${binding ?? '<null>'} not found, skipping`);
+			continue;
+		}
+
+		tasks.push(() =>
+			db
 				.prepare(sql)
 				.bind(...bindings)
-				.all<T>()
+				.run<T>()
 				.catch((error) => {
 					console.error(`Error executing query on shard ${binding}:`, error);
 					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
-				});
-			results.push(result);
-		} catch (error) {
-			console.error(`Error running on shard ${binding}:`, error);
-		}
+				})
+		);
 	}
 
-	const batch: D1Result<T>[] = [];
-	for (let i = 0; i < results.length; i += batchSize) {
-		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	const out: D1Result<T>[] = [];
+	for (let i = 0; i < tasks.length; i += batchSize) {
+		const batch = tasks.slice(i, i + batchSize).map((fn) => fn());
+		out.push(...(await Promise.all(batch)));
 	}
 
-	return batch;
+	return out;
 }
 
 /**
@@ -1277,30 +1401,33 @@ export async function allAllShards<T = Record<string, unknown>>(
 	batchSize: number = 50
 ): Promise<D1Result<T>[]> {
 	const config = getConfig();
-	const results: Promise<D1Result<T>>[] = [];
+	const tasks: Array<() => Promise<D1Result<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
-		try {
-			const result = db
+		if (!binding || !db) {
+			console.error(`Shard ${binding ?? '<null>'} not found, skipping`);
+			continue;
+		}
+
+		tasks.push(() =>
+			db
 				.prepare(sql)
 				.bind(...bindings)
 				.all<T>()
 				.catch((error) => {
 					console.error(`Error executing query on shard ${binding}:`, error);
 					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
-				});
-			results.push(result);
-		} catch (error) {
-			console.error(`Error running on shard ${binding}:`, error);
-		}
+				})
+		);
 	}
 
-	const batch: D1Result<T>[] = [];
-	for (let i = 0; i < results.length; i += batchSize) {
-		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	const out: D1Result<T>[] = [];
+	for (let i = 0; i < tasks.length; i += batchSize) {
+		const batch = tasks.slice(i, i + batchSize).map((fn) => fn());
+		out.push(...(await Promise.all(batch)));
 	}
 
-	return batch;
+	return out;
 }
 
 /**
@@ -1321,31 +1448,33 @@ export async function firstAllShards<T = Record<string, unknown>>(
 	batchSize: number = 50
 ): Promise<(T | null)[]> {
 	const config = getConfig();
-	const results: Promise<T | null>[] = [];
+	const tasks: Array<() => Promise<T | null>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
-		try {
-			const result = db
+		if (!binding || !db) {
+			console.error(`Shard ${binding ?? '<null>'} not found, skipping`);
+			continue;
+		}
+
+		tasks.push(() =>
+			db
 				.prepare(sql)
 				.bind(...bindings)
 				.first<T>()
 				.catch((error) => {
 					console.error(`Error executing query on shard ${binding}:`, error);
 					return null;
-				});
-			3;
-			results.push(result);
-		} catch (error) {
-			console.error(`Error running on shard ${binding}:`, error);
-		}
+				})
+		);
 	}
 
-	const batch: (T | null)[] = [];
-	for (let i = 0; i < results.length; i += batchSize) {
-		batch.push(...(await Promise.all(results.slice(i, i + batchSize))));
+	const out: (T | null)[] = [];
+	for (let i = 0; i < tasks.length; i += batchSize) {
+		const batch = tasks.slice(i, i + batchSize).map((fn) => fn());
+		out.push(...(await Promise.all(batch)));
 	}
 
-	return batch;
+	return out;
 }
 
 /**
@@ -1395,4 +1524,29 @@ export async function flush(): Promise<void> {
 			console.warn('Failed to flush coordinator:', error);
 		}
 	}
+}
+
+/**
+ * Gets the size of a specific D1 database in bytes.
+ * Uses efficient SQLite pragma queries to determine database size.
+ *
+ * @param shardBinding - The shard binding name to check the size of
+ * @returns Promise resolving to the database size in bytes
+ * @throws {CollegeDBError} If shard not found or size query fails
+ * @example
+ * ```typescript
+ * // Get size of a specific shard
+ * const sizeInBytes = await getDatabaseSizeForShard('db-east');
+ * console.log(`Database size: ${Math.round(sizeInBytes / 1024 / 1024)} MB`);
+ * ```
+ */
+export async function getDatabaseSizeForShard(shardBinding: string): Promise<number> {
+	const config = getConfig();
+	const database = config.shards[shardBinding];
+
+	if (!database) {
+		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
+	}
+
+	return await getDatabaseSize(database);
 }

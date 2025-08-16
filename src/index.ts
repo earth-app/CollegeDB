@@ -21,6 +21,7 @@ export {
 	firstShard,
 	flush,
 	getClosestRegionFromIP,
+	getDatabaseSizeForShard,
 	getShardStats,
 	initialize,
 	initializeAsync,
