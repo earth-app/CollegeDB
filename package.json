@@ -4,7 +4,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
-  "version": "1.0.8",
+  "version": "1.1.0",
   "files": [
     "dist/**/*",
     "README.md",
@@ -24,25 +24,25 @@
     "prepare": "husky install"
   },
   "dependencies": {
-    "@cloudflare/workers-types": "^4.20250726.0"
+    "@cloudflare/workers-types": "^4.20260415.1"
   },
   "devDependencies": {
-    "@babel/cli": "^7.28.0",
-    "@babel/core": "^7.28.0",
-    "@babel/preset-env": "^7.28.0",
-    "@babel/preset-typescript": "^7.27.1",
+    "@babel/cli": "^7.28.6",
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.2",
+    "@babel/preset-typescript": "^7.28.5",
     "@types/bun": "latest",
-    "@vitest/coverage-v8": "^4.0.0",
+    "@vitest/coverage-v8": "^4.1.4",
     "husky": "^9.1.7",
     "jsdoc-babel": "^0.5.0",
-    "lint-staged": "^16.1.2",
-    "prettier": "^3.6.2",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.3",
     "prettier-plugin-organize-imports": "4.3.0",
-    "typedoc": "^0.28.8",
-    "vitest": "^4.0.0"
+    "typedoc": "^0.28.19",
+    "vitest": "^4.1.4"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5.8.3"
   },
   "lint-staged": {
     "*.{js,ts,css,md}": "prettier --write"
