@@ -16,7 +16,7 @@
  *
  * @example Deploy this as a Cloudflare Worker:
  * ```bash
- * # 1. Configure wrangler.toml with your D1 databases and KV namespace
+ * # 1. Configure wrangler.jsonc with your D1 databases and KV namespace
  * # 2. Deploy with: wrangler deploy
  * # 3. Test with: curl https://your-worker.your-subdomain.workers.dev/
  * ```

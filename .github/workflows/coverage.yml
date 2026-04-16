@@ -43,3 +43,53 @@ jobs:
           coverage/
           !coverage/node_modules/
         retention-days: 30
+
+  sandbox:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@v2
+    - name: Install dependencies
+      run: bun install --frozen-lockfile
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    - name: Verify Docker and Compose Availability
+      run: |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "Docker CLI is required for sandbox benchmarks" >&2
+          exit 1
+        fi
+
+        if ! docker compose version >/dev/null 2>&1; then
+          echo "Docker Compose v2 (docker compose) is required for sandbox benchmarks" >&2
+          exit 1
+        fi
+
+        docker --version
+        docker compose version
+        docker info >/dev/null
+    - name: Run Sandbox Benchmarks
+      run: bun run test:sandbox
+    - name: Add Sandbox Report to Job Summary
+      if: ${{ always() }}
+      run: |
+        if [[ -f sandbox/results/latest.md ]]; then
+          echo "## Sandbox Benchmark Report" >> "$GITHUB_STEP_SUMMARY"
+          cat sandbox/results/latest.md >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "Sandbox report not found at sandbox/results/latest.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+    - name: Upload Sandbox Report to GitHub
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v6
+      with:
+        name: sandbox-benchmark-report
+        path: |
+          sandbox/results/latest.md
+          sandbox/results/sandbox-latency-*.md
+        if-no-files-found: warn
+        retention-days: 30

@@ -21,6 +21,26 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:sandbox": "bun scripts/sandbox/run.ts --db=all --kv=all --include-cloudflare",
+    "test:sandbox:all": "bun scripts/sandbox/run.ts --db=all --kv=all",
+    "test:sandbox:cloudflare": "bun scripts/sandbox/run.ts --cloudflare-only",
+    "test:sandbox:postgres": "bun scripts/sandbox/run.ts --db=postgres --kv=all",
+    "test:sandbox:postgresql": "bun scripts/sandbox/run.ts --db=postgres --kv=all",
+    "test:sandbox:mysql": "bun scripts/sandbox/run.ts --db=mysql --kv=all",
+    "test:sandbox:mariadb": "bun scripts/sandbox/run.ts --db=mariadb --kv=all",
+    "test:sandbox:sqlite": "bun scripts/sandbox/run.ts --db=sqlite --kv=all",
+    "test:sandbox:redis": "bun scripts/sandbox/run.ts --db=all --kv=redis",
+    "test:sandbox:valkey": "bun scripts/sandbox/run.ts --db=all --kv=valkey",
+    "test:sandbox:postgres+redis": "bun scripts/sandbox/run.ts --db=postgres --kv=redis",
+    "test:sandbox:postgres+valkey": "bun scripts/sandbox/run.ts --db=postgres --kv=valkey",
+    "test:sandbox:postgresql+redis": "bun scripts/sandbox/run.ts --db=postgres --kv=redis",
+    "test:sandbox:postgresql+valkey": "bun scripts/sandbox/run.ts --db=postgres --kv=valkey",
+    "test:sandbox:mysql+redis": "bun scripts/sandbox/run.ts --db=mysql --kv=redis",
+    "test:sandbox:mysql+valkey": "bun scripts/sandbox/run.ts --db=mysql --kv=valkey",
+    "test:sandbox:mariadb+redis": "bun scripts/sandbox/run.ts --db=mariadb --kv=redis",
+    "test:sandbox:mariadb+valkey": "bun scripts/sandbox/run.ts --db=mariadb --kv=valkey",
+    "test:sandbox:sqlite+redis": "bun scripts/sandbox/run.ts --db=sqlite --kv=redis",
+    "test:sandbox:sqlite+valkey": "bun scripts/sandbox/run.ts --db=sqlite --kv=valkey",
     "prepare": "husky install"
   },
   "dependencies": {
@@ -31,20 +51,25 @@
     "@babel/core": "^7.29.0",
     "@babel/preset-env": "^7.29.2",
     "@babel/preset-typescript": "^7.28.5",
+    "@types/pg": "^8.15.6",
     "@types/bun": "latest",
     "@vitest/coverage-v8": "^4.1.4",
     "husky": "^9.1.7",
     "jsdoc-babel": "^0.5.0",
     "lint-staged": "^16.4.0",
+    "mysql2": "^3.15.3",
+    "pg": "^8.16.3",
     "prettier": "^3.8.3",
     "prettier-plugin-organize-imports": "4.3.0",
+    "redis": "^5.8.2",
     "typedoc": "^0.28.19",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.4",
+    "wrangler": "^4.64.0"
   },
   "peerDependencies": {
     "typescript": "^5.8.3"
   },
   "lint-staged": {
-    "*.{js,ts,css,md}": "prettier --write"
+    "*.{js,ts,css,md,json,yml,jsonc}": "prettier --write"
   }
 }

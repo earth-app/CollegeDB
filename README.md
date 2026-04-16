@@ -1,6 +1,6 @@
 # CollegeDB
 
-_Cloudflare D1 Horizontal Sharding Router_
+Cloudflare D1 Horizontal Sharding Router
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![GitHub Issues](https://img.shields.io/github/issues/earth-app/CollegeDB)](https://github.com/earth-app/CollegeDB/issues)
@@ -8,7 +8,7 @@ _Cloudflare D1 Horizontal Sharding Router_
 [![GitHub License](https://img.shields.io/github/license/earth-app/CollegeDB)](LICENSE)
 ![NPM Version](https://img.shields.io/npm/v/%40earth-app%2Fcollegedb)
 
-A TypeScript library for **true horizontal scaling** of SQLite-style databases on Cloudflare using D1 and KV. CollegeDB distributes your data across multiple D1 databases, with each table's records split by primary key across different database instances.
+A TypeScript library for **true horizontal scaling** of SQLite-style databases on Cloudflare using D1 and KV, with provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
 
 CollegeDB implements **data distribution** where a single logical table is physically stored across multiple D1 databases:
 
@@ -46,6 +46,7 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 - **Scale horizontally** by distributing table data across multiple D1 instances
 - **Route queries automatically** based on primary key mappings
 - **Maintain consistency** with KV-based shard mapping
+- **Run on multiple providers** through `KVStorage` and `SQLDatabase` contracts
 - **Optimize for geography** with location-aware shard allocation
 - **Monitor and rebalance** shard distribution
 - **Handle migrations** between shards seamlessly
@@ -53,6 +54,7 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 ## 📦 Features
 
 - **🔀 Automatic Query Routing**: Primary key → shard mapping using Cloudflare KV
+- **🧩 Provider Adapters (v1.1.0)**: Redis/Valkey KV + PostgreSQL/MySQL/SQLite SQL adapters while preserving Cloudflare compatibility
 - **🎯 Multiple Allocation Strategies**: Round-robin, random, hash-based, and location-aware distribution
 - **🔄 Mixed Strategy Support**: Different strategies for reads vs writes (e.g., location for writes, hash for reads)
 - **📊 Shard Coordination**: Durable Objects for allocation and statistics
@@ -62,6 +64,30 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 - **⚡ High Performance**: Optimized for Cloudflare Workers runtime
 - **🔧 TypeScript First**: Full type safety and excellent DX
 
+## Benchmark Suite
+
+CollegeDB includes an integration benchmark suite covering both local provider matrices and Cloudflare Worker routing paths.
+
+Top-level benchmark scenarios:
+
+- `basic_crud`: insert/read/update/delete round-trip routing
+- `advanced_usage`: join + multi-key lookup behavior
+- `migration_mapping`: batch mapping creation for existing keys
+- `bulk_crud`: high-volume insert/update/delete flow
+- `indexing`: indexed query latency under warm data
+- `metadata_fetch`: schema/metadata query latency
+- `pragma_or_info`: provider-specific pragma/info query latency
+- `counting`: shard-wide aggregate counting
+- `shard_fanout`: all-shards fanout query aggregation
+- `reassignment`: shard reassignment and routed-read validation
+
+Benchmark reports include:
+
+- an interpretation guide (`How To Read This Report`)
+- a benchmark catalog with per-run workload details
+- a compact overall matrix (passed/failed/skipped + overall average)
+- split scenario matrices for core workload latency and introspection/routing latency
+
 ## Installation
 
 ```bash
@@ -69,6 +95,129 @@ bun add @earth-app/collegedb
 # or
 npm install @earth-app/collegedb
 ```
+
+## Provider Adapters
+
+CollegeDB can run with either native Cloudflare bindings or custom providers as long as they match the exported `KVStorage` and `SQLDatabase` interfaces.
+
+Supported adapters:
+
+- `createRedisKVProvider`
+- `createValkeyKVProvider`
+- `createPostgresSQLProvider`
+- `createMySQLSQLProvider`
+- `createSQLiteSQLProvider`
+- `createHyperdrivePostgresProvider`
+- `createHyperdriveMySQLProvider`
+
+```typescript
+import { createClient as createRedisClient } from 'redis';
+import { Pool } from 'pg';
+import { createPostgresSQLProvider, createRedisKVProvider, initialize, run, type CollegeDBConfig } from '@earth-app/collegedb';
+
+const redisClient = createRedisClient({ url: process.env.REDIS_URL });
+const pgPool = new Pool({ connectionString: process.env.POSTGRES_URL });
+
+const config: CollegeDBConfig = {
+	kv: createRedisKVProvider(redisClient),
+	shards: {
+		'pg-east': createPostgresSQLProvider(pgPool)
+	},
+	strategy: 'hash',
+	disableAutoMigration: true
+};
+
+async function bootstrap() {
+	await redisClient.connect();
+	initialize(config);
+	await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Taylor']);
+}
+
+bootstrap().catch(console.error);
+```
+
+For Hyperdrive-backed SQL connections, use `createHyperdrivePostgresProvider` or `createHyperdriveMySQLProvider` with your database client factory.
+
+For a complete non-Cloudflare setup, see `examples/provider-sandbox.ts`.
+
+## Sandbox Benchmarks (Docker Compose)
+
+CollegeDB ships with an integration sandbox runner that benchmarks real latency across provider combinations.
+
+Requirements:
+
+- Docker + Docker Compose plugin
+- Bun
+- Wrangler (installed as a dev dependency and invoked by scripts)
+
+The Cloudflare benchmark path runs against the dedicated sandbox worker:
+
+- Worker entry: `sandbox/worker.ts`
+- Wrangler config: `sandbox/wrangler.jsonc`
+
+Main commands:
+
+```bash
+# Run full SQL x KV matrix plus Cloudflare local benchmark
+bun run test:sandbox
+
+# Run full SQL x KV matrix only
+bun run test:sandbox:all
+
+# Run Cloudflare local benchmark only (wrangler dev --local)
+bun run test:sandbox:cloudflare
+```
+
+Provider filters:
+
+```bash
+# One SQL provider against both KV providers
+bun run test:sandbox:mysql
+bun run test:sandbox:postgres
+bun run test:sandbox:mariadb
+bun run test:sandbox:sqlite
+
+# One KV provider against all SQL providers
+bun run test:sandbox:redis
+bun run test:sandbox:valkey
+
+# Explicit pairwise combinations
+bun run test:sandbox:postgres+redis
+bun run test:sandbox:postgres+valkey
+bun run test:sandbox:mysql+redis
+bun run test:sandbox:mysql+valkey
+bun run test:sandbox:mariadb+redis
+bun run test:sandbox:mariadb+valkey
+bun run test:sandbox:sqlite+redis
+bun run test:sandbox:sqlite+valkey
+```
+
+Output behavior:
+
+- Every run writes a timestamped Markdown report to `sandbox/results/`
+- `sandbox/results/latest.md` is always updated to the newest report
+- The runner prints the report in-terminal using Bun's Markdown renderer with ANSI formatting
+- `test:sandbox` produces a matrix for all SQL x KV combinations; filtered commands produce matrix subsets
+
+Benchmark coverage includes:
+
+- basic CRUD
+- advanced lookup/routing workflows
+- migration-style mapping creation
+- bulk CRUD
+- indexing queries
+- metadata fetch
+- pragma/info queries (provider-specific)
+- counting across shards
+- shard fanout aggregation
+- shard reassignment workflow
+
+How to read benchmark rows:
+
+- Latency cells are formatted as `average / p95` in milliseconds.
+- `FAILED` means the scenario returned an error.
+- `N/A` means the scenario was intentionally skipped in that environment.
+- Use the detailed section for full `avg`, `p50`, `p95`, `min`, `max`, and sample count (`n`).
 
 ## Basic Usage
 
@@ -88,7 +237,7 @@ collegedb(
 	},
 	async () => {
 		// Create schema on new shards only (existing shards auto-detected)
-		await createSchema(env['db-new-shard']);
+		await createSchema(env['db-new-shard'], 'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, email TEXT)');
 
 		// Insert data (automatically routed to appropriate shard)
 		await run('user-123', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-123', 'Johnson', 'alice@example.com']);
@@ -221,8 +370,6 @@ collegedb(
 ```
 
 ### Adding Lookup Keys to Existing Mappings
-
-s
 
 ```typescript
 const mapper = new KVShardMapper(env.KV);
@@ -535,7 +682,7 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | ------------------------------------------ | ---------------------------------------------------------------- | -------------------------- |
 | `collegedb(config, callback)`              | Initialize CollegeDB, then run a callback                        | `CollegeDBConfig, () => T` |
 | `initialize(config)`                       | Initialize CollegeDB with configuration                          | `CollegeDBConfig`          |
-| `createSchema(d1)`                         | Create database schema on a D1 instance                          | `D1Database`               |
+| `createSchema(db, schema)`                 | Create schema on a shard database                                | `SQLDatabase, string`      |
 | `prepare(key, sql)`                        | Prepare a SQL statement for execution                            | `string, string`           |
 | `run(key, sql, bindings)`                  | Execute a SQL query with primary key routing                     | `string, string, any[]`    |
 | `first(key, sql, bindings)`                | Execute a SQL query and return first result                      | `string, string, any[]`    |
@@ -552,17 +699,31 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | `getDatabaseSizeForShard(shard)`           | Get size of a specific shard in bytes                            | `string`                   |
 | `flush()`                                  | Clear all shard mappings (development only)                      | `void`                     |
 
+### Provider Adapter Functions
+
+| Function                                                   | Description                                                          | Parameters                                               |
+| ---------------------------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------- |
+| `createRedisKVProvider(client, options?)`                  | Adapt a Redis client to CollegeDB's `KVStorage` contract             | `RedisLikeClient, { scanCount?: number }`                |
+| `createValkeyKVProvider(client, options?)`                 | Adapt a Valkey client to CollegeDB's `KVStorage` contract            | `RedisLikeClient, { scanCount?: number }`                |
+| `createPostgresSQLProvider(client)`                        | Adapt a PostgreSQL client/pool to `SQLDatabase`                      | `PostgresClientLike`                                     |
+| `createMySQLSQLProvider(client)`                           | Adapt a MySQL/MariaDB client to `SQLDatabase`                        | `MySQLClientLike`                                        |
+| `createSQLiteSQLProvider(client)`                          | Adapt a SQLite client to `SQLDatabase`                               | `SQLiteClientLike`                                       |
+| `createHyperdrivePostgresProvider(binding, clientFactory)` | Create a PostgreSQL `SQLDatabase` adapter using a Hyperdrive binding | `HyperdriveBindingLike, HyperdrivePostgresClientFactory` |
+| `createHyperdriveMySQLProvider(binding, clientFactory)`    | Create a MySQL `SQLDatabase` adapter using a Hyperdrive binding      | `HyperdriveBindingLike, HyperdriveMySQLClientFactory`    |
+| `isKVStorage(value)`                                       | Runtime guard for `KVStorage`                                        | `unknown`                                                |
+| `isSQLDatabase(value)`                                     | Runtime guard for `SQLDatabase`                                      | `unknown`                                                |
+
 ### Drop-in Replacement Functions
 
 | Function                                  | Description                                    | Parameters                     |
 | ----------------------------------------- | ---------------------------------------------- | ------------------------------ |
-| `autoDetectAndMigrate(d1, shard, config)` | Automatically detect and migrate existing data | `D1Database, string, config`   |
-| `checkMigrationNeeded(d1, shard, config)` | Check if database needs migration              | `D1Database, string, config`   |
-| `validateTableForSharding(d1, table)`     | Check if table is suitable for sharding        | `D1Database, string`           |
-| `discoverExistingPrimaryKeys(d1, table)`  | Find all primary keys in existing table        | `D1Database, string`           |
-| `integrateExistingDatabase(d1, shard)`    | Complete drop-in integration of existing DB    | `D1Database, string, mapper`   |
+| `autoDetectAndMigrate(d1, shard, config)` | Automatically detect and migrate existing data | `SQLDatabase, string, config`  |
+| `checkMigrationNeeded(d1, shard, config)` | Check if database needs migration              | `SQLDatabase, string, config`  |
+| `validateTableForSharding(d1, table)`     | Check if table is suitable for sharding        | `SQLDatabase, string`          |
+| `discoverExistingPrimaryKeys(d1, table)`  | Find all primary keys in existing table        | `SQLDatabase, string`          |
+| `integrateExistingDatabase(d1, shard)`    | Complete drop-in integration of existing DB    | `SQLDatabase, string, mapper`  |
 | `createMappingsForExistingKeys(keys)`     | Create shard mappings for existing keys        | `string[], string[], strategy` |
-| `listTables(d1)`                          | Get list of tables in database                 | `D1Database`                   |
+| `listTables(d1)`                          | Get list of tables in database                 | `SQLDatabase`                  |
 | `clearMigrationCache()`                   | Clear automatic migration cache                | `void`                         |
 
 ### Error Handling
@@ -645,15 +806,19 @@ The main configuration interface supports both single strategies and mixed strat
 
 ```typescript
 interface CollegeDBConfig {
-	kv: KVNamespace;
+	kv: KVStorage;
 	coordinator?: DurableObjectNamespace;
-	shards: Record<string, D1Database>;
+	shards: Record<string, SQLDatabase>;
 	strategy?: ShardingStrategy | MixedShardingStrategy;
 	targetRegion?: D1Region;
 	shardLocations?: Record<string, ShardLocation>;
 	disableAutoMigration?: boolean; // Default: false
 	hashShardMappings?: boolean; // Default: true
 	maxDatabaseSize?: number; // Default: undefined (no limit)
+	mappingCacheTtlMs?: number; // Default: 30000
+	knownShardsCacheTtlMs?: number; // Default: 10000
+	sizeCacheTtlMs?: number; // Default: 30000
+	migrationConcurrency?: number; // Default: 25
 }
 ```
 
@@ -706,7 +871,7 @@ const mixedStrategyConfig: CollegeDBConfig = {
 
 ### Database Size Management
 
-CollegeDB supports automatic size-based shard exclusion to prevent individual shards from becoming too large. This feature helps maintain optimal performance and prevents hitting D1 storage limits.
+CollegeDB supports automatic size-based shard exclusion to prevent individual shards from becoming too large. This feature helps maintain optimal performance and prevents hitting database storage limits.
 
 #### Configuration
 
@@ -782,12 +947,12 @@ const config: CollegeDBConfig = {
 // "Excluded 2 shards due to size limits: db-east, db-central"
 ```
 
-#### Performance Impact
+#### Size-Limit Performance Impact
 
 - **Size Check Frequency**: Only performed during new allocations (not on reads)
 - **Query Efficiency**: Uses fast SQLite pragmas (microsecond execution time)
 - **Parallel Execution**: Size checks run concurrently across all shards
-- **Caching**: No caching implemented to ensure accurate real-time limits
+- **Caching**: Size checks are cached in-memory (controlled by `sizeCacheTtlMs`, default `30000`)
 
 ### Types
 
@@ -796,6 +961,10 @@ CollegeDB exports TypeScript types for better development experience and type sa
 | Type                    | Description                    | Example                                             |
 | ----------------------- | ------------------------------ | --------------------------------------------------- |
 | `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                          |
+| `KVStorage`             | Provider-agnostic KV contract  | `createRedisKVProvider(redisClient)`                |
+| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgresSQLProvider(pgPool)`                 |
+| `QueryResult`           | Standard query response shape  | `{ success, results, meta }`                        |
+| `QueryResultMeta`       | Query execution metadata       | `{ duration, changes?, last_row_id? }`              |
 | `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'` |
 | `MixedShardingStrategy` | Mixed strategy configuration   | `{ read: 'hash', write: 'location' }`               |
 | `OperationType`         | Database operation types       | `'read' \| 'write'`                                 |
@@ -918,81 +1087,127 @@ wrangler d1 create collegedb-central
 wrangler kv namespace create "KV"
 ```
 
-### 3. Configure wrangler.toml
+### 3. Configure wrangler.jsonc
 
-```toml
-[[d1_databases]]
-binding = "db-east"
-database_name = "collegedb-east"
-database_id = "your-database-id"
-
-[[d1_databases]]
-binding = "db-west"
-database_name = "collegedb-west"
-database_id = "your-database-id"
-
-[[kv_namespaces]]
-binding = "KV"
-id = "your-kv-namespace-id"
-
-[[durable_objects.bindings]]
-name = "ShardCoordinator"
-class_name = "ShardCoordinator"
+```jsonc
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "collegedb-app",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-15",
+	"d1_databases": [
+		{
+			"binding": "db-east",
+			"database_name": "collegedb-east",
+			"database_id": "your-east-database-id"
+		},
+		{
+			"binding": "db-west",
+			"database_name": "collegedb-west",
+			"database_id": "your-west-database-id"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "KV",
+			"id": "your-kv-namespace-id",
+			"preview_id": "your-kv-preview-id"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ShardCoordinator",
+				"class_name": "ShardCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ShardCoordinator"]
+		}
+	]
+}
 ```
 
-#### Complete wrangler.toml with ShardCoordinator
+#### Complete wrangler.jsonc with ShardCoordinator
 
-```toml
-name = "collegedb-app"
-main = "src/index.ts"
-compatibility_date = "2024-08-10"
-
-# D1 Database bindings
-[[d1_databases]]
-binding = "db-east"
-database_name = "collegedb-east"
-database_id = "your-east-database-id"
-
-[[d1_databases]]
-binding = "db-west"
-database_name = "collegedb-west"
-database_id = "your-west-database-id"
-
-[[d1_databases]]
-binding = "db-central"
-database_name = "collegedb-central"
-database_id = "your-central-database-id"
-
-# KV namespace for shard mappings
-[[kv_namespaces]]
-binding = "KV"
-id = "your-kv-namespace-id"
-preview_id = "your-kv-preview-id" # For local development
-
-# Durable Object for shard coordination
-[[durable_objects.bindings]]
-name = "ShardCoordinator"
-class_name = "ShardCoordinator"
-
-# Environment-specific configurations
-[env.production]
-[[env.production.d1_databases]]
-binding = "db-east"
-database_name = "collegedb-prod-east"
-database_id = "your-prod-east-id"
-
-[[env.production.d1_databases]]
-binding = "db-west"
-database_name = "collegedb-prod-west"
-database_id = "your-prod-west-id"
-
-[[env.production.kv_namespaces]]
-binding = "KV"
-id = "your-prod-kv-namespace-id"
-
-[[env.production.durable_objects.bindings]]
-name = "ShardCoordinator"
-class_name = "ShardCoordinator"
+```jsonc
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "collegedb-app",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-15",
+	"d1_databases": [
+		{
+			"binding": "db-east",
+			"database_name": "collegedb-east",
+			"database_id": "your-east-database-id"
+		},
+		{
+			"binding": "db-west",
+			"database_name": "collegedb-west",
+			"database_id": "your-west-database-id"
+		},
+		{
+			"binding": "db-central",
+			"database_name": "collegedb-central",
+			"database_id": "your-central-database-id"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "KV",
+			"id": "your-kv-namespace-id",
+			"preview_id": "your-kv-preview-id"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ShardCoordinator",
+				"class_name": "ShardCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ShardCoordinator"]
+		}
+	],
+	"env": {
+		"production": {
+			"d1_databases": [
+				{
+					"binding": "db-east",
+					"database_name": "collegedb-prod-east",
+					"database_id": "your-prod-east-id"
+				},
+				{
+					"binding": "db-west",
+					"database_name": "collegedb-prod-west",
+					"database_id": "your-prod-west-id"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "KV",
+					"id": "your-prod-kv-namespace-id"
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "ShardCoordinator",
+						"class_name": "ShardCoordinator"
+					}
+				]
+			}
+		}
+	}
+}
 ```
 
 ### 3.1. Worker Script Setup (Required for ShardCoordinator)
@@ -1762,19 +1977,25 @@ CollegeDB includes an optional **ShardCoordinator** Durable Object that provides
 
 #### Durable Object Setup
 
-First, configure the Durable Object in your `wrangler.toml`:
+First, configure the Durable Object in your `wrangler.jsonc`:
 
-```toml
-[[durable_objects.bindings]]
-name = "ShardCoordinator"
-class_name = "ShardCoordinator"
-
-# Export the ShardCoordinator class
-[durable_objects.bindings.script_name]
-# If using modules format
-[[durable_objects.bindings]]
-name = "ShardCoordinator"
-class_name = "ShardCoordinator"
+```jsonc
+{
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ShardCoordinator",
+				"class_name": "ShardCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ShardCoordinator"]
+		}
+	]
+}
 ```
 
 #### Basic Usage with ShardCoordinator

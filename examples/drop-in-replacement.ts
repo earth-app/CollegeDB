@@ -17,7 +17,7 @@
  *
  * @example Deploy this as a Cloudflare Worker for migration:
  * ```bash
- * # 1. Configure wrangler.toml with your existing D1 databases and KV namespace
+ * # 1. Configure wrangler.jsonc with your existing D1 databases and KV namespace
  * # 2. Deploy with: wrangler deploy
  * # 3. Run migration: curl https://your-worker.your-subdomain.workers.dev/migrate
  * ```

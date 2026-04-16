@@ -34,3 +34,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# sandbox benchmark artifacts
+sandbox/tmp/
+sandbox/results/*.md
+
+# local wrangler development state
+.wrangler/

@@ -118,7 +118,8 @@ export default {
 			coordinator: env.ShardCoordinator,
 			shards: {
 				'db-east': env['db-east'],
-				'db-west': env['db-west']
+				'db-west': env['db-west'],
+				'db-central': env['db-central']
 			},
 			strategy: 'hash' // Use hash for consistent routing
 		});
@@ -293,7 +294,8 @@ async function handleInit(env: Env): Promise<Response> {
 		await createSchemaAcrossShards(
 			{
 				'db-east': env['db-east'],
-				'db-west': env['db-west']
+				'db-west': env['db-west'],
+				'db-central': env['db-central']
 			},
 			COLLEGE_SCHEMA
 		);
@@ -301,7 +303,7 @@ async function handleInit(env: Env): Promise<Response> {
 		return new Response(
 			JSON.stringify({
 				message: 'Database schemas initialized successfully',
-				shards: ['db-east', 'db-west']
+				shards: ['db-east', 'db-west', 'db-central']
 			}),
 			{
 				headers: { 'Content-Type': 'application/json' }

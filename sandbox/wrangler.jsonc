@@ -1,0 +1,49 @@
+{
+	"name": "collegedb-sandbox-worker",
+	"main": "worker.ts",
+	"compatibility_date": "2026-04-15",
+	"vars": {
+		"ENV": "sandbox"
+	},
+	"d1_databases": [
+		{
+			"binding": "db-east",
+			"database_name": "collegedb-east",
+			"database_id": "your-east-db-id",
+			"preview_database_id": "your-east-preview-db-id"
+		},
+		{
+			"binding": "db-west",
+			"database_name": "collegedb-west",
+			"database_id": "your-west-db-id",
+			"preview_database_id": "your-west-preview-db-id"
+		},
+		{
+			"binding": "db-central",
+			"database_name": "collegedb-central",
+			"database_id": "your-central-db-id",
+			"preview_database_id": "your-central-preview-db-id"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "KV",
+			"id": "your-kv-namespace-id",
+			"preview_id": "your-kv-preview-namespace-id"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ShardCoordinator",
+				"class_name": "ShardCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ShardCoordinator"]
+		}
+	]
+}

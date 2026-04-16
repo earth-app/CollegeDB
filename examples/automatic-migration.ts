@@ -15,7 +15,7 @@
  *
  * @example Deploy this as a Cloudflare Worker:
  * ```bash
- * # 1. Configure wrangler.toml with your existing D1 databases and KV namespace
+ * # 1. Configure wrangler.jsonc with your existing D1 databases and KV namespace
  * # 2. Deploy with: wrangler deploy
  * # 3. Your existing data is immediately accessible!
  * ```
