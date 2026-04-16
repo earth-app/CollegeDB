@@ -4,14 +4,12 @@
   "workspaces": {
     "": {
       "name": "collegedb",
-      "dependencies": {
-        "@cloudflare/workers-types": "^4.20260415.1",
-      },
       "devDependencies": {
         "@babel/cli": "^7.28.6",
         "@babel/core": "^7.29.0",
         "@babel/preset-env": "^7.29.2",
         "@babel/preset-typescript": "^7.28.5",
+        "@cloudflare/workers-types": "^4.20260415.1",
         "@types/bun": "latest",
         "@types/pg": "^8.15.6",
         "@vitest/coverage-v8": "^4.1.4",

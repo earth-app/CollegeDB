@@ -43,14 +43,12 @@
     "test:sandbox:sqlite+valkey": "bun scripts/sandbox/run.ts --db=sqlite --kv=valkey",
     "prepare": "husky install"
   },
-  "dependencies": {
-    "@cloudflare/workers-types": "^4.20260415.1"
-  },
   "devDependencies": {
     "@babel/cli": "^7.28.6",
     "@babel/core": "^7.29.0",
     "@babel/preset-env": "^7.29.2",
     "@babel/preset-typescript": "^7.28.5",
+    "@cloudflare/workers-types": "^4.20260415.1",
     "@types/pg": "^8.15.6",
     "@types/bun": "latest",
     "@vitest/coverage-v8": "^4.1.4",
