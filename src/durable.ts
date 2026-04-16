@@ -7,10 +7,14 @@
  *
  * @example
  * ```typescript
- * // In wrangler.toml:
- * [[durable_objects.bindings]]
- * name = "ShardCoordinator"
- * class_name = "ShardCoordinator"
+ * // In wrangler.jsonc:
+ * // {
+ * //   "durable_objects": {
+ * //     "bindings": [
+ * //       { "name": "ShardCoordinator", "class_name": "ShardCoordinator" }
+ * //     ]
+ * //   }
+ * // }
  *
  * // Usage in a Worker:
  * const coordinatorId = env.ShardCoordinator.idFromName('default');
