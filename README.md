@@ -1,6 +1,6 @@
 # CollegeDB
 
-Cloudflare D1 Horizontal Sharding Router
+Universal Database Horizontal Sharding Router
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![GitHub Issues](https://img.shields.io/github/issues/earth-app/CollegeDB)](https://github.com/earth-app/CollegeDB/issues)
@@ -8,7 +8,7 @@ Cloudflare D1 Horizontal Sharding Router
 [![GitHub License](https://img.shields.io/github/license/earth-app/CollegeDB)](LICENSE)
 ![NPM Version](https://img.shields.io/npm/v/%40earth-app%2Fcollegedb)
 
-A TypeScript library for **true horizontal scaling** of SQLite-style databases on Cloudflare using D1 and KV, with provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
+A TypeScript library for **true horizontal scaling** of SQLite-style databases primarily for Cloudflare using D1 and KV, with additional provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
 
 CollegeDB implements **data distribution** where a single logical table is physically stored across multiple D1 databases:
 
@@ -65,6 +65,34 @@ CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling 
 - **🔧 TypeScript First**: Full type safety and excellent DX
 
 ## Benchmark Suite
+
+CollegeDB includes a comprehensive benchmark suite covering real-world latency across provider combinations and Cloudflare Worker routing paths.
+
+### Matrix
+
+| Scenario Key      | Scenario                         | What Happens                                                                                        | Workload Per Run                                                       |
+| ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| basic_crud        | Basic CRUD round-trip            | Insert, read, update, and delete a user via routed queries.                                         | 20 iterations; 4 routed SQL ops per iteration                          |
+| advanced_usage    | Advanced lookup workflow         | Writes user+post, adds lookup aliases, then validates join and alias-based lookup.                  | 15 iterations; ~5 routed SQL ops + KV lookup-key updates per iteration |
+| migration_mapping | Migration-style mapping creation | Inserts legacy records on a fixed shard, then builds shard mappings in batch and validates routing. | 10 iterations; 20 legacy records mapped per iteration                  |
+| bulk_crud         | Bulk CRUD pressure               | Performs bulk inserts, half updates, and full delete sweep, then validates shard-wide totals.       | 7 iterations; 160 inserts + 80 updates + 160 deletes per iteration     |
+| indexing          | Indexed query scan               | Creates an index on posts(user_id) and repeatedly queries the indexed path.                         | 15 iterations after warmup dataset build                               |
+
+Real-world latency benchmarks across provider combinations (`average / p95`):
+
+| Combination     | Basic CRUD          | Advanced Operations | Migration           | Bulk CRUD             | Indexing             | Overall Avg |
+| --------------- | ------------------- | ------------------- | ------------------- | --------------------- | -------------------- | ----------- |
+| cloudflare      | 13.14 ms / 16.50 ms | 4.43 ms / 9.65 ms   | 27.68 ms / 30.69 ms | 156.30 ms / 163.76 ms | 67.17 ms / 106.63 ms | 28.40 ms    |
+| postgres+redis  | 2.77 ms / 3.90 ms   | 3.11 ms / 4.64 ms   | 6.55 ms / 8.07 ms   | 42.33 ms / 80.67 ms   | 0.34 ms / 0.61 ms    | 5.87 ms     |
+| postgres+valkey | 1.65 ms / 2.23 ms   | 2.10 ms / 2.82 ms   | 5.60 ms / 6.05 ms   | 33.13 ms / 43.69 ms   | 0.30 ms / 0.46 ms    | 4.64 ms     |
+| mysql+redis     | 5.11 ms / 8.38 ms   | 5.45 ms / 8.51 ms   | 27.41 ms / 61.56 ms | 92.70 ms / 139.70 ms  | 0.49 ms / 1.22 ms    | 13.91 ms    |
+| mysql+valkey    | 4.99 ms / 6.66 ms   | 4.21 ms / 6.42 ms   | 21.68 ms / 27.20 ms | 87.67 ms / 109.44 ms  | 0.55 ms / 1.92 ms    | 12.54 ms    |
+| mariadb+redis   | 2.64 ms / 5.90 ms   | 3.02 ms / 7.55 ms   | 6.48 ms / 7.66 ms   | 46.99 ms / 58.08 ms   | 0.37 ms / 1.08 ms    | 6.29 ms     |
+| mariadb+valkey  | 2.34 ms / 4.58 ms   | 2.91 ms / 5.69 ms   | 5.73 ms / 7.35 ms   | 45.04 ms / 61.42 ms   | 0.36 ms / 0.79 ms    | 5.96 ms     |
+| sqlite+redis    | 2.21 ms / 3.84 ms   | 2.43 ms / 3.14 ms   | 10.49 ms / 17.31 ms | 140.85 ms / 184.48 ms | 0.07 ms / 0.14 ms    | 15.87 ms    |
+| sqlite+valkey   | 1.36 ms / 1.80 ms   | 2.06 ms / 2.70 ms   | 6.36 ms / 8.77 ms   | 121.13 ms / 156.31 ms | 0.06 ms / 0.14 ms    | 13.42 ms    |
+
+### Overview
 
 CollegeDB includes an integration benchmark suite covering both local provider matrices and Cloudflare Worker routing paths.
 
