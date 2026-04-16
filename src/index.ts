@@ -39,6 +39,26 @@ export { ShardCoordinator } from './durable.js';
 export { CollegeDBError } from './errors.js';
 export { KVShardMapper } from './kvmap.js';
 
+// Export provider adapters
+export {
+	createHyperdriveMySQLProvider,
+	createHyperdrivePostgresProvider,
+	createMySQLProvider as createMySQLSQLProvider,
+	createPostgreSQLProvider as createPostgresSQLProvider,
+	createRedisKVProvider,
+	createSQLiteProvider as createSQLiteSQLProvider,
+	createValkeyKVProvider,
+	isKVStorage,
+	isSQLDatabase,
+	type HyperdriveBindingLike,
+	type HyperdriveMySQLClientFactory,
+	type HyperdrivePostgresClientFactory,
+	type MySQLClientLike,
+	type PostgresClientLike,
+	type RedisLikeClient,
+	type SQLiteClientLike
+} from './providers.js';
+
 // Export migration functions
 export {
 	autoDetectAndMigrate,
@@ -65,8 +85,14 @@ export type {
 	CollegeDBConfig,
 	D1Region,
 	Env,
+	KVListResult,
+	KVStorage,
 	MixedShardingStrategy,
 	OperationType,
+	PreparedStatement,
+	QueryResult,
+	QueryResultMeta,
+	SQLDatabase,
 	ShardCoordinatorState,
 	ShardLocation,
 	ShardMapping,
