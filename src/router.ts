@@ -40,10 +40,20 @@
  * @since 1.0.0
  */
 
-import type { D1Database, D1PreparedStatement, D1Result, Request } from '@cloudflare/workers-types';
+import type { Request } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors.js';
 import { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, D1Region, OperationType, ShardLocation, ShardStats, ShardingStrategy } from './types.js';
+import type {
+	CollegeDBConfig,
+	D1Region,
+	OperationType,
+	PreparedStatement,
+	QueryResult,
+	SQLDatabase,
+	ShardLocation,
+	ShardStats,
+	ShardingStrategy
+} from './types.js';
 
 /**
  * Global configuration for the collegedb instance
@@ -55,6 +65,38 @@ import type { CollegeDBConfig, D1Region, OperationType, ShardLocation, ShardStat
  * @private
  */
 let globalConfig: CollegeDBConfig | null = null;
+
+/**
+ * Shared mapper instance for the active configuration.
+ *
+ * Reusing a single mapper preserves in-memory caches and avoids repeated
+ * constructor/setup overhead on each operation.
+ *
+ * @private
+ */
+let globalMapper: KVShardMapper | null = null;
+
+/**
+ * In-memory cache for per-shard size checks.
+ * @private
+ */
+const shardSizeCache = new Map<string, { size: number; expiresAt: number }>();
+
+/**
+ * Gets the shared mapper for the active configuration.
+ * @private
+ */
+function getMapper(config: CollegeDBConfig): KVShardMapper {
+	if (!globalMapper) {
+		globalMapper = new KVShardMapper(config.kv, {
+			hashShardMappings: config.hashShardMappings,
+			mappingCacheTtlMs: config.mappingCacheTtlMs,
+			knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
+		});
+	}
+
+	return globalMapper;
+}
 
 /**
  * Sets up the global configuration for the CollegeDB system. This must be called
@@ -95,11 +137,23 @@ let globalConfig: CollegeDBConfig | null = null;
  */
 export function initialize(config: CollegeDBConfig) {
 	globalConfig = config;
+	globalMapper = new KVShardMapper(config.kv, {
+		hashShardMappings: config.hashShardMappings,
+		mappingCacheTtlMs: config.mappingCacheTtlMs,
+		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
+	});
+	shardSizeCache.clear();
 
 	// Background: sync KV known shards with configured shards
 	try {
-		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
-		Promise.all(Object.keys(config.shards).map((s) => mapper.addKnownShard(s))).catch(() => void 0);
+		const mapper = getMapper(config);
+		Promise.resolve()
+			.then(async () => {
+				const existing = await mapper.getKnownShards();
+				const merged = Array.from(new Set([...existing, ...Object.keys(config.shards)]));
+				await mapper.setKnownShards(merged);
+			})
+			.catch(() => void 0);
 	} catch {}
 
 	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration) {
@@ -151,11 +205,19 @@ export function initialize(config: CollegeDBConfig) {
  */
 export async function initializeAsync(config: CollegeDBConfig) {
 	globalConfig = config;
+	globalMapper = new KVShardMapper(config.kv, {
+		hashShardMappings: config.hashShardMappings,
+		mappingCacheTtlMs: config.mappingCacheTtlMs,
+		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
+	});
+	shardSizeCache.clear();
 
 	// Sync KV known shards with configured shards (awaited in async init)
 	try {
-		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
-		await Promise.all(Object.keys(config.shards).map((s) => mapper.addKnownShard(s)));
+		const mapper = getMapper(config);
+		const existing = await mapper.getKnownShards();
+		const merged = Array.from(new Set([...existing, ...Object.keys(config.shards)]));
+		await mapper.setKnownShards(merged);
 	} catch {}
 
 	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration)
@@ -262,6 +324,8 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
  */
 export function resetConfig(): void {
 	globalConfig = null;
+	globalMapper = null;
+	shardSizeCache.clear();
 }
 
 /**
@@ -532,11 +596,11 @@ function parseRegion(location: ShardLocation | D1Region): D1Region {
  * Uses SQLite's page_count and page_size pragmas for accurate size calculation.
  *
  * @private
- * @param database - The D1 database instance to measure
+ * @param database - The SQL database instance to measure
  * @returns Promise resolving to the database size in bytes
  * @throws {CollegeDBError} If the size query fails
  */
-async function getDatabaseSize(database: D1Database): Promise<number> {
+async function getDatabaseSize(database: SQLDatabase): Promise<number> {
 	try {
 		// Get page count and page size efficiently
 		const [pageCountResult, pageSizeResult] = await Promise.all([
@@ -558,6 +622,34 @@ async function getDatabaseSize(database: D1Database): Promise<number> {
 }
 
 /**
+ * Retrieves a shard size using a short-lived in-memory cache.
+ * @private
+ */
+async function getDatabaseSizeForAllocation(shardName: string, config: CollegeDBConfig): Promise<number> {
+	const cacheTtlMs = Math.max(0, config.sizeCacheTtlMs ?? 30_000);
+	const cached = shardSizeCache.get(shardName);
+
+	if (cached && cached.expiresAt >= Date.now()) {
+		return cached.size;
+	}
+
+	const database = config.shards[shardName];
+	if (!database) {
+		throw new CollegeDBError(`Shard ${shardName} not found in configuration`, 'SHARD_NOT_FOUND');
+	}
+
+	const size = await getDatabaseSize(database);
+	if (cacheTtlMs > 0) {
+		shardSizeCache.set(shardName, {
+			size,
+			expiresAt: Date.now() + cacheTtlMs
+		});
+	}
+
+	return size;
+}
+
+/**
  * Filters available shards to exclude those that exceed the configured maximum size.
  * This is used during shard allocation to prevent new data from being assigned to
  * shards that are approaching or exceeding their size limits.
@@ -568,16 +660,15 @@ async function getDatabaseSize(database: D1Database): Promise<number> {
  * @returns Promise resolving to filtered list of shard names
  */
 async function filterShardsBySize(availableShards: string[], config: CollegeDBConfig): Promise<string[]> {
-	const limit = config.maxDatabaseSize || 10683731148; // 9.95 GB (default limit, close to CF D1 max size)
+	if (typeof config.maxDatabaseSize !== 'number' || !Number.isFinite(config.maxDatabaseSize) || config.maxDatabaseSize <= 0) {
+		return availableShards;
+	}
+
+	const limit = config.maxDatabaseSize;
 
 	const sizeChecks = await Promise.allSettled(
 		availableShards.map(async (shardName) => {
-			const database = config.shards[shardName];
-			if (!database) {
-				throw new CollegeDBError(`Shard ${shardName} not found in configuration`, 'SHARD_NOT_FOUND');
-			}
-
-			const size = await getDatabaseSize(database);
+			const size = await getDatabaseSizeForAllocation(shardName, config);
 			return {
 				shard: shardName,
 				size,
@@ -743,7 +834,7 @@ function selectShardByStrategy(
  */
 async function getShardForKey(primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
 	const config = getConfig();
-	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+	const mapper = getMapper(config);
 
 	// Check if mapping already exists
 	const existingMapping = await mapper.getShardMapping(primaryKey);
@@ -816,7 +907,7 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
  * @returns Promise resolving to the D1 database instance
  * @throws {Error} If shard routing fails or database instance not found
  */
-async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<D1Database> {
+async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<SQLDatabase> {
 	const config = getConfig();
 	const shard = await getShardForKey(primaryKey, operationType);
 	const database = config.shards[shard];
@@ -847,7 +938,7 @@ async function getDatabase(primaryKey: string, operationType: OperationType = 'w
  * await createSchema(env.DB_NEW_SHARD, userSchema);
  * ```
  */
-export async function createSchema(d1: D1Database, schema: string): Promise<void> {
+export async function createSchema(d1: SQLDatabase, schema: string): Promise<void> {
 	const { createSchema: createSchemaImpl } = await import('./migrations.js');
 	await createSchemaImpl(d1, schema);
 }
@@ -860,7 +951,7 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
  * @returns Promise that resolves to a prepared statement
  * @throws {Error} If preparation fails
  */
-export async function prepare(key: string, sql: string): Promise<D1PreparedStatement> {
+export async function prepare(key: string, sql: string): Promise<PreparedStatement> {
 	const operationType = getOperationType(sql);
 	const db = await getDatabase(key, operationType);
 	const result = db.prepare(sql);
@@ -929,7 +1020,7 @@ export async function prepare(key: string, sql: string): Promise<D1PreparedState
  * );
  * ```
  */
-export async function run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+export async function run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
 	const prepared = await prepare(key, sql);
 	const result = await prepared.bind(...bindings).run<T>();
 
@@ -971,7 +1062,7 @@ export async function run<T = Record<string, unknown>>(key: string, sql: string,
  * console.log(`User has ${postsResult.meta.count} posts`);
  * ```
  */
-export async function all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+export async function all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
 	const prepared = await prepare(key, sql);
 	const result = await prepared.bind(...bindings).all<T>();
 
@@ -1061,7 +1152,7 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 		throw new CollegeDBError(`Shard ${newBinding} not found in configuration`, 'SHARD_NOT_FOUND');
 	}
 
-	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+	const mapper = getMapper(config);
 	const currentMapping = await mapper.getShardMapping(primaryKey);
 
 	if (!currentMapping) {
@@ -1126,7 +1217,7 @@ export async function listKnownShards(): Promise<string[]> {
 
 	// Fallback: merge configured shards with KV-known shards
 	try {
-		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		const mapper = getMapper(config);
 		const kvShards = await mapper.getKnownShards();
 		const merged = new Set<string>([...Object.keys(config.shards), ...kvShards]);
 		return Array.from(merged);
@@ -1186,7 +1277,7 @@ export async function getShardStats(): Promise<ShardStats[]> {
 	}
 
 	// Fallback to KV-based counting
-	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+	const mapper = getMapper(config);
 	const counts = await mapper.getShardKeyCounts();
 
 	// Merge shards from config and KV known shards
@@ -1225,7 +1316,11 @@ export async function getShardStats(): Promise<ShardStats[]> {
  * console.log(`Inserted user with ID: ${result.lastInsertId}`);
  * ```
  */
-export async function runShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+export async function runShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = []
+): Promise<QueryResult<T>> {
 	const config = getConfig();
 	const db = config.shards[shardBinding];
 
@@ -1278,7 +1373,11 @@ export async function runShard<T = Record<string, unknown>>(shardBinding: string
  * );
  * ```
  */
-export async function allShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<D1Result<T>> {
+export async function allShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = []
+): Promise<QueryResult<T>> {
 	const config = getConfig();
 	const db = config.shards[shardBinding];
 
@@ -1352,9 +1451,9 @@ export async function runAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	batchSize: number = 50
-): Promise<D1Result<T>[]> {
+): Promise<QueryResult<T>[]> {
 	const config = getConfig();
-	const tasks: Array<() => Promise<D1Result<T>>> = [];
+	const tasks: Array<() => Promise<QueryResult<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
 		if (!binding || !db) {
@@ -1369,12 +1468,17 @@ export async function runAllShards<T = Record<string, unknown>>(
 				.run<T>()
 				.catch((error) => {
 					console.error(`Error executing query on shard ${binding}:`, error);
-					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
+					return {
+						success: false,
+						results: [],
+						error: error instanceof Error ? error.message : String(error),
+						meta: { duration: 0 }
+					} satisfies QueryResult<T>;
 				})
 		);
 	}
 
-	const out: D1Result<T>[] = [];
+	const out: QueryResult<T>[] = [];
 	for (let i = 0; i < tasks.length; i += batchSize) {
 		const batch = tasks.slice(i, i + batchSize).map((fn) => fn());
 		out.push(...(await Promise.all(batch)));
@@ -1399,9 +1503,9 @@ export async function allAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	batchSize: number = 50
-): Promise<D1Result<T>[]> {
+): Promise<QueryResult<T>[]> {
 	const config = getConfig();
-	const tasks: Array<() => Promise<D1Result<T>>> = [];
+	const tasks: Array<() => Promise<QueryResult<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
 		if (!binding || !db) {
@@ -1416,12 +1520,17 @@ export async function allAllShards<T = Record<string, unknown>>(
 				.all<T>()
 				.catch((error) => {
 					console.error(`Error executing query on shard ${binding}:`, error);
-					return { success: false, results: [], meta: { count: 0, duration: 0 } } as unknown as D1Result<T>;
+					return {
+						success: false,
+						results: [],
+						error: error instanceof Error ? error.message : String(error),
+						meta: { duration: 0 }
+					} satisfies QueryResult<T>;
 				})
 		);
 	}
 
-	const out: D1Result<T>[] = [];
+	const out: QueryResult<T>[] = [];
 	for (let i = 0; i < tasks.length; i += batchSize) {
 		const batch = tasks.slice(i, i + batchSize).map((fn) => fn());
 		out.push(...(await Promise.all(batch)));
@@ -1509,9 +1618,10 @@ export async function firstAllShards<T = Record<string, unknown>>(
  */
 export async function flush(): Promise<void> {
 	const config = getConfig();
-	const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+	const mapper = getMapper(config);
 
 	await mapper.clearAllMappings();
+	shardSizeCache.clear();
 
 	// Also flush coordinator if available
 	if (config.coordinator) {

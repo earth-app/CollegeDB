@@ -34,9 +34,8 @@
  * @since 1.0.0
  */
 
-import type { KVNamespace } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors.js';
-import type { CollegeDBConfig, MultiKeyShardMapping, ShardMapping } from './types.js';
+import type { CollegeDBConfig, KVStorage, MultiKeyShardMapping, ShardMapping } from './types.js';
 
 /**
  * KV key prefix for shard mappings
@@ -73,6 +72,18 @@ const MULTI_KEY_MAPPING_PREFIX = 'multikey:';
 const KNOWN_SHARDS_KEY = 'known_shards';
 
 /**
+ * Default TTL for in-memory mapping cache entries.
+ * @private
+ */
+const DEFAULT_MAPPING_CACHE_TTL_MS = 30_000;
+
+/**
+ * Default TTL for in-memory known shards cache entries.
+ * @private
+ */
+const DEFAULT_KNOWN_SHARDS_CACHE_TTL_MS = 10_000;
+
+/**
  * The KVShardMapper class provides a persistent storage layer for mapping
  * primary keys to their assigned D1 database shards. It uses Cloudflare KV
  * for global, eventually consistent storage with low latency reads.
@@ -104,10 +115,10 @@ const KNOWN_SHARDS_KEY = 'known_shards';
  */
 export class KVShardMapper {
 	/**
-	 * Cloudflare KV namespace for storing mappings
+	 * KV provider for storing mappings
 	 * @readonly
 	 */
-	private readonly kv: KVNamespace;
+	private readonly kv: KVStorage;
 
 	/**
 	 * Whether to hash mapping keys with SHA-256
@@ -122,13 +133,113 @@ export class KVShardMapper {
 	private readonly hashCache = new Map<string, string>();
 
 	/**
+	 * In-memory mapping cache to reduce repeated KV reads.
+	 * @private
+	 */
+	private readonly mappingCache = new Map<string, { mapping: ShardMapping | null; expiresAt: number }>();
+
+	/**
+	 * In-memory known shards cache.
+	 * @private
+	 */
+	private readonly knownShardsCache = {
+		shards: null as string[] | null,
+		expiresAt: 0
+	};
+
+	/**
+	 * Mapping cache TTL in milliseconds.
+	 * @private
+	 */
+	private readonly mappingCacheTtlMs: number;
+
+	/**
+	 * Known shards cache TTL in milliseconds.
+	 * @private
+	 */
+	private readonly knownShardsCacheTtlMs: number;
+
+	/**
 	 * Creates a new KVShardMapper instance
-	 * @param kv - Cloudflare KV namespace
+	 * @param kv - KV storage provider
 	 * @param config - Configuration options including hashing preference
 	 */
-	constructor(kv: KVNamespace, config: Partial<Pick<CollegeDBConfig, 'hashShardMappings'>> = {}) {
+	constructor(
+		kv: KVStorage,
+		config: Partial<Pick<CollegeDBConfig, 'hashShardMappings' | 'mappingCacheTtlMs' | 'knownShardsCacheTtlMs'>> = {}
+	) {
 		this.kv = kv;
 		this.hashKeys = config.hashShardMappings ?? true; // Default to true for security
+		this.mappingCacheTtlMs = config.mappingCacheTtlMs ?? DEFAULT_MAPPING_CACHE_TTL_MS;
+		this.knownShardsCacheTtlMs = config.knownShardsCacheTtlMs ?? DEFAULT_KNOWN_SHARDS_CACHE_TTL_MS;
+	}
+
+	/**
+	 * Reads a mapping from the in-memory cache.
+	 * @private
+	 */
+	private getCachedMapping(hashedKey: string): ShardMapping | null | undefined {
+		const cached = this.mappingCache.get(hashedKey);
+		if (!cached) {
+			return undefined;
+		}
+
+		if (cached.expiresAt < Date.now()) {
+			this.mappingCache.delete(hashedKey);
+			return undefined;
+		}
+
+		return cached.mapping;
+	}
+
+	/**
+	 * Writes a mapping to the in-memory cache.
+	 * @private
+	 */
+	private setCachedMapping(hashedKey: string, mapping: ShardMapping | null): void {
+		if (this.mappingCache.size > 50_000) {
+			const firstKey = this.mappingCache.keys().next().value;
+			if (firstKey) {
+				this.mappingCache.delete(firstKey);
+			}
+		}
+
+		this.mappingCache.set(hashedKey, {
+			mapping,
+			expiresAt: Date.now() + this.mappingCacheTtlMs
+		});
+	}
+
+	/**
+	 * Updates mapping cache entries for the provided logical keys.
+	 * @private
+	 */
+	private async cacheMappingForKeys(keys: string[], mapping: ShardMapping | null): Promise<void> {
+		const hashedKeys = await Promise.all(keys.map((k) => this.hashKey(k)));
+		for (const hashedKey of hashedKeys) {
+			this.setCachedMapping(hashedKey, mapping);
+		}
+	}
+
+	/**
+	 * Retrieves known shards from cache when available.
+	 * @private
+	 */
+	private getCachedKnownShards(): string[] | null {
+		if (this.knownShardsCache.shards && this.knownShardsCache.expiresAt >= Date.now()) {
+			return [...this.knownShardsCache.shards];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Stores known shards in the cache.
+	 * @private
+	 */
+	private setCachedKnownShards(shards: string[]): void {
+		this.knownShardsCache.shards = [...shards];
+		this.knownShardsCache.expiresAt = Date.now() + this.knownShardsCacheTtlMs;
 	}
 
 	/**
@@ -183,25 +294,43 @@ export class KVShardMapper {
 	 */
 	async getShardMapping(primaryKey: string): Promise<ShardMapping | null> {
 		const hashedKey = await this.hashKey(primaryKey);
+		const cached = this.getCachedMapping(hashedKey);
+		if (cached !== undefined) {
+			return cached;
+		}
+
 		const key = `${SHARD_MAPPING_PREFIX}${hashedKey}`;
 
 		// Try single-key mapping first
 		const singleMapping = await this.kv.get<ShardMapping>(key, 'json');
 		if (singleMapping) {
+			this.setCachedMapping(hashedKey, singleMapping);
 			return singleMapping;
 		}
 
 		// Try multi-key mapping lookup
 		const multiKeyMapping = await this.kv.get<MultiKeyShardMapping>(`${MULTI_KEY_MAPPING_PREFIX}${hashedKey}`, 'json');
 		if (multiKeyMapping) {
-			return {
+			const resolved: ShardMapping = {
 				shard: multiKeyMapping.shard,
 				createdAt: multiKeyMapping.createdAt,
 				updatedAt: multiKeyMapping.updatedAt,
 				originalKey: this.hashKeys ? undefined : primaryKey
 			};
+
+			this.setCachedMapping(hashedKey, resolved);
+
+			// If hash-based key storage is enabled, cache sibling lookup keys too.
+			if (this.hashKeys) {
+				for (const siblingHashedKey of multiKeyMapping.keys) {
+					this.setCachedMapping(siblingHashedKey, resolved);
+				}
+			}
+
+			return resolved;
 		}
 
+		this.setCachedMapping(hashedKey, null);
 		return null;
 	}
 
@@ -226,19 +355,20 @@ export class KVShardMapper {
 	async setShardMapping(primaryKey: string, shard: string, additionalKeys: string[] = []): Promise<void> {
 		const allKeys = [primaryKey, ...additionalKeys];
 		const timestamp = Date.now();
+		const mapping: ShardMapping = {
+			shard,
+			createdAt: timestamp,
+			updatedAt: timestamp,
+			originalKey: this.hashKeys ? undefined : primaryKey
+		};
 
 		if (allKeys.length === 1) {
 			// Single key mapping - use the original format for backward compatibility
 			const hashedKey = await this.hashKey(primaryKey);
 			const key = `${SHARD_MAPPING_PREFIX}${hashedKey}`;
-			const mapping: ShardMapping = {
-				shard,
-				createdAt: timestamp,
-				updatedAt: timestamp,
-				originalKey: this.hashKeys ? undefined : primaryKey
-			};
 
 			await this.kv.put(key, JSON.stringify(mapping));
+			this.setCachedMapping(hashedKey, mapping);
 		} else {
 			// Multi-key mapping - store the primary mapping and create lookup entries
 			const primaryHashedKey = await this.hashKey(primaryKey);
@@ -271,6 +401,9 @@ export class KVShardMapper {
 			});
 
 			await Promise.all(lookupPromises);
+
+			// Cache all lookup keys to avoid immediate read-after-write KV hits.
+			await this.cacheMappingForKeys(allKeys, mapping);
 		}
 	}
 
@@ -334,6 +467,20 @@ export class KVShardMapper {
 			});
 
 			await Promise.all(lookupPromises);
+
+			const updatedMapping: ShardMapping = {
+				...existing,
+				shard: newShard,
+				updatedAt: timestamp
+			};
+
+			if (this.hashKeys) {
+				for (const keyId of keysToUpdate) {
+					this.setCachedMapping(keyId, updatedMapping);
+				}
+			}
+
+			this.setCachedMapping(hashedKey, updatedMapping);
 		} else {
 			// Update single-key mapping
 			const updatedMapping: ShardMapping = {
@@ -342,6 +489,7 @@ export class KVShardMapper {
 				updatedAt: Date.now()
 			};
 			await this.kv.put(singleMappingKey, JSON.stringify(updatedMapping));
+			this.setCachedMapping(hashedKey, updatedMapping);
 		}
 	}
 
@@ -385,9 +533,17 @@ export class KVShardMapper {
 			});
 
 			await Promise.all(deletePromises);
+
+			if (this.hashKeys) {
+				for (const keyId of keysToDelete) {
+					this.setCachedMapping(keyId, null);
+				}
+			}
+			this.setCachedMapping(hashedKey, null);
 		} else {
 			// Delete single-key mapping
 			await this.kv.delete(singleMappingKey);
+			this.setCachedMapping(hashedKey, null);
 		}
 	}
 
@@ -406,8 +562,15 @@ export class KVShardMapper {
 	 * ```
 	 */
 	async getKnownShards(): Promise<string[]> {
+		const cached = this.getCachedKnownShards();
+		if (cached) {
+			return cached;
+		}
+
 		const shards = await this.kv.get<string[]>(KNOWN_SHARDS_KEY, 'json');
-		return shards || [];
+		const normalized = shards || [];
+		this.setCachedKnownShards(normalized);
+		return normalized;
 	}
 
 	/**
@@ -425,7 +588,14 @@ export class KVShardMapper {
 	 */
 	async setKnownShards(shards: string[]): Promise<void> {
 		if (!shards || shards.length === 0) return;
-		await this.kv.put(KNOWN_SHARDS_KEY, JSON.stringify(shards));
+
+		const unique = [...new Set(shards.filter(Boolean))];
+		if (unique.length === 0) {
+			return;
+		}
+
+		await this.kv.put(KNOWN_SHARDS_KEY, JSON.stringify(unique));
+		this.setCachedKnownShards(unique);
 	}
 
 	/**
@@ -576,6 +746,7 @@ export class KVShardMapper {
 		const multiKeyPromises = multiKeyList.keys.map((key) => this.kv.delete(key.name));
 
 		await Promise.all([...singleKeyPromises, ...multiKeyPromises]);
+		this.mappingCache.clear();
 	}
 
 	/**
@@ -643,6 +814,53 @@ export class KVShardMapper {
 		});
 
 		await Promise.all(lookupPromises);
+
+		// Refresh cache for primary and added keys.
+		const refreshedMapping: ShardMapping = {
+			shard: existing.shard,
+			createdAt: existing.createdAt,
+			updatedAt: timestamp,
+			originalKey: existing.originalKey
+		};
+		await this.cacheMappingForKeys([primaryKey, ...additionalKeys], refreshedMapping);
+	}
+
+	/**
+	 * Sets multiple shard mappings concurrently with a configurable concurrency limit.
+	 *
+	 * This helper is used by migration workflows to significantly reduce total
+	 * mapping time while avoiding unbounded concurrency spikes.
+	 *
+	 * @param mappings - The mappings to create
+	 * @param options - Batch execution options
+	 * @param options.concurrency - Maximum concurrent set operations (default: 25)
+	 * @returns Promise that resolves when all mappings are written
+	 * @since 1.1.0
+	 */
+	async setShardMappingsBatch(
+		mappings: Array<{ primaryKey: string; shard: string; additionalKeys?: string[] }>,
+		options: { concurrency?: number } = {}
+	): Promise<void> {
+		if (mappings.length === 0) {
+			return;
+		}
+
+		const concurrency = Math.max(1, options.concurrency ?? 25);
+		let index = 0;
+
+		const workers = new Array(Math.min(concurrency, mappings.length)).fill(null).map(async () => {
+			while (index < mappings.length) {
+				const currentIndex = index++;
+				const item = mappings[currentIndex];
+				if (!item) {
+					continue;
+				}
+
+				await this.setShardMapping(item.primaryKey, item.shard, item.additionalKeys || []);
+			}
+		});
+
+		await Promise.all(workers);
 	}
 
 	/**
