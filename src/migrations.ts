@@ -31,10 +31,9 @@
  * @since 1.0.0
  */
 
-import type { D1Database } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors.js';
 import type { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, ShardingStrategy } from './types.js';
+import type { CollegeDBConfig, SQLDatabase, ShardingStrategy } from './types.js';
 
 /**
  * Cache for migration status to avoid repeated checks
@@ -47,6 +46,63 @@ const migrationStatusCache = new Map<string, boolean>();
  * @private
  */
 const tableInfoCache = new Map<string, Array<{ name: string; type: string }>>();
+
+/**
+ * Runs async work with a bounded concurrency limit.
+ * @private
+ */
+async function mapWithConcurrency<T>(items: T[], concurrency: number, work: (item: T, index: number) => Promise<void>): Promise<void> {
+	if (items.length === 0) {
+		return;
+	}
+
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
+	let index = 0;
+
+	const workers = new Array(workerCount).fill(null).map(async () => {
+		while (index < items.length) {
+			const currentIndex = index++;
+			const item = items[currentIndex];
+			if (item === undefined) {
+				continue;
+			}
+
+			await work(item, currentIndex);
+		}
+	});
+
+	await Promise.all(workers);
+}
+
+/**
+ * Selects a shard for a key using the requested strategy.
+ * @private
+ */
+function selectShardForKey(
+	primaryKey: string,
+	index: number,
+	shardBindings: string[],
+	strategy: 'hash' | 'round-robin' | 'random'
+): string {
+	const totalShards = shardBindings.length;
+
+	switch (strategy) {
+		case 'hash': {
+			let hash = 0;
+			for (let i = 0; i < primaryKey.length; i++) {
+				const char = primaryKey.charCodeAt(i);
+				hash = (hash << 5) - hash + char;
+				hash = hash & hash;
+			}
+			const hashIndex = Math.abs(hash) % totalShards;
+			return shardBindings[hashIndex]!;
+		}
+		case 'random':
+			return shardBindings[Math.floor(Math.random() * totalShards)]!;
+		default:
+			return shardBindings[index % totalShards]!;
+	}
+}
 
 /**
  * Executes SQL statements to create the default table structure and indexes
@@ -75,7 +131,7 @@ const tableInfoCache = new Map<string, Array<{ name: string; type: string }>>();
  * await createSchema(env.DB_PRODUCTS, sql);
  * ```
  */
-export async function createSchema(d1: D1Database, schema: string): Promise<void> {
+export async function createSchema(d1: SQLDatabase, schema: string): Promise<void> {
 	const statements = schema
 		.split(';')
 		.map((stmt) => stmt.trim())
@@ -121,7 +177,7 @@ export async function createSchema(d1: D1Database, schema: string): Promise<void
  * }
  * ```
  */
-export async function createSchemaAcrossShards(shards: Record<string, D1Database>, schema: string): Promise<void> {
+export async function createSchemaAcrossShards(shards: Record<string, SQLDatabase>, schema: string): Promise<void> {
 	const promises = Object.entries(shards).map(([shardName, db]) => {
 		return createSchema(db, schema).catch((error) => {
 			throw new CollegeDBError(`Failed to create schema on shard ${shardName}: ${error.message}`, 'SCHEMA_CREATION_FAILED');
@@ -147,7 +203,7 @@ export async function createSchemaAcrossShards(shards: Record<string, D1Database
  * }
  * ```
  */
-export async function schemaExists(d1: D1Database, table: string): Promise<boolean> {
+export async function schemaExists(d1: SQLDatabase, table: string): Promise<boolean> {
 	try {
 		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").bind(table).first();
 		return result !== null;
@@ -175,7 +231,7 @@ export async function schemaExists(d1: D1Database, table: string): Promise<boole
  * }
  * ```
  */
-export async function dropSchema(d1: D1Database, ...tables: string[]): Promise<void> {
+export async function dropSchema(d1: SQLDatabase, ...tables: string[]): Promise<void> {
 	for (const table of tables) {
 		try {
 			await d1.prepare(`DROP TABLE IF EXISTS ${table}`).run();
@@ -205,7 +261,7 @@ export async function dropSchema(d1: D1Database, ...tables: string[]): Promise<v
  * }
  * ```
  */
-export async function listTables(d1: D1Database): Promise<string[]> {
+export async function listTables(d1: SQLDatabase): Promise<string[]> {
 	try {
 		const result = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
 		return result.results.map((row: any) => row.name as string);
@@ -250,7 +306,7 @@ export async function listTables(d1: D1Database): Promise<string[]> {
  * await migrateRecord(source, target, 'post-456', 'posts');
  * ```
  */
-export async function migrateRecord(source: D1Database, target: D1Database, primaryKey: string, tableName: string): Promise<void> {
+export async function migrateRecord(source: SQLDatabase, target: SQLDatabase, primaryKey: string, tableName: string): Promise<void> {
 	const sourceRecord = await source.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).bind(primaryKey).first();
 
 	if (!sourceRecord) {
@@ -298,7 +354,7 @@ export async function migrateRecord(source: D1Database, target: D1Database, prim
  * const orderIds = await discoverExistingPrimaryKeys(env.DB_ORDERS, 'orders', 'order_id');
  * ```
  */
-export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: string, primaryKeyColumn: string = 'id'): Promise<string[]> {
+export async function discoverExistingPrimaryKeys(d1: SQLDatabase, tableName: string, primaryKeyColumn: string = 'id'): Promise<string[]> {
 	try {
 		const result = await d1.prepare(`SELECT ${primaryKeyColumn} FROM ${tableName}`).all();
 		return result.results.map((row: any) => String(row[primaryKeyColumn]));
@@ -329,7 +385,7 @@ export async function discoverExistingPrimaryKeys(d1: D1Database, tableName: str
  * @since 1.0.4
  */
 export async function discoverExistingRecordsWithColumns(
-	d1: D1Database,
+	d1: SQLDatabase,
 	tableName: string,
 	primaryKeyColumn: string = 'id'
 ): Promise<Array<{ [key: string]: any }>> {
@@ -400,35 +456,20 @@ export async function createMappingsForExistingKeys(
 	primaryKeys: string[],
 	shardBindings: string[],
 	strategy: 'hash' | 'round-robin' | 'random',
-	mapper: any // KVShardMapper instance
+	mapper: KVShardMapper,
+	options: { concurrency?: number } = {}
 ): Promise<void> {
-	const totalShards = shardBindings.length;
-
-	for (let i = 0; i < primaryKeys.length; i++) {
-		const primaryKey = primaryKeys[i]!;
-		let selectedShard: string;
-
-		switch (strategy) {
-			case 'hash':
-				let hash = 0;
-				for (let j = 0; j < primaryKey.length; j++) {
-					const char = primaryKey.charCodeAt(j);
-					hash = (hash << 5) - hash + char;
-					hash = hash & hash;
-				}
-				const hashIndex = Math.abs(hash) % totalShards;
-				selectedShard = shardBindings[hashIndex]!;
-				break;
-			case 'random':
-				selectedShard = shardBindings[Math.floor(Math.random() * totalShards)]!;
-				break;
-			default: // round-robin
-				selectedShard = shardBindings[i % totalShards]!;
-				break;
-		}
-
-		await mapper.setShardMapping(primaryKey, selectedShard);
+	if (primaryKeys.length === 0 || shardBindings.length === 0) {
+		return;
 	}
+
+	const concurrency = Math.max(1, options.concurrency ?? 25);
+	const payload = primaryKeys.map((primaryKey, index) => ({
+		primaryKey,
+		shard: selectShardForKey(primaryKey, index, shardBindings, strategy)
+	}));
+
+	await mapper.setShardMappingsBatch(payload, { concurrency });
 }
 
 /**
@@ -465,7 +506,7 @@ export type ValidationResult = {
  * }
  * ```
  */
-export async function validateTableForSharding(d1: D1Database, tableName: string, primaryKeyColumn: string): Promise<ValidationResult> {
+export async function validateTableForSharding(d1: SQLDatabase, tableName: string, primaryKeyColumn: string): Promise<ValidationResult> {
 	const issues: string[] = [];
 	let recordCount = 0;
 
@@ -524,6 +565,7 @@ export type IntegrationOptions = {
 	addShardMappingsTable?: boolean;
 	dryRun?: boolean;
 	migrateOtherColumns?: boolean;
+	concurrency?: number;
 };
 
 /**
@@ -575,7 +617,7 @@ export type IntegrationResult = {
  * ```
  */
 export async function integrateExistingDatabase(
-	d1: D1Database,
+	d1: SQLDatabase,
 	shardName: string,
 	mapper: KVShardMapper,
 	options: IntegrationOptions = {}
@@ -586,8 +628,11 @@ export async function integrateExistingDatabase(
 		strategy = 'hash',
 		addShardMappingsTable = true,
 		dryRun = false,
-		migrateOtherColumns = false
+		migrateOtherColumns = false,
+		concurrency = 25
 	} = options;
+
+	const normalizedConcurrency = Math.max(1, concurrency);
 
 	const issues: string[] = [];
 	let tablesProcessed = 0;
@@ -620,10 +665,8 @@ export async function integrateExistingDatabase(
 					}
 
 					if (!dryRun) {
-						for (const record of records) {
+						const payload = records.map((record) => {
 							const primaryKey = String(record[primaryKeyColumn]);
-
-							// Create additional lookup keys based on available columns
 							const additionalKeys: string[] = [];
 
 							if (record.username && typeof record.username === 'string') {
@@ -636,10 +679,15 @@ export async function integrateExistingDatabase(
 								additionalKeys.push(`name:${record.name}`);
 							}
 
-							// Set the primary mapping with additional lookup keys
-							await mapper.setShardMapping(primaryKey, shardName, additionalKeys);
-							mappingsCreated++;
-						}
+							return {
+								primaryKey,
+								shard: shardName,
+								additionalKeys
+							};
+						});
+
+						await mapper.setShardMappingsBatch(payload, { concurrency: normalizedConcurrency });
+						mappingsCreated += payload.length;
 					}
 
 					totalRecords += records.length;
@@ -652,10 +700,12 @@ export async function integrateExistingDatabase(
 					}
 
 					if (!dryRun) {
-						for (const primaryKey of primaryKeys) {
-							await mapper.setShardMapping(primaryKey, shardName);
-							mappingsCreated++;
-						}
+						const payload = primaryKeys.map((primaryKey) => ({
+							primaryKey,
+							shard: shardName
+						}));
+						await mapper.setShardMappingsBatch(payload, { concurrency: normalizedConcurrency });
+						mappingsCreated += payload.length;
 					}
 
 					totalRecords += primaryKeys.length;
@@ -736,7 +786,7 @@ export async function integrateExistingDatabase(
  * ```
  */
 export async function autoDetectAndMigrate(
-	d1: D1Database,
+	d1: SQLDatabase,
 	shardName: string,
 	config: CollegeDBConfig,
 	options: {
@@ -745,6 +795,7 @@ export async function autoDetectAndMigrate(
 		skipCache?: boolean;
 		maxRecordsToCheck?: number;
 		migrateOtherColumns?: boolean;
+		concurrency?: number;
 	} = {}
 ): Promise<{
 	migrationNeeded: boolean;
@@ -753,7 +804,16 @@ export async function autoDetectAndMigrate(
 	tablesProcessed: number;
 	issues: string[];
 }> {
-	const { primaryKeyColumn = 'id', tablesToCheck, skipCache = false, maxRecordsToCheck = 1000, migrateOtherColumns = false } = options;
+	const {
+		primaryKeyColumn = 'id',
+		tablesToCheck,
+		skipCache = false,
+		maxRecordsToCheck = 1000,
+		migrateOtherColumns = false,
+		concurrency = config.migrationConcurrency ?? 25
+	} = options;
+
+	const normalizedConcurrency = Math.max(1, concurrency);
 
 	const cacheKey = `${shardName}_migration_check`;
 
@@ -776,7 +836,11 @@ export async function autoDetectAndMigrate(
 
 	try {
 		const { KVShardMapper } = await import('./kvmap.js');
-		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		const mapper = new KVShardMapper(config.kv, {
+			hashShardMappings: config.hashShardMappings,
+			mappingCacheTtlMs: config.mappingCacheTtlMs,
+			knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
+		});
 
 		// Discover tables to check
 		const allTables = await listTables(d1);
@@ -845,47 +909,54 @@ export async function autoDetectAndMigrate(
 						// Use multi-column discovery for migration with additional lookup keys
 						const allRecords = await discoverExistingRecordsWithColumns(d1, tableName, primaryKeyColumn);
 
-						// Create mappings for all unmapped keys with additional lookup keys
-						let newMappings = 0;
-						for (const record of allRecords) {
+						const payload: Array<{ primaryKey: string; shard: string; additionalKeys: string[] }> = [];
+						await mapWithConcurrency(allRecords, normalizedConcurrency, async (record) => {
 							const primaryKey = String(record[primaryKeyColumn]);
 							const existingMapping = await mapper.getShardMapping(primaryKey);
-							if (!existingMapping) {
-								// Create additional lookup keys based on available columns
-								const additionalKeys: string[] = [];
-
-								if (record.username && typeof record.username === 'string') {
-									additionalKeys.push(`username:${record.username}`);
-								}
-								if (record.email && typeof record.email === 'string') {
-									additionalKeys.push(`email:${record.email}`);
-								}
-								if (record.name && typeof record.name === 'string') {
-									additionalKeys.push(`name:${record.name}`);
-								}
-
-								// Set the primary mapping with additional lookup keys
-								await mapper.setShardMapping(primaryKey, shardName, additionalKeys);
-								newMappings++;
+							if (existingMapping) {
+								return;
 							}
+
+							const additionalKeys: string[] = [];
+							if (record.username && typeof record.username === 'string') {
+								additionalKeys.push(`username:${record.username}`);
+							}
+							if (record.email && typeof record.email === 'string') {
+								additionalKeys.push(`email:${record.email}`);
+							}
+							if (record.name && typeof record.name === 'string') {
+								additionalKeys.push(`name:${record.name}`);
+							}
+
+							payload.push({
+								primaryKey,
+								shard: shardName,
+								additionalKeys
+							});
+						});
+
+						if (payload.length > 0) {
+							await mapper.setShardMappingsBatch(payload, { concurrency: normalizedConcurrency });
 						}
 
-						recordsMigrated += newMappings;
+						recordsMigrated += payload.length;
 					} else {
 						// Original behavior: only use primary keys
 						const allPrimaryKeys = await discoverExistingPrimaryKeys(d1, tableName, primaryKeyColumn);
 
-						// Create mappings for all unmapped keys
-						let newMappings = 0;
-						for (const primaryKey of allPrimaryKeys) {
+						const payload: Array<{ primaryKey: string; shard: string }> = [];
+						await mapWithConcurrency(allPrimaryKeys, normalizedConcurrency, async (primaryKey) => {
 							const existingMapping = await mapper.getShardMapping(primaryKey);
 							if (!existingMapping) {
-								await mapper.setShardMapping(primaryKey, shardName);
-								newMappings++;
+								payload.push({ primaryKey, shard: shardName });
 							}
+						});
+
+						if (payload.length > 0) {
+							await mapper.setShardMappingsBatch(payload, { concurrency: normalizedConcurrency });
 						}
 
-						recordsMigrated += newMappings;
+						recordsMigrated += payload.length;
 					}
 
 					tablesProcessed++;
@@ -955,7 +1026,7 @@ export async function autoDetectAndMigrate(
  * }
  * ```
  */
-export async function checkMigrationNeeded(d1: D1Database, shardName: string, config: CollegeDBConfig): Promise<boolean> {
+export async function checkMigrationNeeded(d1: SQLDatabase, shardName: string, config: CollegeDBConfig): Promise<boolean> {
 	const cacheKey = `${shardName}_migration_check`;
 
 	// Check cache first (but not during tests with skip cache)
@@ -975,7 +1046,11 @@ export async function checkMigrationNeeded(d1: D1Database, shardName: string, co
 		}
 
 		const { KVShardMapper } = await import('./kvmap.js');
-		const mapper = new KVShardMapper(config.kv, { hashShardMappings: config.hashShardMappings });
+		const mapper = new KVShardMapper(config.kv, {
+			hashShardMappings: config.hashShardMappings,
+			mappingCacheTtlMs: config.mappingCacheTtlMs,
+			knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
+		});
 
 		// Quick check: look for any table with data
 		const dataTableNames = tables.filter(
