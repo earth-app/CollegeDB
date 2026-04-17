@@ -8,7 +8,32 @@ Universal Database Horizontal Sharding Router
 [![GitHub License](https://img.shields.io/github/license/earth-app/CollegeDB)](LICENSE)
 ![NPM Version](https://img.shields.io/npm/v/%40earth-app%2Fcollegedb)
 
-A TypeScript library for **true horizontal scaling** of SQLite-style databases primarily for Cloudflare using D1 and KV, with additional provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
+A TypeScript library for **true horizontal scaling** of SQLite-style databases primarily for Cloudflare using D1 and KV, with additional provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends, plus Drizzle ORM interop across those SQL providers. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
+
+## Table of Contents
+
+- [Why CollegeDB](#why-collegedb)
+- [Features](#features)
+- [Getting Started](#getting-started)
+- [Benchmark Suite](#benchmark-suite)
+- [Provider Adapters](#provider-adapters)
+- [NuxtHub + Drizzle Recipes](#nuxthub--drizzle-recipes)
+- [Sandbox Benchmarks (Docker Compose)](#sandbox-benchmarks-docker-compose)
+- [Basic Usage](#basic-usage)
+- [Multi-Key Shard Mappings](#multi-key-shard-mappings)
+- [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
+- [Troubleshooting](#troubleshooting)
+- [API Reference](#api-reference)
+- [Architecture](#architecture)
+- [Cloudflare Setup](#cloudflare-setup)
+- [Monitoring and Maintenance](#monitoring-and-maintenance)
+- [Performance Analysis](#performance-analysis)
+- [Advanced Configuration](#advanced-configuration)
+- [Quick Reference](#quick-reference)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Why CollegeDB
 
 CollegeDB implements **data distribution** where a single logical table is physically stored across multiple D1 databases:
 
@@ -39,36 +64,132 @@ This allows you to:
 - **Scale geographically** by placing shards in different regions
 - **Increase write throughput** by parallelizing across multiple database instances
 
-## 📈 Overview
+## Features
 
-CollegeDB provides a sharding layer on top of Cloudflare D1 databases, enabling you to:
+- Automatic query routing (primary key to shard mapping)
+- Provider adapters for Redis/Valkey/NuxtHub KV plus PostgreSQL/MySQL/SQLite SQL
+- Drizzle interop through existing SQL providers (`createPostgreSQLProvider`, `createMySQLProvider`, `createSQLiteProvider`)
+- Hyperdrive helpers for PostgreSQL and MySQL
+- Multiple allocation strategies: round-robin, random, hash, location-aware, and mixed read/write strategies
+- Durable Object shard coordination and shard statistics
+- Migration helpers for integrating existing datasets and rebalancing mappings
 
-- **Scale horizontally** by distributing table data across multiple D1 instances
-- **Route queries automatically** based on primary key mappings
-- **Maintain consistency** with KV-based shard mapping
-- **Run on multiple providers** through `KVStorage` and `SQLDatabase` contracts
-- **Optimize for geography** with location-aware shard allocation
-- **Monitor and rebalance** shard distribution
-- **Handle migrations** between shards seamlessly
+## Getting Started
 
-## 📦 Features
+### Installation
 
-- **🔀 Automatic Query Routing**: Primary key → shard mapping using Cloudflare KV
-- **🧩 Provider Adapters (v1.1.0)**: Redis/Valkey KV + PostgreSQL/MySQL/SQLite SQL adapters while preserving Cloudflare compatibility
-- **🎯 Multiple Allocation Strategies**: Round-robin, random, hash-based, and location-aware distribution
-- **🔄 Mixed Strategy Support**: Different strategies for reads vs writes (e.g., location for writes, hash for reads)
-- **📊 Shard Coordination**: Durable Objects for allocation and statistics
-- **🛠 Migration Support**: Move data between shards with zero downtime
-- **🔄 Automatic Drop-in Replacement**: Zero-config integration with existing databases
-- **🤖 Smart Migration Detection**: Automatically discovers and maps existing data
-- **⚡ High Performance**: Optimized for Cloudflare Workers runtime
-- **🔧 TypeScript First**: Full type safety and excellent DX
+```bash
+bun add @earth-app/collegedb
+# or
+npm install @earth-app/collegedb
+```
+
+### NuxtHub + Drizzle with CollegeDB Routing
+
+Keep NuxtHub + Drizzle for schema/migrations and add CollegeDB as your routing layer.
+
+```typescript
+import { db as hubDb } from '@nuxthub/db';
+import { kv } from '@nuxthub/kv';
+import { sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/d1';
+import { createNuxtHubKVProvider, createSQLiteProvider, first, initialize, run } from '@earth-app/collegedb';
+
+let initialized = false;
+
+function ensureCollegeDB(env: { DB_SECONDARY: D1Database }) {
+	if (initialized) return;
+
+	initialize({
+		kv: createNuxtHubKVProvider(kv),
+		shards: {
+			'db-primary': createSQLiteProvider(hubDb, sql),
+			'db-secondary': createSQLiteProvider(drizzle(env.DB_SECONDARY), sql)
+		},
+		strategy: 'hash'
+	});
+
+	initialized = true;
+}
+
+export default defineEventHandler(async (event) => {
+	const env = event.context.cloudflare.env;
+	ensureCollegeDB(env);
+
+	await run('post:123', 'INSERT OR REPLACE INTO blog_posts (id, title) VALUES (?, ?)', ['post:123', 'Hello from CollegeDB']);
+
+	const post = await first<{ id: string; title: string }>('post:123', 'SELECT id, title FROM blog_posts WHERE id = ?', ['post:123']);
+
+	return { post };
+});
+```
+
+### Drop-in Pattern for Existing `hub:db` + `hub:kv` Code
+
+```typescript
+// before
+import { eq } from 'drizzle-orm';
+import { db } from 'hub:db';
+import { kv } from 'hub:kv';
+import { blogPosts } from '~/server/db/schema';
+
+const cached = await kv.get('nuxtpress:post:slug');
+if (cached) return cached;
+
+const rows = await db.select().from(blogPosts).where(eq(blogPosts.slug, slug)).limit(1);
+await kv.set('nuxtpress:post:slug', rows[0], { ttl: 3600 });
+```
+
+```typescript
+// after (CollegeDB routing + same NuxtHub KV cache)
+import { kv } from '@nuxthub/kv';
+import { sql } from 'drizzle-orm';
+import { db } from 'hub:db';
+import { createNuxtHubKVProvider, createSQLiteProvider, first, initialize } from '@earth-app/collegedb';
+
+let initialized = false;
+
+function setup() {
+	if (initialized) return;
+	initialize({
+		kv: createNuxtHubKVProvider(kv),
+		shards: {
+			'db-primary': createSQLiteProvider(db, sql)
+		},
+		strategy: 'hash'
+	});
+	initialized = true;
+}
+
+setup();
+
+const cacheKey = `nuxtpress:post:${slug}`;
+const cached = await kv.get(cacheKey);
+if (cached) return cached;
+
+const row = await first<{ id: string; slug: string; title: string }>(
+	cacheKey,
+	'SELECT id, slug, title FROM blog_posts WHERE slug = ? LIMIT 1',
+	[slug]
+);
+
+await kv.set(cacheKey, row, { ttl: 3600 });
+```
 
 ## Benchmark Suite
 
-CollegeDB includes a comprehensive benchmark suite covering real-world latency across provider combinations and Cloudflare Worker routing paths.
+CollegeDB includes a benchmark runner that executes each SQL+KV combination across adapter profiles, then generates a report with profile-specific matrices.
 
-### Matrix
+### Adapter Profiles
+
+| Profile    | Purpose                                                                 |
+| ---------- | ----------------------------------------------------------------------- |
+| native     | Direct provider clients (Cloudflare bindings or driver-native adapters) |
+| drizzle    | Drizzle interop through SQL provider adapters                           |
+| hyperdrive | Hyperdrive connection-string wrappers for PostgreSQL/MySQL              |
+| nuxthub    | NuxtHub-style KV adapter with SQL provider interop                      |
+
+### Scenario Catalog
 
 | Scenario Key      | Scenario                         | What Happens                                                                                        | Workload Per Run                                                       |
 | ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -77,71 +198,56 @@ CollegeDB includes a comprehensive benchmark suite covering real-world latency a
 | migration_mapping | Migration-style mapping creation | Inserts legacy records on a fixed shard, then builds shard mappings in batch and validates routing. | 10 iterations; 20 legacy records mapped per iteration                  |
 | bulk_crud         | Bulk CRUD pressure               | Performs bulk inserts, half updates, and full delete sweep, then validates shard-wide totals.       | 7 iterations; 160 inserts + 80 updates + 160 deletes per iteration     |
 | indexing          | Indexed query scan               | Creates an index on posts(user_id) and repeatedly queries the indexed path.                         | 15 iterations after warmup dataset build                               |
+| metadata_fetch    | Metadata inspection              | Reads table metadata/introspection rows from one shard.                                             | 14 iterations; 1 metadata query per iteration                          |
+| pragma_or_info    | PRAGMA / server info             | Runs provider-specific PRAGMA/info query to sample low-level metadata latency.                      | 14 iterations; 1 pragma/info query per iteration                       |
+| counting          | Cross-shard counting             | Counts users across all shards to measure fanout aggregation overhead.                              | 14 iterations; all-shard count aggregation per iteration               |
+| shard_fanout      | Shard fanout query               | Runs query fanout to all shards and aggregates shard-level responses.                               | 14 iterations; 1 all-shards query per iteration                        |
+| reassignment      | Shard reassignment flow          | Creates a record, reassigns it to another shard, and verifies routed reads still succeed.           | 10 iterations; insert + reassignment + verification per iteration      |
 
-Real-world latency benchmarks across provider combinations (`average / p95`):
+### Report Matrices
 
-| Combination     | Basic CRUD          | Advanced Operations | Migration           | Bulk CRUD             | Indexing             | Overall Avg |
-| --------------- | ------------------- | ------------------- | ------------------- | --------------------- | -------------------- | ----------- |
-| cloudflare      | 13.14 ms / 16.50 ms | 4.43 ms / 9.65 ms   | 27.68 ms / 30.69 ms | 156.30 ms / 163.76 ms | 67.17 ms / 106.63 ms | 28.40 ms    |
-| postgres+redis  | 2.77 ms / 3.90 ms   | 3.11 ms / 4.64 ms   | 6.55 ms / 8.07 ms   | 42.33 ms / 80.67 ms   | 0.34 ms / 0.61 ms    | 5.87 ms     |
-| postgres+valkey | 1.65 ms / 2.23 ms   | 2.10 ms / 2.82 ms   | 5.60 ms / 6.05 ms   | 33.13 ms / 43.69 ms   | 0.30 ms / 0.46 ms    | 4.64 ms     |
-| mysql+redis     | 5.11 ms / 8.38 ms   | 5.45 ms / 8.51 ms   | 27.41 ms / 61.56 ms | 92.70 ms / 139.70 ms  | 0.49 ms / 1.22 ms    | 13.91 ms    |
-| mysql+valkey    | 4.99 ms / 6.66 ms   | 4.21 ms / 6.42 ms   | 21.68 ms / 27.20 ms | 87.67 ms / 109.44 ms  | 0.55 ms / 1.92 ms    | 12.54 ms    |
-| mariadb+redis   | 2.64 ms / 5.90 ms   | 3.02 ms / 7.55 ms   | 6.48 ms / 7.66 ms   | 46.99 ms / 58.08 ms   | 0.37 ms / 1.08 ms    | 6.29 ms     |
-| mariadb+valkey  | 2.34 ms / 4.58 ms   | 2.91 ms / 5.69 ms   | 5.73 ms / 7.35 ms   | 45.04 ms / 61.42 ms   | 0.36 ms / 0.79 ms    | 5.96 ms     |
-| sqlite+redis    | 2.21 ms / 3.84 ms   | 2.43 ms / 3.14 ms   | 10.49 ms / 17.31 ms | 140.85 ms / 184.48 ms | 0.07 ms / 0.14 ms    | 15.87 ms    |
-| sqlite+valkey   | 1.36 ms / 1.80 ms   | 2.06 ms / 2.70 ms   | 6.36 ms / 8.77 ms   | 121.13 ms / 156.31 ms | 0.06 ms / 0.14 ms    | 13.42 ms    |
+Each generated report includes:
 
-### Overview
+- `Matrix: SQL x KV (Overall)`
+- `Matrix: Adapter Profiles (Overall Avg)`
+- `Matrix: Core Scenario Latency (avg/p95)`
+- `Matrix: Introspection and Routing Latency (avg/p95)`
+- `Cloudflare Worker (wrangler dev --local)`
+- `Matrix: Cloudflare Adapter Profiles (Overall Avg)`
 
-CollegeDB includes an integration benchmark suite covering both local provider matrices and Cloudflare Worker routing paths.
-
-Top-level benchmark scenarios:
-
-- `basic_crud`: insert/read/update/delete round-trip routing
-- `advanced_usage`: join + multi-key lookup behavior
-- `migration_mapping`: batch mapping creation for existing keys
-- `bulk_crud`: high-volume insert/update/delete flow
-- `indexing`: indexed query latency under warm data
-- `metadata_fetch`: schema/metadata query latency
-- `pragma_or_info`: provider-specific pragma/info query latency
-- `counting`: shard-wide aggregate counting
-- `shard_fanout`: all-shards fanout query aggregation
-- `reassignment`: shard reassignment and routed-read validation
-
-Benchmark reports include:
-
-- an interpretation guide (`How To Read This Report`)
-- a benchmark catalog with per-run workload details
-- a compact overall matrix (passed/failed/skipped + overall average)
-- split scenario matrices for core workload latency and introspection/routing latency
-
-## Installation
+### Common Commands
 
 ```bash
-bun add @earth-app/collegedb
-# or
-npm install @earth-app/collegedb
+bun run test:sandbox
+bun run test:sandbox:drizzle
+bun run test:sandbox:nuxthub
+bun run test:sandbox:hyperdrive
 ```
+
+For Docker-based benchmark details and filtering options, see [Sandbox Benchmarks (Docker Compose)](#sandbox-benchmarks-docker-compose).
 
 ## Provider Adapters
 
 CollegeDB can run with either native Cloudflare bindings or custom providers as long as they match the exported `KVStorage` and `SQLDatabase` interfaces.
 
+Drizzle interop is enabled by passing a Drizzle `sql` tag as the optional second argument to `createPostgreSQLProvider`, `createMySQLProvider`, or `createSQLiteProvider`.
+
 Supported adapters:
 
 - `createRedisKVProvider`
 - `createValkeyKVProvider`
-- `createPostgresSQLProvider`
-- `createMySQLSQLProvider`
-- `createSQLiteSQLProvider`
+- `createNuxtHubKVProvider`
+- `createPostgreSQLProvider`
+- `createMySQLProvider`
+- `createSQLiteProvider`
+- `createDrizzleSQLProvider` (compatibility helper)
 - `createHyperdrivePostgresProvider`
 - `createHyperdriveMySQLProvider`
 
 ```typescript
 import { createClient as createRedisClient } from 'redis';
 import { Pool } from 'pg';
-import { createPostgresSQLProvider, createRedisKVProvider, initialize, run, type CollegeDBConfig } from '@earth-app/collegedb';
+import { createPostgreSQLProvider, createRedisKVProvider, initialize, run, type CollegeDBConfig } from '@earth-app/collegedb';
 
 const redisClient = createRedisClient({ url: process.env.REDIS_URL });
 const pgPool = new Pool({ connectionString: process.env.POSTGRES_URL });
@@ -149,7 +255,7 @@ const pgPool = new Pool({ connectionString: process.env.POSTGRES_URL });
 const config: CollegeDBConfig = {
 	kv: createRedisKVProvider(redisClient),
 	shards: {
-		'pg-east': createPostgresSQLProvider(pgPool)
+		'pg-east': createPostgreSQLProvider(pgPool)
 	},
 	strategy: 'hash',
 	disableAutoMigration: true
@@ -166,7 +272,100 @@ bootstrap().catch(console.error);
 
 For Hyperdrive-backed SQL connections, use `createHyperdrivePostgresProvider` or `createHyperdriveMySQLProvider` with your database client factory.
 
+### NuxtHub Runtime Example (D1 + KV)
+
+```typescript
+import { db } from '@nuxthub/db';
+import { kv } from '@nuxthub/kv';
+import { sql } from 'drizzle-orm';
+import { createNuxtHubKVProvider, createSQLiteProvider, initialize, run, first } from '@earth-app/collegedb';
+
+initialize({
+	kv: createNuxtHubKVProvider(kv),
+	shards: {
+		'db-primary': createSQLiteProvider(db, sql)
+	},
+	strategy: 'hash'
+});
+
+await run('draft:home', 'INSERT OR REPLACE INTO drafts (id, content) VALUES (?, ?)', ['draft:home', '# Home']);
+
+const draft = await first<{ id: string; content: string }>('draft:home', 'SELECT id, content FROM drafts WHERE id = ?', ['draft:home']);
+```
+
+### Keep Drizzle Schema + Migrations, Route Queries with CollegeDB
+
+CollegeDB does not replace your Drizzle schema or NuxtHub migration workflow.
+
+```bash
+npx nuxt db generate
+npx nuxt db migrate
+```
+
+Use those migrations as-is, then route runtime reads/writes through CollegeDB adapters.
+
 For a complete non-Cloudflare setup, see `examples/provider-sandbox.ts`.
+
+## NuxtHub + Drizzle Recipes
+
+### Multi-Vendor Shards (Cloudflare + Postgres/MySQL)
+
+NuxtHub supports multiple deployment/database vendors. CollegeDB can shard across any SQL backends that Drizzle can connect to.
+
+```typescript
+import { sql } from 'drizzle-orm';
+import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js';
+import { drizzle as drizzleMySQL } from 'drizzle-orm/mysql2';
+import { drizzle as drizzleD1 } from 'drizzle-orm/d1';
+import { kv } from '@nuxthub/kv';
+import postgres from 'postgres';
+import mysql from 'mysql2/promise';
+import {
+	createMySQLProvider,
+	createNuxtHubKVProvider,
+	createPostgreSQLProvider,
+	createSQLiteProvider,
+	initialize,
+	run
+} from '@earth-app/collegedb';
+
+const pgClient = postgres(process.env.POSTGRES_URL!);
+const mysqlPool = mysql.createPool(process.env.MYSQL_URL!);
+
+function setup(env: { DB_CF: D1Database }) {
+	initialize({
+		kv: createNuxtHubKVProvider(kv),
+		shards: {
+			'db-cf': createSQLiteProvider(drizzleD1(env.DB_CF), sql),
+			'db-pg': createPostgreSQLProvider(drizzlePg(pgClient), sql),
+			'db-mysql': createMySQLProvider(drizzleMySQL(mysqlPool), sql)
+		},
+		strategy: 'hash'
+	});
+}
+
+export default defineEventHandler(async (event) => {
+	setup(event.context.cloudflare.env);
+
+	await run('tenant:acme:user:1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['tenant:acme:user:1', 'Ada']);
+});
+```
+
+### Keep NuxtHub Cache/KV Semantics Intact
+
+Use NuxtHub KV for app cache while CollegeDB uses its own key namespace for shard mappings:
+
+```typescript
+import { kv } from '@nuxthub/kv';
+import { first } from '@earth-app/collegedb';
+
+const cacheKey = `nuxtpress:post:${slug}`;
+const cached = await kv.get(cacheKey);
+if (cached) return cached;
+
+const post = await first(cacheKey, 'SELECT * FROM blog_posts WHERE slug = ? LIMIT 1', [slug]);
+await kv.set(cacheKey, post, { ttl: 3600 });
+```
 
 ## Sandbox Benchmarks (Docker Compose)
 
@@ -199,15 +398,20 @@ bun run test:sandbox:cloudflare
 Provider filters:
 
 ```bash
-# One SQL provider against both KV providers
+# One SQL provider against all KV providers (native profile by default)
 bun run test:sandbox:mysql
 bun run test:sandbox:postgres
 bun run test:sandbox:mariadb
 bun run test:sandbox:sqlite
 
-# One KV provider against all SQL providers
+# One KV provider against all SQL providers (native profile by default)
 bun run test:sandbox:redis
 bun run test:sandbox:valkey
+
+# Run all SQL x KV combinations for one adapter profile
+bun run test:sandbox:drizzle
+bun run test:sandbox:nuxthub
+bun run test:sandbox:hyperdrive
 
 # Explicit pairwise combinations
 bun run test:sandbox:postgres+redis
@@ -225,7 +429,7 @@ Output behavior:
 - Every run writes a timestamped Markdown report to `sandbox/results/`
 - `sandbox/results/latest.md` is always updated to the newest report
 - The runner prints the report in-terminal using Bun's Markdown renderer with ANSI formatting
-- `test:sandbox` produces a matrix for all SQL x KV combinations; filtered commands produce matrix subsets
+- `test:sandbox` includes native, drizzle, hyperdrive, and nuxthub adapter profiles across supported SQL/KV combinations plus Cloudflare profile runs
 
 Benchmark coverage includes:
 
@@ -704,7 +908,7 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 }
 ```
 
-## 📚 API Reference
+## API Reference
 
 | Function                                   | Description                                                      | Parameters                 |
 | ------------------------------------------ | ---------------------------------------------------------------- | -------------------------- |
@@ -733,9 +937,11 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 | ---------------------------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------- |
 | `createRedisKVProvider(client, options?)`                  | Adapt a Redis client to CollegeDB's `KVStorage` contract             | `RedisLikeClient, { scanCount?: number }`                |
 | `createValkeyKVProvider(client, options?)`                 | Adapt a Valkey client to CollegeDB's `KVStorage` contract            | `RedisLikeClient, { scanCount?: number }`                |
-| `createPostgresSQLProvider(client)`                        | Adapt a PostgreSQL client/pool to `SQLDatabase`                      | `PostgresClientLike`                                     |
-| `createMySQLSQLProvider(client)`                           | Adapt a MySQL/MariaDB client to `SQLDatabase`                        | `MySQLClientLike`                                        |
-| `createSQLiteSQLProvider(client)`                          | Adapt a SQLite client to `SQLDatabase`                               | `SQLiteClientLike`                                       |
+| `createNuxtHubKVProvider(client)`                          | Adapt NuxtHub/Unstorage-style KV clients to `KVStorage`              | `NuxtHubKVLike`                                          |
+| `createPostgreSQLProvider(client, sqlTag?)`                | Adapt PostgreSQL or Drizzle PostgreSQL clients                       | `PostgresClientLike, sqlTag?`                            |
+| `createMySQLProvider(client, sqlTag?)`                     | Adapt MySQL/MariaDB or Drizzle MySQL/MariaDB clients                 | `MySQLClientLike, sqlTag?`                               |
+| `createSQLiteProvider(client, sqlTag?)`                    | Adapt SQLite/D1 or Drizzle SQLite/D1 clients                         | `SQLiteClientLike, sqlTag?`                              |
+| `createDrizzleSQLProvider(client, sqlTag)`                 | Generic Drizzle adapter (optional helper)                            | `DrizzleClientLike, DrizzleSqlTagLike`                   |
 | `createHyperdrivePostgresProvider(binding, clientFactory)` | Create a PostgreSQL `SQLDatabase` adapter using a Hyperdrive binding | `HyperdriveBindingLike, HyperdrivePostgresClientFactory` |
 | `createHyperdriveMySQLProvider(binding, clientFactory)`    | Create a MySQL `SQLDatabase` adapter using a Hyperdrive binding      | `HyperdriveBindingLike, HyperdriveMySQLClientFactory`    |
 | `isKVStorage(value)`                                       | Runtime guard for `KVStorage`                                        | `unknown`                                                |
@@ -990,7 +1196,10 @@ CollegeDB exports TypeScript types for better development experience and type sa
 | ----------------------- | ------------------------------ | --------------------------------------------------- |
 | `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                          |
 | `KVStorage`             | Provider-agnostic KV contract  | `createRedisKVProvider(redisClient)`                |
-| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgresSQLProvider(pgPool)`                 |
+| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgreSQLProvider(pgPool)`                  |
+| `NuxtHubKVLike`         | NuxtHub/Unstorage KV contract  | `createNuxtHubKVProvider(kv)`                       |
+| `DrizzleClientLike`     | Minimal Drizzle DB contract    | `createPostgreSQLProvider(drizzleDb, sql)`          |
+| `DrizzleSqlTagLike`     | Drizzle SQL tag contract       | `createSQLiteProvider(drizzleDb, sql)`              |
 | `QueryResult`           | Standard query response shape  | `{ success, results, meta }`                        |
 | `QueryResultMeta`       | Query execution metadata       | `{ duration, changes?, last_row_id? }`              |
 | `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'` |
@@ -1026,7 +1235,7 @@ const config: CollegeDBConfig = {
 };
 ```
 
-## 🏗 Architecture
+## Architecture
 
 ```txt
 ┌─────────────────────────────────────────────────────────────┐
@@ -1097,7 +1306,7 @@ const config: CollegeDBConfig = {
 - **Random**: Random shard selection for load balancing
 - **Location**: Geographic proximity-based allocation for optimal latency
 
-## 🌐 Cloudflare Setup
+## Cloudflare Setup
 
 ### 1. Create D1 Databases
 
@@ -1301,7 +1510,7 @@ wrangler deploy
 wrangler deploy --env production
 ```
 
-## 📊 Monitoring and Maintenance
+## Monitoring and Maintenance
 
 ### Shard Statistics
 
@@ -1585,7 +1794,7 @@ export default {
 };
 ```
 
-## ⚙️ Performance Analysis
+## Performance Analysis
 
 ### Scaling Performance Comparison
 
@@ -1975,7 +2184,7 @@ initialize({
 - Cost-sensitive deployments at small scale
 - **Single-strategy applications** where reads and writes have identical performance needs
 
-## �🔧 Advanced Configuration
+## Advanced Configuration
 
 ### Custom Allocation Strategy
 
@@ -2292,7 +2501,7 @@ async function allocateWithFallback(coordinator: DurableObjectNamespace, primary
 }
 ```
 
-## 🚀 Quick Reference
+## Quick Reference
 
 ### Strategy Selection Guide
 
@@ -2410,7 +2619,7 @@ async function allocateWithFallback(coordinator: DurableObjectNamespace, primary
 | `me`   | Middle East           | Dubai            |
 | `af`   | Africa                | Johannesburg     |
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
@@ -2418,18 +2627,18 @@ async function allocateWithFallback(coordinator: DurableObjectNamespace, primary
 4. Push to branch: `git push origin feature/amazing-feature`
 5. Submit a pull request
 
-## 📝 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🔗 Links
+## Links
 
 - [Cloudflare D1 Documentation](https://developers.cloudflare.com/d1/)
 - [Cloudflare KV Documentation](https://developers.cloudflare.com/kv/)
 - [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
 - [Durable Objects Documentation](https://developers.cloudflare.com/durable-objects/)
 
-## 🆘 Support
+## Support
 
 - 📖 [Documentation](https://earth-app.github.io/CollegeDB)
 - 🐛 [Report Issues](https://github.com/earth-app/CollegeDB/issues)

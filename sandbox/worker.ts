@@ -1,11 +1,14 @@
 import type { D1Database, DurableObjectNamespace, KVNamespace } from '@cloudflare/workers-types';
+import { sql as drizzleSql } from 'drizzle-orm';
+import { drizzle as drizzleD1 } from 'drizzle-orm/d1';
 import {
-	ShardCoordinator,
 	all,
 	allAllShards,
 	allShard,
 	createMappingsForExistingKeys,
+	createNuxtHubKVProvider,
 	createSchemaAcrossShards,
+	createSQLiteProvider,
 	first,
 	flush,
 	getShardStats,
@@ -13,10 +16,11 @@ import {
 	listKnownShards,
 	run,
 	runAllShards,
-	runShard
-} from '../src/index.js';
-import { KVShardMapper } from '../src/kvmap.js';
-import type { CollegeDBConfig } from '../src/types.js';
+	runShard,
+	ShardCoordinator
+} from '../src/index';
+import { KVShardMapper } from '../src/kvmap';
+import type { CollegeDBConfig } from '../src/types';
 
 export { ShardCoordinator };
 
@@ -27,6 +31,8 @@ interface Env {
 	'db-west': D1Database;
 	'db-central': D1Database;
 }
+
+type SandboxProfile = 'native' | 'drizzle' | 'nuxthub';
 
 const BENCH_SCHEMA = `
 	CREATE TABLE IF NOT EXISTS users (
@@ -58,14 +64,73 @@ function json(data: unknown, status = 200): Response {
 	});
 }
 
-function buildConfig(env: Env): CollegeDBConfig {
+function createNuxtHubKVCompatClient(kv: KVNamespace): {
+	get: <T = unknown>(key: string) => Promise<T | null>;
+	set: (key: string, value: unknown) => Promise<void>;
+	del: (key: string) => Promise<void>;
+	keys: (prefix?: string) => Promise<string[]>;
+} {
 	return {
-		kv: env.KV as any,
+		get: async <T = unknown>(key: string) => (await kv.get(key, 'text')) as T | null,
+		set: async (key: string, value: unknown) => {
+			const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+			await kv.put(key, serialized);
+		},
+		del: async (key: string) => {
+			await kv.delete(key);
+		},
+		keys: async (prefix: string = '') => {
+			const allKeys: string[] = [];
+			let cursor: string | undefined;
+
+			do {
+				const result = await kv.list({ prefix, cursor, limit: 1000 });
+				for (const item of result.keys) {
+					allKeys.push(item.name);
+				}
+				cursor = result.list_complete ? undefined : result.cursor;
+			} while (cursor);
+
+			return allKeys;
+		}
+	};
+}
+
+function createDrizzleD1CompatProvider(db: D1Database) {
+	const drizzleDb = drizzleD1(db) as any;
+	return createSQLiteProvider(
+		{
+			run: async (query: unknown) => await drizzleDb.run(query as any),
+			all: async (query: unknown) => await drizzleDb.all(query as any),
+			get: async (query: unknown) => await drizzleDb.get(query as any),
+			execute: async (query: unknown) => await drizzleDb.run(query as any)
+		},
+		drizzleSql as any
+	);
+}
+
+function normalizeProfile(raw: string | null): SandboxProfile {
+	if (raw === 'drizzle' || raw === 'nuxthub') {
+		return raw;
+	}
+	return 'native';
+}
+
+function buildConfig(env: Env, profile: SandboxProfile): CollegeDBConfig {
+	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
+	const shardA = useDrizzle ? createDrizzleD1CompatProvider(env['db-east']) : (env['db-east'] as any);
+	const shardB = useDrizzle ? createDrizzleD1CompatProvider(env['db-west']) : (env['db-west'] as any);
+	const shardC = useDrizzle ? createDrizzleD1CompatProvider(env['db-central']) : (env['db-central'] as any);
+
+	const kv = profile === 'nuxthub' ? createNuxtHubKVProvider(createNuxtHubKVCompatClient(env.KV)) : (env.KV as any);
+
+	return {
+		kv,
 		coordinator: env.ShardCoordinator as any,
 		shards: {
-			'db-east': env['db-east'] as any,
-			'db-west': env['db-west'] as any,
-			'db-central': env['db-central'] as any
+			'db-east': shardA,
+			'db-west': shardB,
+			'db-central': shardC
 		},
 		strategy: 'hash',
 		disableAutoMigration: true,
@@ -121,8 +186,9 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 		const { pathname, searchParams } = url;
+		const profile = normalizeProfile(searchParams.get('profile'));
 
-		const config = buildConfig(env);
+		const config = buildConfig(env, profile);
 		initialize(config);
 
 		try {
