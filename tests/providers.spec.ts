@@ -1,14 +1,16 @@
+import { sql as drizzleSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { KVShardMapper } from '../src/kvmap.js';
+import { KVShardMapper } from '../src/kvmap';
 import {
 	createHyperdriveMySQLProvider,
 	createHyperdrivePostgresProvider,
 	createMySQLProvider,
+	createNuxtHubKVProvider,
 	createPostgreSQLProvider,
 	createRedisKVProvider,
 	createSQLiteProvider,
 	createValkeyKVProvider
-} from '../src/providers.js';
+} from '../src/providers';
 
 class MockRedisClient {
 	private readonly store = new Map<string, string>();
@@ -79,6 +81,81 @@ class InstrumentedKVStorage {
 			.map((name) => ({ name }));
 		return { keys };
 	}
+}
+
+class MockNuxtHubKV {
+	private readonly store = new Map<string, unknown>();
+
+	async get<T = unknown>(key: string): Promise<T | null> {
+		return (this.store.get(key) as T | undefined) ?? null;
+	}
+
+	async set(key: string, value: unknown): Promise<void> {
+		this.store.set(key, value);
+	}
+
+	async del(key: string): Promise<void> {
+		this.store.delete(key);
+	}
+
+	async keys(prefix: string = ''): Promise<string[]> {
+		return Array.from(this.store.keys()).filter((key) => key.startsWith(prefix));
+	}
+}
+
+class MockUnstorageKV {
+	private readonly store = new Map<string, unknown>();
+
+	async getItem<T = unknown>(key: string): Promise<T | null> {
+		return (this.store.get(key) as T | undefined) ?? null;
+	}
+
+	async setItem(key: string, value: unknown): Promise<void> {
+		this.store.set(key, value);
+	}
+
+	async removeItem(key: string): Promise<void> {
+		this.store.delete(key);
+	}
+
+	async getKeys(prefix: string = ''): Promise<string[]> {
+		return Array.from(this.store.keys()).filter((key) => key.startsWith(prefix));
+	}
+}
+
+type MockDrizzleChunk = {
+	text: string;
+	params: any[];
+	append(chunk: MockDrizzleChunk): void;
+};
+
+function createMockDrizzleSqlTag() {
+	const createChunk = (text: string, params: any[] = []): MockDrizzleChunk => ({
+		text,
+		params: [...params],
+		append(chunk: MockDrizzleChunk) {
+			this.text += chunk.text;
+			this.params.push(...chunk.params);
+		}
+	});
+
+	const tag = ((strings: TemplateStringsArray, ...params: any[]) => {
+		let text = strings[0] ?? '';
+		for (let i = 0; i < params.length; i++) {
+			text += `?${strings[i + 1] ?? ''}`;
+		}
+
+		return createChunk(text, params);
+	}) as {
+		(strings: TemplateStringsArray, ...params: any[]): MockDrizzleChunk;
+		raw(sql: string): MockDrizzleChunk;
+		empty(): MockDrizzleChunk;
+	};
+
+	tag.raw = (sql: string) => createChunk(sql, []);
+	tag.empty = () => createChunk('', []);
+
+	return tag;
 }
 
 function extractPattern(args: any[]): string {
@@ -227,6 +304,137 @@ describe('Provider Adapters', () => {
 		const result = await provider.prepare('SELECT 1').all<{ ok: boolean }>();
 		expect(result.results[0]?.ok).toBe(true);
 		expect(capturedConnectionString).toBe('mysql://hyperdrive-host/db');
+	});
+
+	it('supports Drizzle interop via createPostgreSQLProvider', async () => {
+		const sqlTag = createMockDrizzleSqlTag();
+		let capturedQuery: MockDrizzleChunk | undefined;
+
+		const provider = createPostgreSQLProvider(
+			{
+				async execute(query: unknown) {
+					capturedQuery = query as MockDrizzleChunk;
+					return {
+						rows: [{ id: 'user-1', email: 'alice@example.com' }],
+						rowCount: 1
+					};
+				}
+			},
+			sqlTag
+		);
+
+		const result = await provider
+			.prepare("SELECT * FROM users WHERE id = ? AND note = '?' AND email = ?")
+			.bind('user-1', 'alice@example.com')
+			.all<{ id: string; email: string }>();
+
+		expect(result.results[0]?.id).toBe('user-1');
+		expect(result.results[0]?.email).toBe('alice@example.com');
+		expect(capturedQuery?.text).toBe("SELECT * FROM users WHERE id = ? AND note = '?' AND email = ?");
+		expect(capturedQuery?.params).toEqual(['user-1', 'alice@example.com']);
+	});
+
+	it('supports Drizzle interop via createSQLiteProvider with real drizzle-orm sql tag', async () => {
+		let capturedQuery: unknown;
+		const provider = createSQLiteProvider(
+			{
+				async execute(query: unknown) {
+					capturedQuery = query;
+					return {
+						rows: [{ id: 'drizzle-user-1' }],
+						rowCount: 1
+					};
+				}
+			},
+			drizzleSql as any
+		);
+
+		const row = await provider.prepare('SELECT ? AS id').bind('drizzle-user-1').first<{ id: string }>();
+		expect(row?.id).toBe('drizzle-user-1');
+		expect(capturedQuery).toBeTruthy();
+	});
+
+	it('supports Drizzle first() when get() returns a plain row object', async () => {
+		const sqlTag = createMockDrizzleSqlTag();
+
+		const provider = createSQLiteProvider(
+			{
+				async get() {
+					return { id: 'plain-row-1', email: 'plain@example.com' };
+				}
+			},
+			sqlTag
+		);
+
+		const row = await provider.prepare('SELECT id, email FROM users WHERE id = ?').bind('plain-row-1').first<{
+			id: string;
+			email: string;
+		}>();
+
+		expect(row?.id).toBe('plain-row-1');
+		expect(row?.email).toBe('plain@example.com');
+	});
+
+	it('supports Drizzle interop via createMySQLProvider', async () => {
+		const sqlTag = createMockDrizzleSqlTag();
+
+		const provider = createMySQLProvider(
+			{
+				async run(query: unknown) {
+					const sqlChunk = query as MockDrizzleChunk;
+					if (sqlChunk.text.startsWith('INSERT')) {
+						return { changes: 1, lastInsertId: 88 };
+					}
+					return { rows: [{ ok: true }] };
+				}
+			},
+			sqlTag
+		);
+
+		const write = await provider.prepare('INSERT INTO users (id) VALUES (?)').bind('u-1').run();
+		expect(write.meta.changes).toBe(1);
+		expect(write.meta.last_row_id).toBe(88);
+	});
+
+	it('supports Drizzle all() when mysql driver returns [rows, fields] tuple', async () => {
+		const sqlTag = createMockDrizzleSqlTag();
+
+		const provider = createMySQLProvider(
+			{
+				async all() {
+					return [[{ count: 3 }], [{ name: 'count' }]];
+				}
+			},
+			sqlTag
+		);
+
+		const result = await provider.prepare('SELECT COUNT(*) AS count FROM users').all<{ count: number }>();
+		expect(result.results).toEqual([{ count: 3 }]);
+	});
+
+	it('supports NuxtHub KV adapter (@nuxthub/kv style)', async () => {
+		const nuxtHubKV = new MockNuxtHubKV();
+		const kv = createNuxtHubKVProvider(nuxtHubKV as any);
+
+		await kv.put('shard:user:1', JSON.stringify({ shard: 'db-east' }));
+		const mapping = await kv.get<{ shard: string }>('shard:user:1', 'json');
+		expect(mapping?.shard).toBe('db-east');
+
+		await kv.put('shard:user:2', JSON.stringify({ shard: 'db-west' }));
+		const listed = await kv.list({ prefix: 'shard:user:' });
+		expect(listed.keys.map((k) => k.name).sort()).toEqual(['shard:user:1', 'shard:user:2']);
+
+		await kv.delete('shard:user:1');
+		expect(await kv.get('shard:user:1')).toBeNull();
+	});
+
+	it('supports NuxtHub KV adapter (unstorage style)', async () => {
+		const storage = new MockUnstorageKV();
+		const kv = createNuxtHubKVProvider(storage as any);
+
+		await kv.put('known_shards', JSON.stringify(['db-east', 'db-west']));
+		const shards = await kv.get<string[]>('known_shards', 'json');
+		expect(shards).toEqual(['db-east', 'db-west']);
 	});
 });
 

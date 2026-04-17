@@ -32,32 +32,38 @@ export {
 	run,
 	runAllShards,
 	runShard
-} from './router.js';
+} from './router';
 
 // Export utility classes
-export { ShardCoordinator } from './durable.js';
-export { CollegeDBError } from './errors.js';
-export { KVShardMapper } from './kvmap.js';
+export { ShardCoordinator } from './durable';
+export { CollegeDBError } from './errors';
+export { KVShardMapper } from './kvmap';
 
 // Export provider adapters
 export {
+	createDrizzleSQLProvider,
 	createHyperdriveMySQLProvider,
 	createHyperdrivePostgresProvider,
-	createMySQLProvider as createMySQLSQLProvider,
-	createPostgreSQLProvider as createPostgresSQLProvider,
+	createMySQLProvider,
+	createNuxtHubKVProvider,
+	createPostgreSQLProvider,
 	createRedisKVProvider,
-	createSQLiteProvider as createSQLiteSQLProvider,
+	createSQLiteProvider,
 	createValkeyKVProvider,
 	isKVStorage,
 	isSQLDatabase,
+	type DrizzleClientLike,
+	type DrizzleSqlChunkLike,
+	type DrizzleSqlTagLike,
 	type HyperdriveBindingLike,
 	type HyperdriveMySQLClientFactory,
 	type HyperdrivePostgresClientFactory,
 	type MySQLClientLike,
+	type NuxtHubKVLike,
 	type PostgresClientLike,
 	type RedisLikeClient,
 	type SQLiteClientLike
-} from './providers.js';
+} from './providers';
 
 // Export migration functions
 export {
@@ -78,7 +84,7 @@ export {
 	type IntegrationOptions,
 	type IntegrationResult,
 	type ValidationResult
-} from './migrations.js';
+} from './migrations';
 
 // Export types
 export type {
@@ -98,4 +104,4 @@ export type {
 	ShardMapping,
 	ShardStats,
 	ShardingStrategy
-} from './types.js';
+} from './types';

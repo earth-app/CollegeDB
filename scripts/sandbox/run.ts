@@ -3,6 +3,10 @@
 /// <reference types="bun-types" />
 
 import { Database } from 'bun:sqlite';
+import { sql as drizzleSql } from 'drizzle-orm';
+import { drizzle as drizzleBunSQLite } from 'drizzle-orm/bun-sqlite';
+import { drizzle as drizzleMySQL } from 'drizzle-orm/mysql2';
+import { drizzle as drizzlePostgres } from 'drizzle-orm/node-postgres';
 import mysql from 'mysql2/promise';
 import { mkdir, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -14,12 +18,15 @@ import {
 	all,
 	allAllShards,
 	allShard,
+	createHyperdriveMySQLProvider,
+	createHyperdrivePostgresProvider,
 	createMappingsForExistingKeys,
-	createMySQLSQLProvider,
-	createPostgresSQLProvider,
+	createMySQLProvider,
+	createNuxtHubKVProvider,
+	createPostgreSQLProvider,
 	createRedisKVProvider,
 	createSchemaAcrossShards,
-	createSQLiteSQLProvider,
+	createSQLiteProvider,
 	createValkeyKVProvider,
 	first,
 	flush,
@@ -28,9 +35,9 @@ import {
 	run,
 	runAllShards,
 	runShard
-} from '../../src/index.js';
-import { KVShardMapper } from '../../src/kvmap.js';
-import type { CollegeDBConfig, KVStorage, SQLDatabase } from '../../src/types.js';
+} from '../../src/index';
+import { KVShardMapper } from '../../src/kvmap';
+import type { CollegeDBConfig, KVStorage, SQLDatabase } from '../../src/types';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..', '..');
@@ -42,6 +49,7 @@ const WRANGLER_BIN = resolve(PROJECT_ROOT, 'node_modules', '.bin', 'wrangler');
 
 const ALL_DATABASES = ['postgres', 'mysql', 'mariadb', 'sqlite'] as const;
 const ALL_KV = ['redis', 'valkey'] as const;
+const ALL_ADAPTER_PROFILES = ['native', 'drizzle', 'hyperdrive', 'nuxthub'] as const;
 const SCENARIO_NAMES = [
 	'basic_crud',
 	'advanced_usage',
@@ -57,12 +65,14 @@ const SCENARIO_NAMES = [
 
 type DatabaseFlavor = (typeof ALL_DATABASES)[number];
 type KVFlavor = (typeof ALL_KV)[number];
+type AdapterProfile = (typeof ALL_ADAPTER_PROFILES)[number];
 type ScenarioName = (typeof SCENARIO_NAMES)[number];
 type Status = 'passed' | 'failed' | 'skipped';
 
 interface CLIOptions {
 	db: DatabaseFlavor | 'all';
 	kv: KVFlavor | 'all';
+	profile: AdapterProfile | 'all';
 	iterations: number;
 	bulkSize: number;
 	includeCloudflare: boolean;
@@ -91,6 +101,8 @@ interface ScenarioStats {
 
 interface ComboResult {
 	id: string;
+	baseId: string;
+	profile: AdapterProfile;
 	db: DatabaseFlavor | 'cloudflare';
 	kv: KVFlavor | 'cloudflare-kv';
 	status: Status;
@@ -224,22 +236,30 @@ async function main(): Promise<void> {
 	const comboResults: ComboResult[] = [];
 
 	for (const combo of combos) {
-		console.log(`\n[Sandbox] Running ${combo.id}...`);
-		const result = await benchmarkCombo(combo, options);
-		comboResults.push(result);
-		console.log(`[Sandbox] ${combo.id} => ${result.status}`);
+		const profiles = profilesForCombo(combo.db, options.profile);
+		for (const profile of profiles) {
+			console.log(`\n[Sandbox] Running ${combo.id} (${profile})...`);
+			const result = await benchmarkCombo(combo, profile, options);
+			comboResults.push(result);
+			console.log(`[Sandbox] ${combo.id} (${profile}) => ${result.status}`);
+		}
 	}
 
-	let cloudflareResult: ComboResult | null = null;
+	const cloudflareResults: ComboResult[] = [];
 	if (options.includeCloudflare || options.cloudflareOnly) {
-		console.log('\n[Sandbox] Running cloudflare (wrangler dev local) benchmark...');
-		cloudflareResult = await benchmarkCloudflare(options);
-		console.log(`[Sandbox] cloudflare => ${cloudflareResult.status}`);
+		for (const profile of profilesForCloudflare(options.profile)) {
+			console.log(`\n[Sandbox] Running cloudflare (${profile}) benchmark...`);
+			const result = await benchmarkCloudflare(options, profile);
+			cloudflareResults.push(result);
+			console.log(`[Sandbox] cloudflare (${profile}) => ${result.status}`);
+		}
 	}
 
-	const markdown = buildMarkdownReport(options, comboResults, cloudflareResult);
+	const markdown = buildMarkdownReport(options, comboResults, cloudflareResults);
 	const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-	const scope = options.cloudflareOnly ? 'cloudflare' : `${options.db}-${options.kv}${options.includeCloudflare ? '-plus-cloudflare' : ''}`;
+	const scope = options.cloudflareOnly
+		? 'cloudflare'
+		: `${options.db}-${options.kv}-${options.profile}${options.includeCloudflare ? '-plus-cloudflare' : ''}`;
 	const outPath = join(RESULTS_DIR, `sandbox-latency-${scope}-${timestamp}.md`);
 	const latestPath = join(RESULTS_DIR, 'latest.md');
 
@@ -250,7 +270,7 @@ async function main(): Promise<void> {
 	console.log(`[Sandbox] Latest report updated: ${latestPath}\n`);
 	printMarkdownAnsi(markdown);
 
-	const hasFailures = comboResults.some((r) => r.status === 'failed') || cloudflareResult?.status === 'failed';
+	const hasFailures = [...comboResults, ...cloudflareResults].some((r) => r.status === 'failed');
 	if (hasFailures) {
 		process.exitCode = 1;
 	}
@@ -260,6 +280,7 @@ function parseArgs(args: string[]): CLIOptions {
 	const defaults: CLIOptions = {
 		db: 'all',
 		kv: 'all',
+		profile: 'all',
 		iterations: 20,
 		bulkSize: 160,
 		includeCloudflare: false,
@@ -277,6 +298,9 @@ function parseArgs(args: string[]): CLIOptions {
 			} else {
 				throw new Error(`Unsupported --kv value: ${raw}`);
 			}
+		} else if (arg.startsWith('--profile=')) {
+			const raw = arg.slice('--profile='.length).trim().toLowerCase();
+			defaults.profile = normalizeProfile(raw);
 		} else if (arg.startsWith('--iterations=')) {
 			defaults.iterations = Math.max(1, Number.parseInt(arg.slice('--iterations='.length), 10) || defaults.iterations);
 		} else if (arg.startsWith('--bulk-size=')) {
@@ -308,6 +332,35 @@ function normalizeDb(raw: string): DatabaseFlavor | 'all' {
 	throw new Error(`Unsupported --db value: ${raw}`);
 }
 
+function normalizeProfile(raw: string): AdapterProfile | 'all' {
+	if (raw === 'all') {
+		return 'all';
+	}
+	if ((ALL_ADAPTER_PROFILES as readonly string[]).includes(raw)) {
+		return raw as AdapterProfile;
+	}
+	throw new Error(`Unsupported --profile value: ${raw}`);
+}
+
+function profilesForCombo(dbFlavor: DatabaseFlavor, profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
+	const supported =
+		dbFlavor === 'sqlite' ? (['native', 'drizzle', 'nuxthub'] as const) : (['native', 'drizzle', 'hyperdrive', 'nuxthub'] as const);
+
+	if (profileFilter === 'all') {
+		return [...supported];
+	}
+
+	return supported.includes(profileFilter) ? [profileFilter] : [];
+}
+
+function profilesForCloudflare(profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
+	const supported = ['native', 'drizzle', 'nuxthub'] as const;
+	if (profileFilter === 'all') {
+		return [...supported];
+	}
+	return supported.includes(profileFilter) ? [profileFilter] : [];
+}
+
 function buildCombos(dbFilter: DatabaseFlavor | 'all', kvFilter: KVFlavor | 'all'): Combo[] {
 	const dbs = dbFilter === 'all' ? [...ALL_DATABASES] : [dbFilter];
 	const kvs = kvFilter === 'all' ? [...ALL_KV] : [kvFilter];
@@ -329,13 +382,14 @@ async function ensureDockerComposeReady(): Promise<void> {
 	}
 }
 
-async function benchmarkCombo(combo: Combo, options: CLIOptions): Promise<ComboResult> {
+async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CLIOptions): Promise<ComboResult> {
 	const started = performance.now();
 	const scenarios = createSkippedScenarioMap('Not run');
 	const services = composeServicesForCombo(combo);
 	let kvRuntime: KVRuntime | null = null;
 	let sqlRuntime: SQLRuntime | null = null;
 	let initialized = false;
+	const resultId = `${combo.id}/${profile}`;
 
 	try {
 		await composeDown();
@@ -343,9 +397,9 @@ async function benchmarkCombo(combo: Combo, options: CLIOptions): Promise<ComboR
 			await composeUp(services);
 		}
 
-		const runId = createRunId(combo.id);
-		kvRuntime = await createKVRuntime(combo.kv);
-		sqlRuntime = await createSQLRuntime(combo.db, runId);
+		const runId = createRunId(resultId);
+		kvRuntime = await createKVRuntime(combo.kv, profile);
+		sqlRuntime = await createSQLRuntime(combo.db, runId, profile);
 
 		const config: CollegeDBConfig = {
 			kv: kvRuntime.kv,
@@ -395,7 +449,9 @@ async function benchmarkCombo(combo: Combo, options: CLIOptions): Promise<ComboR
 
 		const status: Status = Object.values(scenarios).some((scenario) => scenario.status === 'failed') ? 'failed' : 'passed';
 		return {
-			id: combo.id,
+			id: resultId,
+			baseId: combo.id,
+			profile,
 			db: combo.db,
 			kv: combo.kv,
 			status,
@@ -406,7 +462,9 @@ async function benchmarkCombo(combo: Combo, options: CLIOptions): Promise<ComboR
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return {
-			id: combo.id,
+			id: resultId,
+			baseId: combo.id,
+			profile,
 			db: combo.db,
 			kv: combo.kv,
 			status: 'failed',
@@ -432,9 +490,10 @@ async function benchmarkCombo(combo: Combo, options: CLIOptions): Promise<ComboR
 	}
 }
 
-async function benchmarkCloudflare(options: CLIOptions): Promise<ComboResult> {
+async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile): Promise<ComboResult> {
 	const scenarios = createSkippedScenarioMap('Not run');
 	const started = performance.now();
+	const resultId = `cloudflare/${profile}`;
 
 	const wranglerArgs = [
 		WRANGLER_BIN,
@@ -460,52 +519,58 @@ async function benchmarkCloudflare(options: CLIOptions): Promise<ComboResult> {
 	const stderrPromise = new Response(proc.stderr).text();
 
 	try {
-		await waitForHttp('http://127.0.0.1:8787/health', 90_000);
-		await assertOk(await fetch('http://127.0.0.1:8787/init', { method: 'POST' }), 'POST /init');
+		await waitForHttp(cloudflareUrl('/health', profile), 90_000);
+		await assertOk(await fetch(cloudflareUrl('/init', profile), { method: 'POST' }), 'POST /init');
 
 		const plan = buildIterationPlan(Math.max(8, options.iterations));
 
-		await resetCloudflareBenchmarkData();
-		scenarios.basic_crud = await scenarioCloudflareBasicCrud(Math.max(6, Math.floor(plan.basic / 2)));
+		await resetCloudflareBenchmarkData(profile);
+		scenarios.basic_crud = await scenarioCloudflareBasicCrud(Math.max(6, Math.floor(plan.basic / 2)), profile);
 
-		await resetCloudflareBenchmarkData();
-		scenarios.advanced_usage = await scenarioCloudflareAdvanced(Math.max(5, Math.floor(plan.advanced / 2)));
+		await resetCloudflareBenchmarkData(profile);
+		scenarios.advanced_usage = await scenarioCloudflareAdvanced(Math.max(5, Math.floor(plan.advanced / 2)), profile);
 
-		await resetCloudflareBenchmarkData();
+		await resetCloudflareBenchmarkData(profile);
 		scenarios.migration_mapping = await scenarioCloudflareMigration(
 			Math.max(4, Math.floor(plan.migration / 2)),
-			Math.max(12, Math.floor(options.bulkSize / 6))
+			Math.max(12, Math.floor(options.bulkSize / 6)),
+			profile
 		);
 
-		await resetCloudflareBenchmarkData();
+		await resetCloudflareBenchmarkData(profile);
 		scenarios.bulk_crud = await scenarioCloudflareBulk(
 			Math.max(3, Math.floor(plan.bulk / 2)),
-			Math.max(20, Math.floor(options.bulkSize / 4))
+			Math.max(20, Math.floor(options.bulkSize / 4)),
+			profile
 		);
 
-		await resetCloudflareBenchmarkData();
+		await resetCloudflareBenchmarkData(profile);
 		scenarios.indexing = await scenarioCloudflareIndexing(
 			Math.max(4, Math.floor(plan.indexing / 2)),
-			Math.max(60, Math.floor(options.bulkSize * 0.75))
+			Math.max(60, Math.floor(options.bulkSize * 0.75)),
+			profile
 		);
 
-		scenarios.metadata_fetch = await scenarioCloudflareMetadata(Math.max(6, Math.floor(plan.metadata / 2)));
-		scenarios.pragma_or_info = await scenarioCloudflarePragma(Math.max(6, Math.floor(plan.pragma / 2)));
+		scenarios.metadata_fetch = await scenarioCloudflareMetadata(Math.max(6, Math.floor(plan.metadata / 2)), profile);
+		scenarios.pragma_or_info = await scenarioCloudflarePragma(Math.max(6, Math.floor(plan.pragma / 2)), profile);
 
-		await resetCloudflareBenchmarkData();
+		await resetCloudflareBenchmarkData(profile);
 		scenarios.counting = await scenarioCloudflareCounting(
 			Math.max(6, Math.floor(plan.counting / 2)),
-			Math.max(30, Math.floor(options.bulkSize / 2))
+			Math.max(30, Math.floor(options.bulkSize / 2)),
+			profile
 		);
 
-		scenarios.shard_fanout = await scenarioCloudflareFanout(Math.max(6, Math.floor(plan.fanout / 2)));
+		scenarios.shard_fanout = await scenarioCloudflareFanout(Math.max(6, Math.floor(plan.fanout / 2)), profile);
 
-		await resetCloudflareBenchmarkData();
-		scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)));
+		await resetCloudflareBenchmarkData(profile);
+		scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
 
 		const status: Status = Object.values(scenarios).some((scenario) => scenario.status === 'failed') ? 'failed' : 'passed';
 		return {
-			id: 'cloudflare',
+			id: resultId,
+			baseId: 'cloudflare',
+			profile,
 			db: 'cloudflare',
 			kv: 'cloudflare-kv',
 			status,
@@ -518,7 +583,9 @@ async function benchmarkCloudflare(options: CLIOptions): Promise<ComboResult> {
 		const stderr = await stderrPromise;
 		const stdout = await stdoutPromise;
 		return {
-			id: 'cloudflare',
+			id: resultId,
+			baseId: 'cloudflare',
+			profile,
 			db: 'cloudflare',
 			kv: 'cloudflare-kv',
 			status: 'failed',
@@ -762,7 +829,12 @@ async function scenarioReassignment(iterations: number, config: CollegeDBConfig)
 	});
 }
 
-async function scenarioCloudflareBasicCrud(iterations: number): Promise<ScenarioStats> {
+function cloudflareUrl(path: string, profile: AdapterProfile): string {
+	const separator = path.includes('?') ? '&' : '?';
+	return `http://127.0.0.1:8787${path}${separator}profile=${encodeURIComponent(profile)}`;
+}
+
+async function scenarioCloudflareBasicCrud(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('basic_crud', iterations, async (i) => {
 		const id = `cf-user-${Date.now()}-${i}`;
 		const payload = {
@@ -772,7 +844,7 @@ async function scenarioCloudflareBasicCrud(iterations: number): Promise<Scenario
 		};
 
 		await assertOk(
-			await fetch('http://127.0.0.1:8787/api/users', {
+			await fetch(cloudflareUrl('/api/users', profile), {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(payload)
@@ -780,10 +852,10 @@ async function scenarioCloudflareBasicCrud(iterations: number): Promise<Scenario
 			'POST /api/users'
 		);
 
-		await assertOk(await fetch(`http://127.0.0.1:8787/api/users?id=${encodeURIComponent(id)}`), 'GET /api/users');
+		await assertOk(await fetch(cloudflareUrl(`/api/users?id=${encodeURIComponent(id)}`, profile)), 'GET /api/users');
 
 		await assertOk(
-			await fetch('http://127.0.0.1:8787/api/users', {
+			await fetch(cloudflareUrl('/api/users', profile), {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -795,23 +867,26 @@ async function scenarioCloudflareBasicCrud(iterations: number): Promise<Scenario
 			'PUT /api/users'
 		);
 
-		await assertOk(await fetch(`http://127.0.0.1:8787/api/users?id=${encodeURIComponent(id)}`, { method: 'DELETE' }), 'DELETE /api/users');
+		await assertOk(
+			await fetch(cloudflareUrl(`/api/users?id=${encodeURIComponent(id)}`, profile), { method: 'DELETE' }),
+			'DELETE /api/users'
+		);
 	});
 }
 
-async function scenarioCloudflareAdvanced(iterations: number): Promise<ScenarioStats> {
+async function scenarioCloudflareAdvanced(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('advanced_usage', iterations, async () => {
-		await assertOk(await fetch('http://127.0.0.1:8787/api/stats'), 'GET /api/stats');
-		await assertOk(await fetch('http://127.0.0.1:8787/api/shards'), 'GET /api/shards');
+		await assertOk(await fetch(cloudflareUrl('/api/stats', profile)), 'GET /api/stats');
+		await assertOk(await fetch(cloudflareUrl('/api/shards', profile)), 'GET /api/shards');
 	});
 }
 
-async function scenarioCloudflareBulk(iterations: number, bulkSize: number): Promise<ScenarioStats> {
+async function scenarioCloudflareBulk(iterations: number, bulkSize: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('bulk_crud', iterations, async (i) => {
 		const ids = new Array(bulkSize).fill(null).map((_, idx) => `cf-bulk-${Date.now()}-${i}-${idx}`);
 		for (const id of ids) {
 			await assertOk(
-				await fetch('http://127.0.0.1:8787/api/users', {
+				await fetch(cloudflareUrl('/api/users', profile), {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({ id, name: `Bulk ${id}`, email: `${id}@bulk.cloudflare.local` })
@@ -819,16 +894,24 @@ async function scenarioCloudflareBulk(iterations: number, bulkSize: number): Pro
 				'POST /api/users (bulk)'
 			);
 		}
-		await assertOk(await fetch('http://127.0.0.1:8787/api/stats'), 'GET /api/stats');
+		await assertOk(await fetch(cloudflareUrl('/api/stats', profile)), 'GET /api/stats');
 	});
 }
 
-async function scenarioCloudflareMigration(iterations: number, recordsPerIteration: number): Promise<ScenarioStats> {
+async function scenarioCloudflareMigration(
+	iterations: number,
+	recordsPerIteration: number,
+	profile: AdapterProfile
+): Promise<ScenarioStats> {
 	return measureScenario('migration_mapping', iterations, async (i) => {
-		const response = await postCloudflareBenchmark('/api/benchmark/migration', {
-			prefix: `cf-migrate-${Date.now()}-${i}`,
-			records: recordsPerIteration
-		});
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/migration',
+			{
+				prefix: `cf-migrate-${Date.now()}-${i}`,
+				records: recordsPerIteration
+			},
+			profile
+		);
 		const body = (await response.json()) as { success?: boolean; mapped?: number };
 		if (!body?.success || typeof body.mapped !== 'number' || body.mapped <= 0) {
 			throw new Error('Cloudflare migration endpoint did not return mapped record count');
@@ -836,12 +919,16 @@ async function scenarioCloudflareMigration(iterations: number, recordsPerIterati
 	});
 }
 
-async function scenarioCloudflareIndexing(iterations: number, postsPerIteration: number): Promise<ScenarioStats> {
+async function scenarioCloudflareIndexing(iterations: number, postsPerIteration: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('indexing', iterations, async (i) => {
-		const response = await postCloudflareBenchmark('/api/benchmark/indexing', {
-			userId: `cf-index-${Date.now()}-${i}`,
-			posts: postsPerIteration
-		});
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/indexing',
+			{
+				userId: `cf-index-${Date.now()}-${i}`,
+				posts: postsPerIteration
+			},
+			profile
+		);
 		const body = (await response.json()) as { success?: boolean; rows?: number };
 		if (!body?.success || typeof body.rows !== 'number' || body.rows <= 0) {
 			throw new Error('Cloudflare indexing endpoint returned no rows');
@@ -849,9 +936,9 @@ async function scenarioCloudflareIndexing(iterations: number, postsPerIteration:
 	});
 }
 
-async function scenarioCloudflareMetadata(iterations: number): Promise<ScenarioStats> {
+async function scenarioCloudflareMetadata(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('metadata_fetch', iterations, async () => {
-		const response = await fetch('http://127.0.0.1:8787/api/benchmark/metadata');
+		const response = await fetch(cloudflareUrl('/api/benchmark/metadata', profile));
 		await assertOk(response, 'GET /api/benchmark/metadata');
 		const body = (await response.json()) as { success?: boolean; rows?: number };
 		if (!body?.success || typeof body.rows !== 'number' || body.rows <= 0) {
@@ -860,9 +947,9 @@ async function scenarioCloudflareMetadata(iterations: number): Promise<ScenarioS
 	});
 }
 
-async function scenarioCloudflarePragma(iterations: number): Promise<ScenarioStats> {
+async function scenarioCloudflarePragma(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('pragma_or_info', iterations, async () => {
-		const response = await fetch('http://127.0.0.1:8787/api/benchmark/pragma');
+		const response = await fetch(cloudflareUrl('/api/benchmark/pragma', profile));
 		await assertOk(response, 'GET /api/benchmark/pragma');
 		const body = (await response.json()) as { success?: boolean; value?: unknown };
 		if (!body?.success || body.value === undefined || body.value === null) {
@@ -871,18 +958,22 @@ async function scenarioCloudflarePragma(iterations: number): Promise<ScenarioSta
 	});
 }
 
-async function scenarioCloudflareCounting(iterations: number, seedCount: number): Promise<ScenarioStats> {
-	const seedResponse = await postCloudflareBenchmark('/api/benchmark/seed-users', {
-		prefix: `cf-count-seed-${Date.now()}`,
-		records: seedCount
-	});
+async function scenarioCloudflareCounting(iterations: number, seedCount: number, profile: AdapterProfile): Promise<ScenarioStats> {
+	const seedResponse = await postCloudflareBenchmark(
+		'/api/benchmark/seed-users',
+		{
+			prefix: `cf-count-seed-${Date.now()}`,
+			records: seedCount
+		},
+		profile
+	);
 	const seedBody = (await seedResponse.json()) as { success?: boolean; inserted?: number };
 	if (!seedBody?.success || typeof seedBody.inserted !== 'number' || seedBody.inserted <= 0) {
 		throw new Error('Cloudflare seed-users endpoint did not insert records for counting benchmark');
 	}
 
 	return measureScenario('counting', iterations, async () => {
-		const response = await fetch('http://127.0.0.1:8787/api/benchmark/counting');
+		const response = await fetch(cloudflareUrl('/api/benchmark/counting', profile));
 		await assertOk(response, 'GET /api/benchmark/counting');
 		const body = (await response.json()) as { success?: boolean; total?: number };
 		if (!body?.success || typeof body.total !== 'number' || body.total <= 0) {
@@ -891,9 +982,9 @@ async function scenarioCloudflareCounting(iterations: number, seedCount: number)
 	});
 }
 
-async function scenarioCloudflareFanout(iterations: number): Promise<ScenarioStats> {
+async function scenarioCloudflareFanout(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('shard_fanout', iterations, async () => {
-		const response = await fetch('http://127.0.0.1:8787/api/benchmark/fanout');
+		const response = await fetch(cloudflareUrl('/api/benchmark/fanout', profile));
 		await assertOk(response, 'GET /api/benchmark/fanout');
 		const body = (await response.json()) as { success?: boolean; total?: number };
 		if (!body?.success || typeof body.total !== 'number') {
@@ -902,11 +993,15 @@ async function scenarioCloudflareFanout(iterations: number): Promise<ScenarioSta
 	});
 }
 
-async function scenarioCloudflareReassignment(iterations: number): Promise<ScenarioStats> {
+async function scenarioCloudflareReassignment(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('reassignment', iterations, async (i) => {
-		const response = await postCloudflareBenchmark('/api/benchmark/reassignment', {
-			id: `cf-reassign-${Date.now()}-${i}`
-		});
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/reassignment',
+			{
+				id: `cf-reassign-${Date.now()}-${i}`
+			},
+			profile
+		);
 		const body = (await response.json()) as { success?: boolean; reassignedTo?: string };
 		if (!body?.success || !body.reassignedTo) {
 			throw new Error('Cloudflare reassignment endpoint did not report target shard');
@@ -914,12 +1009,12 @@ async function scenarioCloudflareReassignment(iterations: number): Promise<Scena
 	});
 }
 
-async function resetCloudflareBenchmarkData(): Promise<void> {
-	await assertOk(await fetch('http://127.0.0.1:8787/api/benchmark/reset', { method: 'POST' }), 'POST /api/benchmark/reset');
+async function resetCloudflareBenchmarkData(profile: AdapterProfile): Promise<void> {
+	await assertOk(await fetch(cloudflareUrl('/api/benchmark/reset', profile), { method: 'POST' }), 'POST /api/benchmark/reset');
 }
 
-async function postCloudflareBenchmark(path: string, payload: Record<string, unknown>): Promise<Response> {
-	const response = await fetch(`http://127.0.0.1:8787${path}`, {
+async function postCloudflareBenchmark(path: string, payload: Record<string, unknown>, profile: AdapterProfile): Promise<Response> {
+	const response = await fetch(cloudflareUrl(path, profile), {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(payload)
@@ -928,8 +1023,8 @@ async function postCloudflareBenchmark(path: string, payload: Record<string, unk
 	return response;
 }
 
-async function createKVRuntime(kvFlavor: KVFlavor): Promise<KVRuntime> {
-	const url = kvFlavor === 'redis' ? 'redis://127.0.0.1:6379' : 'redis://127.0.0.1:6380';
+async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Promise<KVRuntime> {
+	const url = kvFlavor === 'valkey' ? 'redis://127.0.0.1:6380' : 'redis://127.0.0.1:6379';
 	await waitForRedis(url);
 
 	const client: any = createRedisClient({
@@ -943,7 +1038,12 @@ async function createKVRuntime(kvFlavor: KVFlavor): Promise<KVRuntime> {
 	});
 	await client.connect();
 
-	const kv = kvFlavor === 'redis' ? createRedisKVProvider(client) : createValkeyKVProvider(client);
+	const kv =
+		profile === 'nuxthub'
+			? createNuxtHubKVProvider(createNuxtHubKVCompatClient(client))
+			: kvFlavor === 'redis'
+				? createRedisKVProvider(client)
+				: createValkeyKVProvider(client);
 	return {
 		kv,
 		close: async () => {
@@ -960,20 +1060,81 @@ async function createKVRuntime(kvFlavor: KVFlavor): Promise<KVRuntime> {
 	};
 }
 
-async function createSQLRuntime(dbFlavor: DatabaseFlavor, runId: string): Promise<SQLRuntime> {
-	switch (dbFlavor) {
-		case 'postgres':
-			return createPostgresRuntime(runId);
-		case 'mysql':
-			return createMySQLRuntime(runId, 3306);
-		case 'mariadb':
-			return createMySQLRuntime(runId, 3307);
-		case 'sqlite':
-			return createSQLiteRuntime(runId);
+function createNuxtHubKVCompatClient(client: any): {
+	get: (key: string) => Promise<string | null>;
+	set: (key: string, value: unknown) => Promise<void>;
+	del: (key: string) => Promise<void>;
+	keys: (prefix?: string) => Promise<string[]>;
+} {
+	return {
+		get: async (key: string) => {
+			const value = await client.get(key);
+			return value === null ? null : String(value);
+		},
+		set: async (key: string, value: unknown) => {
+			const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+			await client.set(key, serialized);
+		},
+		del: async (key: string) => {
+			await client.del(key);
+		},
+		keys: async (prefix: string = '') => {
+			const pattern = `${prefix}*`;
+			let cursor = '0';
+			const found: string[] = [];
+
+			do {
+				const scanResult = await scanRedisKeys(client, cursor, pattern);
+				cursor = scanResult.cursor;
+				for (const key of scanResult.keys) {
+					if (!prefix || key.startsWith(prefix)) {
+						found.push(key);
+					}
+				}
+			} while (cursor !== '0');
+
+			return found;
+		}
+	};
+}
+
+async function scanRedisKeys(client: any, cursor: string, pattern: string): Promise<{ cursor: string; keys: string[] }> {
+	try {
+		const objectResult = await client.scan(cursor, { MATCH: pattern, COUNT: 500 });
+		if (Array.isArray(objectResult)) {
+			return {
+				cursor: String(objectResult[0] ?? '0'),
+				keys: Array.isArray(objectResult[1]) ? objectResult[1] : []
+			};
+		}
+
+		return {
+			cursor: String(objectResult?.cursor ?? '0'),
+			keys: Array.isArray(objectResult?.keys) ? objectResult.keys : []
+		};
+	} catch {
+		const tupleResult = await client.scan(cursor, 'MATCH', pattern, 'COUNT', '500');
+		return {
+			cursor: String(tupleResult?.[0] ?? '0'),
+			keys: Array.isArray(tupleResult?.[1]) ? tupleResult[1] : []
+		};
 	}
 }
 
-async function createPostgresRuntime(runId: string): Promise<SQLRuntime> {
+async function createSQLRuntime(dbFlavor: DatabaseFlavor, runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
+	switch (dbFlavor) {
+		case 'postgres':
+			return createPostgresRuntime(runId, profile);
+		case 'mysql':
+			return createMySQLRuntime(runId, 3306, profile);
+		case 'mariadb':
+			return createMySQLRuntime(runId, 3307, profile);
+		case 'sqlite':
+			return createSQLiteRuntime(runId, profile);
+	}
+}
+
+async function createPostgresRuntime(runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
 	await waitForPostgres();
 
 	const dbA = sanitizeDatabaseName(`collegedb_a_${runId}`);
@@ -1014,10 +1175,27 @@ async function createPostgresRuntime(runId: string): Promise<SQLRuntime> {
 	await poolA.query('SELECT 1');
 	await poolB.query('SELECT 1');
 
+	const connA = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbA}`;
+	const connB = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbB}`;
+
+	const createPostgresProviderForProfile = (pool: PostgresPool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
+		switch (currentProfile) {
+			case 'native':
+				return createPostgreSQLProvider(pool as any);
+			case 'drizzle':
+			case 'nuxthub': {
+				const drizzleDb = drizzlePostgres(pool as any);
+				return createPostgreSQLProvider(drizzleDb as any, drizzleSql);
+			}
+			case 'hyperdrive':
+				return createHyperdrivePostgresProvider({ connectionString }, (conn) => new PostgresClient({ connectionString: conn }));
+		}
+	};
+
 	return {
 		shards: {
-			'shard-a': createPostgresSQLProvider(poolA as any),
-			'shard-b': createPostgresSQLProvider(poolB as any)
+			'shard-a': createPostgresProviderForProfile(poolA, connA, profile),
+			'shard-b': createPostgresProviderForProfile(poolB, connB, profile)
 		},
 		close: async () => {
 			await poolA.end();
@@ -1037,7 +1215,7 @@ async function createPostgresRuntime(runId: string): Promise<SQLRuntime> {
 	};
 }
 
-async function createMySQLRuntime(runId: string, port: number): Promise<SQLRuntime> {
+async function createMySQLRuntime(runId: string, port: number, profile: AdapterProfile): Promise<SQLRuntime> {
 	await waitForMySQL(port);
 
 	const dbA = sanitizeDatabaseName(`collegedb_a_${runId}`);
@@ -1075,10 +1253,36 @@ async function createMySQLRuntime(runId: string, port: number): Promise<SQLRunti
 	await poolA.query('SELECT 1');
 	await poolB.query('SELECT 1');
 
+	const connA = `mysql://root:root@127.0.0.1:${port}/${dbA}`;
+	const connB = `mysql://root:root@127.0.0.1:${port}/${dbB}`;
+
+	const createMySQLProviderForProfile = (pool: mysql.Pool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
+		switch (currentProfile) {
+			case 'native':
+				return createMySQLProvider(pool as any);
+			case 'drizzle':
+			case 'nuxthub': {
+				const drizzleDb = drizzleMySQL(pool as any);
+				return createMySQLProvider(drizzleDb as any, drizzleSql);
+			}
+			case 'hyperdrive':
+				return createHyperdriveMySQLProvider({ connectionString }, (conn) => ({
+					execute: async (sql: string, bindings: any[] = []) => {
+						const connection = await mysql.createConnection(conn);
+						try {
+							return await connection.execute(sql, bindings);
+						} finally {
+							await connection.end();
+						}
+					}
+				}));
+		}
+	};
+
 	return {
 		shards: {
-			'shard-a': createMySQLSQLProvider(poolA as any),
-			'shard-b': createMySQLSQLProvider(poolB as any)
+			'shard-a': createMySQLProviderForProfile(poolA, connA, profile),
+			'shard-b': createMySQLProviderForProfile(poolB, connB, profile)
 		},
 		close: async () => {
 			await poolA.end();
@@ -1096,17 +1300,25 @@ async function createMySQLRuntime(runId: string, port: number): Promise<SQLRunti
 	};
 }
 
-async function createSQLiteRuntime(runId: string): Promise<SQLRuntime> {
+async function createSQLiteRuntime(runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
 	const fileA = resolve(TMP_DIR, `${runId}-a.sqlite`);
 	const fileB = resolve(TMP_DIR, `${runId}-b.sqlite`);
 
 	const dbA = new Database(fileA, { create: true });
 	const dbB = new Database(fileB, { create: true });
+	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
+
+	const providerA = useDrizzle
+		? createSQLiteProvider(drizzleBunSQLite({ client: dbA }) as any, drizzleSql)
+		: createSQLiteProvider(dbA as any);
+	const providerB = useDrizzle
+		? createSQLiteProvider(drizzleBunSQLite({ client: dbB }) as any, drizzleSql)
+		: createSQLiteProvider(dbB as any);
 
 	return {
 		shards: {
-			'shard-a': createSQLiteSQLProvider(dbA as any),
-			'shard-b': createSQLiteSQLProvider(dbB as any)
+			'shard-a': providerA,
+			'shard-b': providerB
 		},
 		close: async () => {
 			dbA.close();
@@ -1263,7 +1475,6 @@ function composeServicesForCombo(combo: Combo): string[] {
 	if (combo.kv === 'valkey') {
 		services.add('valkey');
 	}
-
 	switch (combo.db) {
 		case 'postgres':
 			services.add('postgres');
@@ -1516,10 +1727,32 @@ function scenarioLabel(name: ScenarioName): string {
 	return SCENARIO_CATALOG[name]?.title ?? name;
 }
 
-function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], cloudflareResult: ComboResult | null): string {
+function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], cloudflareResults: ComboResult[]): string {
 	const generatedAt = new Date().toISOString();
 	const lines: string[] = [];
 	const catalogPlan = buildIterationPlan(options.iterations);
+	const groupedByBase = new Map<string, Map<AdapterProfile, ComboResult>>();
+
+	for (const result of comboResults) {
+		const byProfile = groupedByBase.get(result.baseId) ?? new Map<AdapterProfile, ComboResult>();
+		byProfile.set(result.profile, result);
+		groupedByBase.set(result.baseId, byProfile);
+	}
+
+	const groupedCloudflare = new Map<AdapterProfile, ComboResult>();
+	for (const result of cloudflareResults) {
+		groupedCloudflare.set(result.profile, result);
+	}
+
+	const profileCell = (result: ComboResult | undefined): string => {
+		if (!result) {
+			return 'N/A';
+		}
+		if (result.status === 'failed') {
+			return 'FAILED';
+		}
+		return formatMs(result.overallAvgMs);
+	};
 
 	lines.push('# CollegeDB Sandbox Benchmark Report');
 	lines.push('');
@@ -1529,6 +1762,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	lines.push('');
 	lines.push(`- Database filter: ${options.db}`);
 	lines.push(`- KV filter: ${options.kv}`);
+	lines.push(`- Profile filter: ${options.profile}`);
 	lines.push(`- Base iterations: ${options.iterations}`);
 	lines.push(`- Bulk size: ${options.bulkSize}`);
 	lines.push(`- Included Cloudflare run: ${options.includeCloudflare || options.cloudflareOnly ? 'yes' : 'no'}`);
@@ -1553,51 +1787,72 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	if (comboResults.length > 0) {
 		lines.push('## Matrix: SQL x KV (Overall)');
 		lines.push('');
-		lines.push('| Combination | Status | Passed | Failed | Skipped | Overall Avg | Duration |');
-		lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+		lines.push('| Combination | Profile | Status | Passed | Failed | Skipped | Overall Avg | Duration |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
 			const states = countScenarioStates(result.scenarios);
 			lines.push(
-				`| ${result.id} | ${result.status.toUpperCase()} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} |`
+				`| ${result.baseId} | ${result.profile} | ${result.status.toUpperCase()} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} |`
+			);
+		}
+		lines.push('');
+
+		lines.push('## Matrix: Adapter Profiles (Overall Avg)');
+		lines.push('');
+		lines.push('| Combination | native | drizzle | hyperdrive | nuxthub |');
+		lines.push('| --- | --- | --- | --- | --- |');
+		for (const [baseId, byProfile] of groupedByBase) {
+			lines.push(
+				`| ${baseId} | ${profileCell(byProfile.get('native'))} | ${profileCell(byProfile.get('drizzle'))} | ${profileCell(byProfile.get('hyperdrive'))} | ${profileCell(byProfile.get('nuxthub'))} |`
 			);
 		}
 		lines.push('');
 
 		lines.push('## Matrix: Core Scenario Latency (avg/p95)');
 		lines.push('');
-		lines.push('| Combination | Basic CRUD | Advanced | Migration | Bulk CRUD | Indexing | Overall Avg |');
-		lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+		lines.push('| Combination | Profile | Basic CRUD | Advanced | Migration | Bulk CRUD | Indexing | Overall Avg |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
 			lines.push(
-				`| ${result.id} | ${scenarioCell(result.scenarios.basic_crud)} | ${scenarioCell(result.scenarios.advanced_usage)} | ${scenarioCell(result.scenarios.migration_mapping)} | ${scenarioCell(result.scenarios.bulk_crud)} | ${scenarioCell(result.scenarios.indexing)} | ${formatMs(result.overallAvgMs)} |`
+				`| ${result.baseId} | ${result.profile} | ${scenarioCell(result.scenarios.basic_crud)} | ${scenarioCell(result.scenarios.advanced_usage)} | ${scenarioCell(result.scenarios.migration_mapping)} | ${scenarioCell(result.scenarios.bulk_crud)} | ${scenarioCell(result.scenarios.indexing)} | ${formatMs(result.overallAvgMs)} |`
 			);
 		}
 		lines.push('');
 
 		lines.push('## Matrix: Introspection and Routing Latency (avg/p95)');
 		lines.push('');
-		lines.push('| Combination | Metadata | Pragma/Info | Counting | Fanout | Reassignment |');
-		lines.push('| --- | --- | --- | --- | --- | --- |');
+		lines.push('| Combination | Profile | Metadata | Pragma/Info | Counting | Fanout | Reassignment |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
 			lines.push(
-				`| ${result.id} | ${scenarioCell(result.scenarios.metadata_fetch)} | ${scenarioCell(result.scenarios.pragma_or_info)} | ${scenarioCell(result.scenarios.counting)} | ${scenarioCell(result.scenarios.shard_fanout)} | ${scenarioCell(result.scenarios.reassignment)} |`
+				`| ${result.baseId} | ${result.profile} | ${scenarioCell(result.scenarios.metadata_fetch)} | ${scenarioCell(result.scenarios.pragma_or_info)} | ${scenarioCell(result.scenarios.counting)} | ${scenarioCell(result.scenarios.shard_fanout)} | ${scenarioCell(result.scenarios.reassignment)} |`
 			);
 		}
 		lines.push('');
 	}
 
-	if (cloudflareResult) {
+	if (cloudflareResults.length > 0) {
 		lines.push('## Cloudflare Worker (`wrangler dev --local`)');
 		lines.push('');
 		lines.push(
-			'| Environment | Status | Basic CRUD | Advanced | Migration | Bulk CRUD | Indexing | Metadata | Pragma | Counting | Fanout | Reassignment | Overall Avg |'
+			'| Environment | Profile | Status | Basic CRUD | Advanced | Migration | Bulk CRUD | Indexing | Metadata | Pragma | Counting | Fanout | Reassignment | Overall Avg |'
 		);
-		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+		for (const result of cloudflareResults) {
+			lines.push(
+				`| cloudflare | ${result.profile} | ${result.status.toUpperCase()} | ${scenarioCell(result.scenarios.basic_crud)} | ${scenarioCell(result.scenarios.advanced_usage)} | ${scenarioCell(result.scenarios.migration_mapping)} | ${scenarioCell(result.scenarios.bulk_crud)} | ${scenarioCell(result.scenarios.indexing)} | ${scenarioCell(result.scenarios.metadata_fetch)} | ${scenarioCell(result.scenarios.pragma_or_info)} | ${scenarioCell(result.scenarios.counting)} | ${scenarioCell(result.scenarios.shard_fanout)} | ${scenarioCell(result.scenarios.reassignment)} | ${formatMs(result.overallAvgMs)} |`
+			);
+		}
+		lines.push('');
+		lines.push('## Matrix: Cloudflare Adapter Profiles (Overall Avg)');
+		lines.push('');
+		lines.push('| Environment | native | drizzle | nuxthub |');
+		lines.push('| --- | --- | --- | --- |');
 		lines.push(
-			`| cloudflare | ${cloudflareResult.status.toUpperCase()} | ${scenarioCell(cloudflareResult.scenarios.basic_crud)} | ${scenarioCell(cloudflareResult.scenarios.advanced_usage)} | ${scenarioCell(cloudflareResult.scenarios.migration_mapping)} | ${scenarioCell(cloudflareResult.scenarios.bulk_crud)} | ${scenarioCell(cloudflareResult.scenarios.indexing)} | ${scenarioCell(cloudflareResult.scenarios.metadata_fetch)} | ${scenarioCell(cloudflareResult.scenarios.pragma_or_info)} | ${scenarioCell(cloudflareResult.scenarios.counting)} | ${scenarioCell(cloudflareResult.scenarios.shard_fanout)} | ${scenarioCell(cloudflareResult.scenarios.reassignment)} | ${formatMs(cloudflareResult.overallAvgMs)} |`
+			`| cloudflare | ${profileCell(groupedCloudflare.get('native'))} | ${profileCell(groupedCloudflare.get('drizzle'))} | ${profileCell(groupedCloudflare.get('nuxthub'))} |`
 		);
 		lines.push('');
 	}
@@ -1629,8 +1884,8 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('');
 	}
 
-	if (cloudflareResult) {
-		lines.push('### cloudflare');
+	for (const cloudflareResult of cloudflareResults) {
+		lines.push(`### cloudflare/${cloudflareResult.profile}`);
 		lines.push('');
 		lines.push(`- Status: ${cloudflareResult.status.toUpperCase()}`);
 		lines.push(`- Duration: ${formatMs(cloudflareResult.durationMs)}`);

@@ -17,13 +17,54 @@ fi
 action="${1:-}"
 shift || true
 
+normalize_service() {
+  local service="$1"
+  case "$service" in
+    postgresql)
+      echo "postgres"
+      ;;
+    *)
+      echo "$service"
+      ;;
+  esac
+}
+
+append_unique_service() {
+  local value="$1"
+  shift
+  local existing
+  for existing in "$@"; do
+    if [[ "$existing" == "$value" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 case "$action" in
   up)
     if [[ $# -eq 0 ]]; then
-      echo "Usage: compose.sh up <service...>" >&2
-      exit 1
+      docker compose -f "$COMPOSE_FILE" up -d
+      exit 0
     fi
-    docker compose -f "$COMPOSE_FILE" up -d "$@"
+
+    declare -a services=()
+    for raw in "$@"; do
+      mapped="$(normalize_service "$raw")"
+      if [[ ${#services[@]} -eq 0 ]]; then
+        if append_unique_service "$mapped"; then
+          services+=("$mapped")
+        fi
+      elif append_unique_service "$mapped" "${services[@]}"; then
+        services+=("$mapped")
+      fi
+    done
+
+    if [[ ${#services[@]} -eq 0 ]]; then
+      docker compose -f "$COMPOSE_FILE" up -d
+    else
+      docker compose -f "$COMPOSE_FILE" up -d "${services[@]}"
+    fi
     ;;
   down)
     docker compose -f "$COMPOSE_FILE" down -v --remove-orphans
