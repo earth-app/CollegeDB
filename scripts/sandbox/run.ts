@@ -350,7 +350,7 @@ function profilesForCombo(dbFlavor: DatabaseFlavor, profileFilter: AdapterProfil
 		return [...supported];
 	}
 
-	return supported.includes(profileFilter) ? [profileFilter] : [];
+	return (supported as readonly AdapterProfile[]).includes(profileFilter) ? [profileFilter] : [];
 }
 
 function profilesForCloudflare(profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
@@ -358,7 +358,7 @@ function profilesForCloudflare(profileFilter: AdapterProfile | 'all'): AdapterPr
 	if (profileFilter === 'all') {
 		return [...supported];
 	}
-	return supported.includes(profileFilter) ? [profileFilter] : [];
+	return (supported as readonly AdapterProfile[]).includes(profileFilter) ? [profileFilter] : [];
 }
 
 function buildCombos(dbFilter: DatabaseFlavor | 'all', kvFilter: KVFlavor | 'all'): Combo[] {
@@ -1061,15 +1061,15 @@ async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Pro
 }
 
 function createNuxtHubKVCompatClient(client: any): {
-	get: (key: string) => Promise<string | null>;
+	get: <T = unknown>(key: string) => Promise<T | null>;
 	set: (key: string, value: unknown) => Promise<void>;
 	del: (key: string) => Promise<void>;
 	keys: (prefix?: string) => Promise<string[]>;
 } {
 	return {
-		get: async (key: string) => {
+		get: async <T = unknown>(key: string) => {
 			const value = await client.get(key);
-			return value === null ? null : String(value);
+			return (value === null ? null : String(value)) as T | null;
 		},
 		set: async (key: string, value: unknown) => {
 			const serialized = typeof value === 'string' ? value : JSON.stringify(value);
@@ -1188,7 +1188,25 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile): Pr
 				return createPostgreSQLProvider(drizzleDb as any, drizzleSql);
 			}
 			case 'hyperdrive':
-				return createHyperdrivePostgresProvider({ connectionString }, (conn) => new PostgresClient({ connectionString: conn }));
+				return createHyperdrivePostgresProvider({ connectionString }, (conn) => {
+					const client = new PostgresClient({ connectionString: conn });
+					return {
+						connect: async () => {
+							await client.connect();
+						},
+						query: async <T = Record<string, unknown>>(sql: string, bindings: any[] = []) => {
+							const result = await client.query(sql, bindings);
+							return {
+								rows: result.rows as T[],
+								rowCount: result.rowCount,
+								command: result.command
+							};
+						},
+						end: async () => {
+							await client.end();
+						}
+					};
+				});
 		}
 	};
 
