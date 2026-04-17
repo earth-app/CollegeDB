@@ -14,7 +14,7 @@
  *
  * @example
  * ```typescript
- * import type { CollegeDBConfig, QueryResult, ShardStats } from './types.js';
+ * import type { CollegeDBConfig, QueryResult, ShardStats } from './types';
  *
  * const config: CollegeDBConfig = {
  *   kv: env.KV,

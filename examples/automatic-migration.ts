@@ -24,8 +24,8 @@
  * @since 1.0.0
  */
 
-import { first, getShardStats, initialize, run } from '../src/index.js';
-import type { Env } from '../src/types.js';
+import { first, getShardStats, initialize, run } from '../src/index';
+import type { Env } from '../src/types';
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {

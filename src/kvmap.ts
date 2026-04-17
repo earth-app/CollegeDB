@@ -34,8 +34,8 @@
  * @since 1.0.0
  */
 
-import { CollegeDBError } from './errors.js';
-import type { CollegeDBConfig, KVStorage, MultiKeyShardMapping, ShardMapping } from './types.js';
+import { CollegeDBError } from './errors';
+import type { CollegeDBConfig, KVStorage, MultiKeyShardMapping, ShardMapping } from './types';
 
 /**
  * KV key prefix for shard mappings

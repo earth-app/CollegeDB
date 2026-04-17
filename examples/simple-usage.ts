@@ -25,8 +25,8 @@
  * @since 1.0.0
  */
 
-import { createSchema, first, initialize, run } from '../src/index.js';
-import type { Env } from '../src/types.js';
+import { createSchema, first, initialize, run } from '../src/index';
+import type { Env } from '../src/types';
 
 // Example schema for a simple user and posts system
 const EXAMPLE_SCHEMA = `

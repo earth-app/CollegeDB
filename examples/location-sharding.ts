@@ -11,8 +11,8 @@
  * ```
  */
 
-import type { CollegeDBConfig, D1Region } from '../src/index.js';
-import { collegedb, first, getShardStats, run } from '../src/index.js';
+import type { CollegeDBConfig, D1Region } from '../src/index';
+import { collegedb, first, getShardStats, run } from '../src/index';
 
 // Example configuration for a global application
 const config: CollegeDBConfig = {

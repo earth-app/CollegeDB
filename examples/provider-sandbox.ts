@@ -8,8 +8,8 @@
  * bun examples/provider-sandbox.ts
  */
 
-import { createRedisKVProvider, createSQLiteProvider } from '../src/providers.js';
-import { first, initialize, run } from '../src/router.js';
+import { createRedisKVProvider, createSQLiteProvider } from '../src/providers';
+import { first, initialize, run } from '../src/router';
 
 class InMemoryRedisLike {
 	private readonly store = new Map<string, string>();

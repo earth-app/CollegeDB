@@ -33,9 +33,9 @@
  * @since 1.0.3
  */
 
-import { collegedb, first, run } from '../src/index.js';
-import { KVShardMapper } from '../src/kvmap.js';
-import type { CollegeDBConfig, Env } from '../src/types.js';
+import { collegedb, first, run } from '../src/index';
+import { KVShardMapper } from '../src/kvmap';
+import type { CollegeDBConfig, Env } from '../src/types';
 
 // Example schema with user table
 const USER_SCHEMA = `

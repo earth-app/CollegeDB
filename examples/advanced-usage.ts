@@ -37,8 +37,8 @@
  * @since 1.0.0
  */
 
-import { allShard, createSchema, first, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index.js';
-import type { CollegeDBConfig, Env } from '../src/types.js';
+import { allShard, createSchema, first, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index';
+import type { CollegeDBConfig, Env } from '../src/types';
 
 // Example schema for advanced usage scenarios
 const ADVANCED_SCHEMA = `

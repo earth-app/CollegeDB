@@ -15,7 +15,7 @@
  *
  * @example
  * ```typescript
- * import { createSchema, migrateRecord, schemaExists } from './migrations.js';
+ * import { createSchema, migrateRecord, schemaExists } from './migrations';
  *
  * // Create schema on a new shard
  * await createSchema(env.DB_EAST);
@@ -31,9 +31,9 @@
  * @since 1.0.0
  */
 
-import { CollegeDBError } from './errors.js';
-import type { KVShardMapper } from './kvmap.js';
-import type { CollegeDBConfig, SQLDatabase, ShardingStrategy } from './types.js';
+import { CollegeDBError } from './errors';
+import type { KVShardMapper } from './kvmap';
+import type { CollegeDBConfig, SQLDatabase, ShardingStrategy } from './types';
 
 /**
  * Cache for migration status to avoid repeated checks
@@ -442,7 +442,7 @@ export async function discoverExistingRecordsWithColumns(
  * @throws {Error} If mapping creation fails
  * @example
  * ```typescript
- * import { KVShardMapper } from './kvmap.js';
+ * import { KVShardMapper } from './kvmap';
  *
  * const mapper = new KVShardMapper(env.KV);
  * const existingIds = await discoverExistingPrimaryKeys(env.DB_EXISTING, 'users');
@@ -602,7 +602,7 @@ export type IntegrationResult = {
  * @throws {Error} If integration fails
  * @example
  * ```typescript
- * import { KVShardMapper } from './kvmap.js';
+ * import { KVShardMapper } from './kvmap';
  *
  * const mapper = new KVShardMapper(env.KV);
  * const result = await integrateExistingDatabase(env.DB_EXISTING, 'db-existing', mapper, {
@@ -835,7 +835,7 @@ export async function autoDetectAndMigrate(
 	let migrationPerformed = false;
 
 	try {
-		const { KVShardMapper } = await import('./kvmap.js');
+		const { KVShardMapper } = await import('./kvmap');
 		const mapper = new KVShardMapper(config.kv, {
 			hashShardMappings: config.hashShardMappings,
 			mappingCacheTtlMs: config.mappingCacheTtlMs,
@@ -1045,7 +1045,7 @@ export async function checkMigrationNeeded(d1: SQLDatabase, shardName: string, c
 			return false;
 		}
 
-		const { KVShardMapper } = await import('./kvmap.js');
+		const { KVShardMapper } = await import('./kvmap');
 		const mapper = new KVShardMapper(config.kv, {
 			hashShardMappings: config.hashShardMappings,
 			mappingCacheTtlMs: config.mappingCacheTtlMs,

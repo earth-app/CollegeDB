@@ -41,8 +41,8 @@
  */
 
 import type { Request } from '@cloudflare/workers-types';
-import { CollegeDBError } from './errors.js';
-import { KVShardMapper } from './kvmap.js';
+import { CollegeDBError } from './errors';
+import { KVShardMapper } from './kvmap';
 import type {
 	CollegeDBConfig,
 	D1Region,
@@ -53,7 +53,7 @@ import type {
 	ShardLocation,
 	ShardStats,
 	ShardingStrategy
-} from './types.js';
+} from './types';
 
 /**
  * Global configuration for the collegedb instance
@@ -268,7 +268,7 @@ export async function collegedb<T>(config: CollegeDBConfig, callback: () => T) {
  */
 async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 	try {
-		const { autoDetectAndMigrate } = await import('./migrations.js');
+		const { autoDetectAndMigrate } = await import('./migrations');
 		const shardNames = Object.keys(config.shards);
 
 		if (config.debug) {
@@ -939,7 +939,7 @@ async function getDatabase(primaryKey: string, operationType: OperationType = 'w
  * ```
  */
 export async function createSchema(d1: SQLDatabase, schema: string): Promise<void> {
-	const { createSchema: createSchemaImpl } = await import('./migrations.js');
+	const { createSchema: createSchemaImpl } = await import('./migrations');
 	await createSchemaImpl(d1, schema);
 }
 
@@ -1161,7 +1161,7 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 
 	// Migrate data if different shard
 	if (currentMapping.shard !== newBinding) {
-		const { migrateRecord } = await import('./migrations.js');
+		const { migrateRecord } = await import('./migrations');
 		const sourceDb = config.shards[currentMapping.shard];
 		const targetDb = config.shards[newBinding];
 

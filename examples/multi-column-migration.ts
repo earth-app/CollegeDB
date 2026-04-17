@@ -19,9 +19,9 @@
  */
 
 import type { D1Database, KVNamespace } from '@cloudflare/workers-types';
-import { KVShardMapper } from '../src/kvmap.js';
-import { autoDetectAndMigrate, discoverExistingRecordsWithColumns, integrateExistingDatabase } from '../src/migrations.js';
-import type { CollegeDBConfig } from '../src/types.js';
+import { KVShardMapper } from '../src/kvmap';
+import { autoDetectAndMigrate, discoverExistingRecordsWithColumns, integrateExistingDatabase } from '../src/migrations';
+import type { CollegeDBConfig } from '../src/types';
 
 interface Env {
 	KV: KVNamespace;

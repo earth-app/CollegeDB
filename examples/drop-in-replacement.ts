@@ -33,9 +33,9 @@ import {
 	integrateExistingDatabase,
 	listTables,
 	validateTableForSharding
-} from '../src/index.js';
-import { KVShardMapper } from '../src/kvmap.js';
-import type { Env } from '../src/types.js';
+} from '../src/index';
+import { KVShardMapper } from '../src/kvmap';
+import type { Env } from '../src/types';
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {

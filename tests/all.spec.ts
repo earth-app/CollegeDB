@@ -22,9 +22,9 @@ import {
 	resetConfig,
 	run,
 	runShard
-} from '../src/index.js';
-import { discoverExistingRecordsWithColumns } from '../src/migrations.js';
-import type { CollegeDBConfig, MixedShardingStrategy } from '../src/types.js';
+} from '../src/index';
+import { discoverExistingRecordsWithColumns } from '../src/migrations';
+import type { CollegeDBConfig, MixedShardingStrategy } from '../src/types';
 
 // Test schema for creating tables
 const TEST_SCHEMA = `
@@ -385,7 +385,7 @@ describe('CollegeDB', () => {
 	describe('Schema Creation', () => {
 		it('should create schema successfully', async () => {
 			// Test the migrations module directly with mock
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await expect(createSchema(mockDB1 as any, TEST_SCHEMA)).resolves.toBeUndefined();
 		});
 	});
@@ -393,7 +393,7 @@ describe('CollegeDB', () => {
 	describe('Basic CRUD Operations', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
@@ -512,7 +512,7 @@ describe('CollegeDB', () => {
 			};
 
 			// Import and create coordinator
-			const { ShardCoordinator } = await import('../src/durable.js');
+			const { ShardCoordinator } = await import('../src/durable');
 			coordinator = new ShardCoordinator(mockState);
 		});
 
@@ -1153,7 +1153,7 @@ describe('CollegeDB', () => {
 	describe('Shard Routing', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
@@ -1194,7 +1194,7 @@ describe('CollegeDB', () => {
 	describe('Drop-in Replacement', () => {
 		beforeEach(async () => {
 			// Create existing database with data
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 
 			// Add some existing data
@@ -1213,7 +1213,7 @@ describe('CollegeDB', () => {
 		});
 
 		it('should discover existing primary keys', async () => {
-			const { discoverExistingPrimaryKeys } = await import('../src/migrations.js');
+			const { discoverExistingPrimaryKeys } = await import('../src/migrations');
 
 			const userIds = await discoverExistingPrimaryKeys(mockDB1 as any, 'users');
 			expect(userIds).toContain('existing-user-1');
@@ -1226,7 +1226,7 @@ describe('CollegeDB', () => {
 		});
 
 		it('should validate tables for sharding', async () => {
-			const { validateTableForSharding } = await import('../src/migrations.js');
+			const { validateTableForSharding } = await import('../src/migrations');
 
 			const usersValidation = await validateTableForSharding(mockDB1 as any, 'users', 'id');
 			expect(usersValidation.isValid).toBe(true);
@@ -1239,8 +1239,8 @@ describe('CollegeDB', () => {
 		});
 
 		it('should integrate existing database', async () => {
-			const { integrateExistingDatabase } = await import('../src/migrations.js');
-			const { KVShardMapper } = await import('../src/kvmap.js');
+			const { integrateExistingDatabase } = await import('../src/migrations');
+			const { KVShardMapper } = await import('../src/kvmap');
 
 			const mapper = new KVShardMapper(mockKV as any);
 
@@ -1265,8 +1265,8 @@ describe('CollegeDB', () => {
 		});
 
 		it('should query existing data after integration', async () => {
-			const { integrateExistingDatabase } = await import('../src/migrations.js');
-			const { KVShardMapper } = await import('../src/kvmap.js');
+			const { integrateExistingDatabase } = await import('../src/migrations');
+			const { KVShardMapper } = await import('../src/kvmap');
 
 			const mapper = new KVShardMapper(mockKV as any);
 
@@ -1298,8 +1298,8 @@ describe('CollegeDB', () => {
 		});
 
 		it('should handle dry run mode', async () => {
-			const { integrateExistingDatabase } = await import('../src/migrations.js');
-			const { KVShardMapper } = await import('../src/kvmap.js');
+			const { integrateExistingDatabase } = await import('../src/migrations');
+			const { KVShardMapper } = await import('../src/kvmap');
 
 			const mapper = new KVShardMapper(mockKV as any);
 
@@ -1332,7 +1332,7 @@ describe('CollegeDB', () => {
 			mockDB2.clear();
 
 			// Create existing database with data
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 
 			// Add some existing data without mappings
@@ -1383,7 +1383,7 @@ describe('CollegeDB', () => {
 			expect(result.tablesProcessed).toBe(2); // users and posts tables
 
 			// Verify mappings were created
-			const { KVShardMapper } = await import('../src/kvmap.js');
+			const { KVShardMapper } = await import('../src/kvmap');
 			const mapper = new KVShardMapper(mockKV as any);
 
 			const userMapping = await mapper.getShardMapping('auto-user-1');
@@ -1436,7 +1436,7 @@ describe('CollegeDB', () => {
 
 		it('should handle databases with no data gracefully', async () => {
 			// Create empty database
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 
 			const config: CollegeDBConfig = {
@@ -1777,7 +1777,7 @@ describe('CollegeDB', () => {
 	describe('CollegeDB Method', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
@@ -1826,7 +1826,7 @@ describe('CollegeDB', () => {
 	describe('Shard Methods', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
@@ -1897,7 +1897,7 @@ describe('CollegeDB', () => {
 	describe('Error Handling', () => {
 		beforeEach(async () => {
 			// Create schema directly with the migration module
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
@@ -2531,14 +2531,14 @@ describe('CollegeDB', () => {
 	describe('Database Size Limits', () => {
 		beforeEach(async () => {
 			// Create schema for testing
-			const { createSchema } = await import('../src/migrations.js');
+			const { createSchema } = await import('../src/migrations');
 			await createSchema(mockDB1 as any, TEST_SCHEMA);
 			await createSchema(mockDB2 as any, TEST_SCHEMA);
 		});
 
 		it('should exclude shards that exceed maxDatabaseSize from allocation', async () => {
 			// Mock the database size function to return large sizes for db-east
-			const originalGetSize = (await import('../src/router.js')).getDatabaseSizeForShard;
+			const originalGetSize = (await import('../src/router')).getDatabaseSizeForShard;
 
 			// Initialize with a small size limit
 			initialize({

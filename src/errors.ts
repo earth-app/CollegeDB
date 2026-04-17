@@ -7,7 +7,7 @@
  *
  * @example
  * ```typescript
- * import { CollegeDBError } from './errors.js';
+ * import { CollegeDBError } from './errors';
  *
  * throw new CollegeDBError('Failed to allocate shard', 'SHARD_ALLOCATION_ERROR');
  * ```

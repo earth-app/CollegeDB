@@ -45,9 +45,9 @@
  */
 
 import type { ExecutionContext } from '@cloudflare/workers-types';
-import { ShardCoordinator } from '../src/durable.js';
-import { createSchemaAcrossShards, first, flush, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index.js';
-import type { Env } from '../src/types.js';
+import { ShardCoordinator } from '../src/durable';
+import { createSchemaAcrossShards, first, flush, getShardStats, initialize, listKnownShards, reassignShard, run } from '../src/index';
+import type { Env } from '../src/types';
 
 // Demo schema for college database
 const COLLEGE_SCHEMA = `

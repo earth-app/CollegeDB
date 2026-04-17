@@ -30,8 +30,8 @@
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import { CollegeDBError } from './errors.js';
-import type { D1Region, MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types.js';
+import { CollegeDBError } from './errors';
+import type { D1Region, MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types';
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
