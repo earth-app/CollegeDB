@@ -5,10 +5,11 @@
 		"emitDeclarationOnly": true,
 		"declaration": true,
 		"declarationMap": true,
+		"rootDir": "src",
 		"outDir": "dist",
 		"allowImportingTsExtensions": false,
 		"verbatimModuleSyntax": false
 	},
-	"include": ["src/**/*"],
-	"exclude": ["dist", "node_modules", "**/*.test.ts", "**/*.spec.ts"]
+	"include": ["src/**/*.ts"],
+	"exclude": ["dist", "node_modules", "coverage", "typedoc", "examples", "sandbox", "scripts", "demos", "**/*.test.ts", "**/*.spec.ts"]
 }

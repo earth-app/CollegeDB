@@ -25,5 +25,15 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "examples/**/*.ts", "sandbox/**/*.ts", "scripts/**/*.ts", "demos/**/*.ts", "vitest.config.ts"],
+  "exclude": [
+    "dist",
+    "node_modules",
+    "coverage",
+    "typedoc",
+    "sandbox/.wrangler/**",
+    "sandbox/results/**",
+    "sandbox/tmp/**"
+  ]
 }
