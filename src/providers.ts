@@ -32,9 +32,9 @@ const DEFAULT_REDIS_SCAN_COUNT = 500;
  */
 export interface RedisLikeClient {
 	get(key: string): Promise<string | null>;
-	set(key: string, value: string): Promise<unknown>;
-	del(key: string): Promise<unknown>;
-	scan(cursor: string, ...args: any[]): Promise<RedisScanResult>;
+	set(key: string, value: string): unknown | Promise<unknown>;
+	del(key: string): unknown | Promise<unknown>;
+	scan(cursor: string, ...args: any[]): RedisScanResult | Promise<RedisScanResult>;
 }
 
 /**
@@ -76,8 +76,8 @@ export interface PostgresClientLike {
  * Optional lifecycle methods used by Hyperdrive helpers.
  */
 export interface PostgresLifecycleClientLike extends PostgresClientLike {
-	connect?: () => Promise<void>;
-	end?: () => Promise<void>;
+	connect?: () => void | Promise<void>;
+	end?: () => void | Promise<void>;
 	release?: () => void;
 }
 
@@ -95,16 +95,16 @@ export interface MySQLOkPacket {
  * Minimal MySQL/MariaDB client contract used by adapters.
  */
 export interface MySQLClientLike {
-	execute?: (sql: string, bindings?: any[]) => Promise<[unknown, unknown]>;
-	query?: (sql: string, bindings?: any[]) => Promise<[unknown, unknown]>;
+	execute?: (sql: string, bindings?: any[]) => any | Promise<any>;
+	query?: (sql: string, bindings?: any[]) => any | Promise<any>;
 }
 
 /**
  * Optional lifecycle methods used by Hyperdrive helpers.
  */
 export interface MySQLLifecycleClientLike extends MySQLClientLike {
-	end?: () => Promise<void>;
-	close?: () => Promise<void>;
+	end?: () => void | Promise<void>;
+	close?: () => void | Promise<void>;
 	destroy?: () => void;
 }
 
@@ -122,7 +122,7 @@ export interface SQLiteStatementLike {
  */
 export interface SQLiteClientLike {
 	prepare?: (sql: string) => SQLiteStatementLike;
-	execute?: (sql: string, bindings?: any[]) => Promise<unknown>;
+	execute?: (sql: string, bindings?: any[]) => any | Promise<any>;
 }
 
 /**
@@ -163,24 +163,24 @@ export interface DrizzleSqlTagLike {
  * Minimal Drizzle database contract used by the SQL adapter.
  */
 export interface DrizzleClientLike {
-	execute?: (query: unknown) => Promise<unknown>;
-	run?: (query: unknown) => Promise<unknown>;
-	all?: (query: unknown) => Promise<unknown>;
-	get?: (query: unknown) => Promise<unknown>;
+	execute?: (query: any) => any | Promise<any>;
+	run?: (query: any) => any | Promise<any>;
+	all?: (query: any) => any | Promise<any>;
+	get?: (query: any) => any | Promise<any>;
 }
 
 /**
  * NuxtHub/Unstorage-like KV contract used by the adapter.
  */
 export interface NuxtHubKVLike {
-	get?<T = unknown>(key: string): Promise<T | null | undefined>;
-	set?(key: string, value: unknown, options?: { ttl?: number }): Promise<unknown>;
-	del?(key: string): Promise<unknown>;
-	keys?(prefix?: string): Promise<string[]>;
-	getItem?<T = unknown>(key: string): Promise<T | null | undefined>;
-	setItem?(key: string, value: unknown): Promise<unknown>;
-	removeItem?(key: string): Promise<unknown>;
-	getKeys?(prefix?: string): Promise<string[]>;
+	get?<T = any>(key: string): T | null | undefined | Promise<T | null | undefined>;
+	set?(key: string, value: any, options?: { ttl?: number }): any | Promise<any>;
+	del?(key: string): any | Promise<any>;
+	keys?(prefix?: string): string[] | readonly string[] | Promise<string[] | readonly string[]>;
+	getItem?<T = any>(key: string): T | null | undefined | Promise<T | null | undefined>;
+	setItem?(key: string, value: any): any | Promise<any>;
+	removeItem?(key: string): any | Promise<any>;
+	getKeys?(prefix?: string): string[] | readonly string[] | Promise<string[] | readonly string[]>;
 }
 
 /**
@@ -835,13 +835,19 @@ function normalizeRedisScanResult(result: RedisScanResult): { cursor: string; ke
 
 async function executeMySQL(client: MySQLClientLike, sql: string, bindings: any[]): Promise<unknown> {
 	if (typeof client.execute === 'function') {
-		const [rows] = await client.execute(sql, bindings);
-		return rows;
+		const result = await client.execute(sql, bindings);
+		if (Array.isArray(result)) {
+			return result[0];
+		}
+		return result;
 	}
 
 	if (typeof client.query === 'function') {
-		const [rows] = await client.query(sql, bindings);
-		return rows;
+		const result = await client.query(sql, bindings);
+		if (Array.isArray(result)) {
+			return result[0];
+		}
+		return result;
 	}
 
 	throw new CollegeDBError('MySQL client must expose execute() or query()', 'MYSQL_CLIENT_INVALID');
@@ -1103,7 +1109,7 @@ async function deleteNuxtHubKVValue(client: NuxtHubKVLike, key: string): Promise
 }
 
 async function listNuxtHubKVKeys(client: NuxtHubKVLike, prefix: string): Promise<string[]> {
-	let keys: string[];
+	let keys: readonly string[];
 
 	if (typeof client.keys === 'function') {
 		keys = await client.keys(prefix);
@@ -1118,7 +1124,7 @@ async function listNuxtHubKVKeys(client: NuxtHubKVLike, prefix: string): Promise
 	}
 
 	if (!prefix) {
-		return keys;
+		return [...keys];
 	}
 
 	return keys.filter((key) => key.startsWith(prefix));

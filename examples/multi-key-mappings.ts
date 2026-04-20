@@ -119,11 +119,12 @@ export default {
 			return new Response(JSON.stringify(result, null, 2), {
 				headers: { 'Content-Type': 'application/json' }
 			});
-		} catch (error: any) {
+		} catch (error: unknown) {
+			const err = error instanceof Error ? error : new Error(String(error));
 			return new Response(
 				JSON.stringify({
-					error: error.message,
-					stack: error.stack
+					error: err.message,
+					stack: err.stack
 				}),
 				{
 					status: 500,
@@ -138,7 +139,7 @@ export default {
  * Complete demonstration of multi-key mapping features
  */
 async function runCompleteDemo(env: Env) {
-	const results: any = { steps: [] };
+	const results: Record<string, unknown> & { steps: string[] } = { steps: [] };
 
 	// Step 1: Create user with multiple lookup keys
 	results.steps.push('Creating user with multiple lookup keys...');
@@ -318,7 +319,7 @@ async function addLookupKeyDemo(params: URLSearchParams, env: Env) {
  * Demonstrate security features and SHA-256 hashing
  */
 async function securityDemo(env: Env) {
-	const results: any = {};
+	const results: Record<string, unknown> = {};
 
 	// Create mapper with hashing enabled
 	const secureMapper = new KVShardMapper(env.KV, { hashShardMappings: true });
@@ -360,7 +361,7 @@ async function securityDemo(env: Env) {
  */
 async function managementDemo(env: Env) {
 	const mapper = new KVShardMapper(env.KV, { hashShardMappings: true });
-	const results: any = {};
+	const results: Record<string, unknown> = {};
 
 	// Create a test user for management demo
 	const userId = 'mgmt-user-' + Date.now();
@@ -393,7 +394,7 @@ async function managementDemo(env: Env) {
 	};
 
 	// Verify all keys still work after update
-	const verificationResults: any = {};
+	const verificationResults: Record<string, { shard?: string; works: boolean }> = {};
 	for (const key of allKeys.slice(0, 3)) {
 		// Test first 3 keys
 		const mapping = await mapper.getShardMapping(key);

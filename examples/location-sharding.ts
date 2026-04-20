@@ -12,11 +12,75 @@
  */
 
 import type { CollegeDBConfig, D1Region } from '../src/index';
-import { collegedb, first, getShardStats, run } from '../src/index';
+import { collegedb, createRedisKVProvider, createSQLiteProvider, first, getShardStats, run } from '../src/index';
+
+class InMemoryRedisLike {
+	private readonly store = new Map<string, string>();
+
+	async get(key: string): Promise<string | null> {
+		return this.store.get(key) ?? null;
+	}
+
+	async set(key: string, value: string): Promise<void> {
+		this.store.set(key, value);
+	}
+
+	async del(key: string): Promise<void> {
+		this.store.delete(key);
+	}
+
+	async scan(_cursor: string, ...args: any[]): Promise<[string, string[]]> {
+		const matchIndex = args.findIndex((arg) => arg === 'MATCH');
+		const pattern = matchIndex >= 0 ? String(args[matchIndex + 1]) : '*';
+		const prefix = pattern.endsWith('*') ? pattern.slice(0, -1) : pattern;
+		const keys = Array.from(this.store.keys()).filter((key) => key.startsWith(prefix));
+		return ['0', keys];
+	}
+}
+
+class InMemorySQLiteLike {
+	private readonly users = new Map<string, { id: string; name: string; region: string }>();
+
+	prepare(sql: string) {
+		return {
+			run: (...bindings: any[]) => {
+				if (sql.startsWith('CREATE TABLE')) {
+					return { changes: 0 };
+				}
+				if (sql.startsWith('INSERT')) {
+					this.users.set(String(bindings[0]), {
+						id: String(bindings[0]),
+						name: String(bindings[1]),
+						region: String(bindings[2])
+					});
+					return { changes: 1, lastInsertRowid: 1 };
+				}
+				return { changes: 0 };
+			},
+			all: (...bindings: any[]) => {
+				if (sql.startsWith('SELECT') && bindings.length > 0) {
+					const user = this.users.get(String(bindings[0]));
+					return user ? [user] : [];
+				}
+				return Array.from(this.users.values());
+			},
+			get: (...bindings: any[]) => {
+				if (sql.startsWith('SELECT') && bindings.length > 0) {
+					return this.users.get(String(bindings[0])) ?? null;
+				}
+				return null;
+			}
+		};
+	}
+}
+
+function createInMemoryShard() {
+	return createSQLiteProvider(new InMemorySQLiteLike());
+}
 
 // Example configuration for a global application
 const config: CollegeDBConfig = {
-	kv: {} as any, // Mock KV for example
+	kv: createRedisKVProvider(new InMemoryRedisLike()),
 	strategy: 'location',
 	targetRegion: 'wnam', // Target Western North America
 	shardLocations: {
@@ -26,10 +90,10 @@ const config: CollegeDBConfig = {
 		'db-asia': { region: 'apac', priority: 1 } // Tertiary (Tokyo)
 	},
 	shards: {
-		'db-west-us': {} as any,
-		'db-east-us': {} as any,
-		'db-europe': {} as any,
-		'db-asia': {} as any
+		'db-west-us': createInMemoryShard(),
+		'db-east-us': createInMemoryShard(),
+		'db-europe': createInMemoryShard(),
+		'db-asia': createInMemoryShard()
 	}
 };
 
@@ -131,9 +195,9 @@ async function disasterRecoveryExample() {
 			'db-asia': { region: 'apac', priority: 1 } // Tertiary
 		},
 		shards: {
-			'db-east-us': {} as any,
-			'db-europe': {} as any,
-			'db-asia': {} as any
+			'db-east-us': createInMemoryShard(),
+			'db-europe': createInMemoryShard(),
+			'db-asia': createInMemoryShard()
 		}
 	};
 

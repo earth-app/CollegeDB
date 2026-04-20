@@ -66,7 +66,7 @@ export default {
  * Handles the migration process for existing databases
  */
 async function handleMigration(env: Env): Promise<Response> {
-	const results: any[] = [];
+	const results: Array<Record<string, unknown>> = [];
 
 	// Initialize CollegeDB
 	initialize({
@@ -134,7 +134,7 @@ async function handleMigration(env: Env): Promise<Response> {
  * Handles validation of existing databases before migration
  */
 async function handleValidation(env: Env): Promise<Response> {
-	const validations: any[] = [];
+	const validations: Array<Record<string, unknown>> = [];
 
 	const databases = [
 		{ db: env['db-existing-east'], name: 'db-existing-east' },
@@ -215,7 +215,7 @@ async function handleDemo(env: Env): Promise<Response> {
 		strategy: 'hash'
 	});
 
-	const results: any[] = [];
+	const results: Array<Record<string, unknown>> = [];
 
 	// Example: Query existing users (these will be automatically routed to correct shards)
 	const sampleUserIds = ['user-1', 'user-100', 'user-999'];
