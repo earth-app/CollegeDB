@@ -48,22 +48,22 @@
     "@babel/core": "^7.29.0",
     "@babel/preset-env": "^7.29.2",
     "@babel/preset-typescript": "^7.28.5",
-    "@cloudflare/workers-types": "^4.20260415.1",
+    "@cloudflare/workers-types": "^4.20260418.1",
     "@types/bun": "latest",
-    "@types/pg": "^8.15.6",
+    "@types/pg": "^8.20.0",
     "@vitest/coverage-v8": "^4.1.4",
     "drizzle-orm": "^0.45.2",
     "husky": "^9.1.7",
     "jsdoc-babel": "^0.5.0",
     "lint-staged": "^16.4.0",
-    "mysql2": "^3.15.3",
-    "pg": "^8.16.3",
+    "mysql2": "^3.22.1",
+    "pg": "^8.20.0",
     "prettier": "^3.8.3",
     "prettier-plugin-organize-imports": "4.3.0",
-    "redis": "^5.8.2",
+    "redis": "^5.12.1",
     "typedoc": "^0.28.19",
     "vitest": "^4.1.4",
-    "wrangler": "^4.64.0"
+    "wrangler": "^4.83.0"
   },
   "peerDependencies": {
     "typescript": "^5.8.3"
