@@ -24,7 +24,7 @@ import {
 	runShard
 } from '../src/index';
 import { discoverExistingRecordsWithColumns } from '../src/migrations';
-import type { CollegeDBConfig, MixedShardingStrategy } from '../src/types';
+import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy } from '../src/types';
 
 // Test schema for creating tables
 const TEST_SCHEMA = `
@@ -1639,6 +1639,43 @@ describe('CollegeDB', () => {
 			expect(user).toBeTruthy();
 			expect(user?.name).toBe('Updated User');
 		});
+
+		it('should support location strategy across multiple target regions with five mock databases', async () => {
+			const regions: D1Region[] = ['wnam', 'enam', 'weur', 'apac', 'oc'];
+			const shardLocations: Record<string, { region: D1Region; priority: number }> = {
+				'db-wnam': { region: 'wnam', priority: 3 },
+				'db-enam': { region: 'enam', priority: 2 },
+				'db-weur': { region: 'weur', priority: 2 },
+				'db-apac': { region: 'apac', priority: 2 },
+				'db-oc': { region: 'oc', priority: 1 }
+			};
+
+			const shards = {
+				'db-wnam': new MockD1Database() as any,
+				'db-enam': new MockD1Database() as any,
+				'db-weur': new MockD1Database() as any,
+				'db-apac': new MockD1Database() as any,
+				'db-oc': new MockD1Database() as any
+			};
+
+			for (const targetRegion of regions) {
+				initialize({
+					kv: mockKV as any,
+					strategy: 'location',
+					targetRegion,
+					shardLocations,
+					shards,
+					disableAutoMigration: true
+				});
+
+				const key = `location-multi-region-${targetRegion}`;
+				await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, `Location ${targetRegion}`]);
+
+				const row = await first(key, 'SELECT * FROM users WHERE id = ?', [key]);
+				expect(row).toBeTruthy();
+				expect((row as any).name).toBe(`Location ${targetRegion}`);
+			}
+		});
 	});
 
 	describe('IP Geolocation', () => {
@@ -2138,6 +2175,61 @@ describe('CollegeDB', () => {
 
 			expect(result).toBeDefined();
 			expect((result as any).name).toBe('Default User');
+		});
+
+		it('should support all mixed read/write strategy permutations across regional location profiles', async () => {
+			const strategies: ShardingStrategy[] = ['round-robin', 'random', 'hash', 'location'];
+			const targetRegions: D1Region[] = ['wnam', 'enam', 'weur', 'apac', 'oc'];
+			const shardLocations: Record<string, { region: D1Region; priority: number }> = {
+				'db-wnam': { region: 'wnam', priority: 3 },
+				'db-enam': { region: 'enam', priority: 2 },
+				'db-weur': { region: 'weur', priority: 2 },
+				'db-apac': { region: 'apac', priority: 2 },
+				'db-oc': { region: 'oc', priority: 1 }
+			};
+
+			const shards = {
+				'db-wnam': new MockD1Database() as any,
+				'db-enam': new MockD1Database() as any,
+				'db-weur': new MockD1Database() as any,
+				'db-apac': new MockD1Database() as any,
+				'db-oc': new MockD1Database() as any
+			};
+
+			let caseIndex = 0;
+			for (const read of strategies) {
+				for (const write of strategies) {
+					const targetRegion = targetRegions[caseIndex % targetRegions.length] || 'wnam';
+					const mixedStrategy: MixedShardingStrategy = {
+						read,
+						write
+					};
+
+					initialize({
+						kv: mockKV as any,
+						shards,
+						strategy: mixedStrategy,
+						targetRegion,
+						shardLocations,
+						disableAutoMigration: true
+					});
+
+					// Trigger read-path routing on an unmapped key.
+					const missKey = `mix-read-miss-${read}-${write}-${caseIndex}`;
+					const miss = await first(missKey, 'SELECT * FROM users WHERE id = ?', [missKey]);
+					expect(miss).toBeNull();
+
+					// Trigger write-path routing on a fresh key.
+					const writeKey = `mix-write-${read}-${write}-${caseIndex}`;
+					await run(writeKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [writeKey, `Combo ${read}/${write}`]);
+
+					const row = await first(writeKey, 'SELECT * FROM users WHERE id = ?', [writeKey]);
+					expect(row).toBeTruthy();
+					expect((row as any).name).toBe(`Combo ${read}/${write}`);
+
+					caseIndex += 1;
+				}
+			}
 		});
 	});
 

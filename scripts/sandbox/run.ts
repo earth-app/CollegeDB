@@ -25,8 +25,8 @@ import {
 	createNuxtHubKVProvider,
 	createPostgreSQLProvider,
 	createRedisKVProvider,
-	createSchemaAcrossShards,
 	createSQLiteProvider,
+	createSchemaAcrossShards,
 	createValkeyKVProvider,
 	first,
 	flush,
@@ -37,7 +37,15 @@ import {
 	runShard
 } from '../../src/index';
 import { KVShardMapper } from '../../src/kvmap';
-import type { CollegeDBConfig, KVStorage, SQLDatabase } from '../../src/types';
+import type {
+	CollegeDBConfig,
+	D1Region,
+	KVStorage,
+	MixedShardingStrategy,
+	SQLDatabase,
+	ShardLocation,
+	ShardingStrategy
+} from '../../src/types';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..', '..');
@@ -62,6 +70,20 @@ const SCENARIO_NAMES = [
 	'shard_fanout',
 	'reassignment'
 ] as const;
+const SHARDING_STRATEGIES = ['round-robin', 'random', 'hash', 'location'] as const;
+const STRATEGY_BENCHMARK_TARGET_REGIONS = ['wnam', 'enam', 'weur', 'apac', 'oc'] as const;
+const STRATEGY_BENCHMARK_SHARDS = [
+	{ binding: 'db-wnam', location: { region: 'wnam', priority: 3 } },
+	{ binding: 'db-enam', location: { region: 'enam', priority: 2 } },
+	{ binding: 'db-weur', location: { region: 'weur', priority: 2 } },
+	{ binding: 'db-apac', location: { region: 'apac', priority: 2 } },
+	{ binding: 'db-oc', location: { region: 'oc', priority: 1 } }
+] as const;
+const CLOUDFLARE_STRATEGY_SHARD_LOCATIONS: Record<string, ShardLocation> = {
+	'db-east': { region: 'enam', priority: 2 },
+	'db-west': { region: 'wnam', priority: 2 },
+	'db-central': { region: 'weur', priority: 1 }
+};
 
 type DatabaseFlavor = (typeof ALL_DATABASES)[number];
 type KVFlavor = (typeof ALL_KV)[number];
@@ -75,6 +97,7 @@ interface CLIOptions {
 	profile: AdapterProfile | 'all';
 	iterations: number;
 	bulkSize: number;
+	strategyStatements: number;
 	includeCloudflare: boolean;
 	cloudflareOnly: boolean;
 }
@@ -107,9 +130,56 @@ interface ComboResult {
 	kv: KVFlavor | 'cloudflare-kv';
 	status: Status;
 	scenarios: Record<ScenarioName, ScenarioStats>;
+	strategyBenchmark?: StrategyBenchmarkResult;
 	overallAvgMs?: number;
 	durationMs: number;
 	error?: string;
+}
+
+interface StrategyMatrixColumn {
+	key: string;
+	label: string;
+	strategy: ShardingStrategy | MixedShardingStrategy;
+}
+
+interface StrategyBenchmarkCell {
+	status: Status;
+	statements: number;
+	samplesMs: number[];
+	avgMs?: number;
+	p50Ms?: number;
+	p95Ms?: number;
+	minMs?: number;
+	maxMs?: number;
+	error?: string;
+}
+
+interface StrategyBenchmarkRow {
+	targetRegion: D1Region;
+	columns: Record<string, StrategyBenchmarkCell>;
+}
+
+interface StrategyBenchmarkResult {
+	statementsPerOperation: number;
+	writesPerStrategy: number;
+	readsPerStrategy: number;
+	shardCount: number;
+	shardLocations: Record<string, ShardLocation>;
+	databaseSizesBytes?: Record<string, number | undefined>;
+	columns: StrategyMatrixColumn[];
+	rows: StrategyBenchmarkRow[];
+	error?: string;
+}
+
+interface StrategyAggregate {
+	label: string;
+	avgMs: number;
+	p95Ms: number;
+}
+
+interface RowMetricCell {
+	text: string;
+	metric?: number;
 }
 
 interface SQLRuntime {
@@ -222,6 +292,45 @@ const SCENARIO_CATALOG: Record<
 	}
 };
 
+function getStrategyBenchmarkShardBindings(): string[] {
+	return STRATEGY_BENCHMARK_SHARDS.map((entry) => entry.binding);
+}
+
+function getStrategyBenchmarkShardLocations(): Record<string, ShardLocation> {
+	const entries = STRATEGY_BENCHMARK_SHARDS.map((entry) => [entry.binding, entry.location] as const);
+	return Object.fromEntries(entries);
+}
+
+function buildStrategyBenchmarkColumns(): StrategyMatrixColumn[] {
+	const columns: StrategyMatrixColumn[] = [];
+
+	for (const strategy of SHARDING_STRATEGIES) {
+		columns.push({
+			key: `single:${strategy}`,
+			label: `single:${strategy}`,
+			strategy
+		});
+	}
+
+	for (const read of SHARDING_STRATEGIES) {
+		for (const write of SHARDING_STRATEGIES) {
+			if (read === write) {
+				continue;
+			}
+
+			columns.push({
+				key: `mixed:r=${read},w=${write}`,
+				label: `mixed:r=${read},w=${write}`,
+				strategy: { read, write }
+			});
+		}
+	}
+
+	return columns;
+}
+
+const STRATEGY_BENCHMARK_COLUMNS = buildStrategyBenchmarkColumns();
+
 async function main(): Promise<void> {
 	const options = parseArgs(Bun.argv.slice(2));
 	const combos = options.cloudflareOnly ? [] : buildCombos(options.db, options.kv);
@@ -238,20 +347,36 @@ async function main(): Promise<void> {
 	for (const combo of combos) {
 		const profiles = profilesForCombo(combo.db, options.profile);
 		for (const profile of profiles) {
-			console.log(`\n[Sandbox] Running ${combo.id} (${profile})...`);
+			const startedAt = new Date();
+			const wallStarted = performance.now();
+			console.log(`\n[Sandbox] [${startedAt.toISOString()}] START ${combo.id} (${profile})`);
+
 			const result = await benchmarkCombo(combo, profile, options);
 			comboResults.push(result);
-			console.log(`[Sandbox] ${combo.id} (${profile}) => ${result.status}`);
+
+			const completedAt = new Date();
+			const wallDurationMs = performance.now() - wallStarted;
+			console.log(
+				`[Sandbox] [${completedAt.toISOString()}] COMPLETE ${combo.id} (${profile}) => ${result.status.toUpperCase()} (benchmark=${formatMs(result.durationMs)}, wall=${formatMs(wallDurationMs)})`
+			);
 		}
 	}
 
 	const cloudflareResults: ComboResult[] = [];
 	if (options.includeCloudflare || options.cloudflareOnly) {
 		for (const profile of profilesForCloudflare(options.profile)) {
-			console.log(`\n[Sandbox] Running cloudflare (${profile}) benchmark...`);
+			const startedAt = new Date();
+			const wallStarted = performance.now();
+			console.log(`\n[Sandbox] [${startedAt.toISOString()}] START cloudflare (${profile})`);
+
 			const result = await benchmarkCloudflare(options, profile);
 			cloudflareResults.push(result);
-			console.log(`[Sandbox] cloudflare (${profile}) => ${result.status}`);
+
+			const completedAt = new Date();
+			const wallDurationMs = performance.now() - wallStarted;
+			console.log(
+				`[Sandbox] [${completedAt.toISOString()}] COMPLETE cloudflare (${profile}) => ${result.status.toUpperCase()} (benchmark=${formatMs(result.durationMs)}, wall=${formatMs(wallDurationMs)})`
+			);
 		}
 	}
 
@@ -283,6 +408,7 @@ function parseArgs(args: string[]): CLIOptions {
 		profile: 'all',
 		iterations: 20,
 		bulkSize: 160,
+		strategyStatements: 100,
 		includeCloudflare: false,
 		cloudflareOnly: false
 	};
@@ -305,6 +431,11 @@ function parseArgs(args: string[]): CLIOptions {
 			defaults.iterations = Math.max(1, Number.parseInt(arg.slice('--iterations='.length), 10) || defaults.iterations);
 		} else if (arg.startsWith('--bulk-size=')) {
 			defaults.bulkSize = Math.max(10, Number.parseInt(arg.slice('--bulk-size='.length), 10) || defaults.bulkSize);
+		} else if (arg.startsWith('--strategy-statements=')) {
+			defaults.strategyStatements = Math.max(
+				10,
+				Number.parseInt(arg.slice('--strategy-statements='.length), 10) || defaults.strategyStatements
+			);
 		} else if (arg === '--include-cloudflare') {
 			defaults.includeCloudflare = true;
 		} else if (arg === '--cloudflare-only') {
@@ -388,6 +519,7 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 	const services = composeServicesForCombo(combo);
 	let kvRuntime: KVRuntime | null = null;
 	let sqlRuntime: SQLRuntime | null = null;
+	let strategyBenchmark: StrategyBenchmarkResult | undefined;
 	let initialized = false;
 	const resultId = `${combo.id}/${profile}`;
 
@@ -447,7 +579,12 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 		await resetBenchData();
 		scenarios.reassignment = await scenarioReassignment(plan.reassignment, config);
 
-		const status: Status = Object.values(scenarios).some((scenario) => scenario.status === 'failed') ? 'failed' : 'passed';
+		strategyBenchmark = await benchmarkStrategyBulkMatrix(combo.db, profile, options, kvRuntime.kv);
+
+		const status: Status =
+			Object.values(scenarios).some((scenario) => scenario.status === 'failed') || strategyBenchmarkHasFailures(strategyBenchmark)
+				? 'failed'
+				: 'passed';
 		return {
 			id: resultId,
 			baseId: combo.id,
@@ -456,6 +593,7 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 			kv: combo.kv,
 			status,
 			scenarios,
+			strategyBenchmark,
 			overallAvgMs: computeOverallAverage(scenarios),
 			durationMs: performance.now() - started
 		};
@@ -469,6 +607,7 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 			kv: combo.kv,
 			status: 'failed',
 			scenarios,
+			strategyBenchmark,
 			durationMs: performance.now() - started,
 			error: message
 		};
@@ -494,6 +633,7 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 	const scenarios = createSkippedScenarioMap('Not run');
 	const started = performance.now();
 	const resultId = `cloudflare/${profile}`;
+	let strategyBenchmark: StrategyBenchmarkResult | undefined;
 
 	const wranglerArgs = [
 		WRANGLER_BIN,
@@ -566,7 +706,12 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 		await resetCloudflareBenchmarkData(profile);
 		scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
 
-		const status: Status = Object.values(scenarios).some((scenario) => scenario.status === 'failed') ? 'failed' : 'passed';
+		strategyBenchmark = await benchmarkCloudflareStrategyBulkMatrix(options, profile);
+
+		const status: Status =
+			Object.values(scenarios).some((scenario) => scenario.status === 'failed') || strategyBenchmarkHasFailures(strategyBenchmark)
+				? 'failed'
+				: 'passed';
 		return {
 			id: resultId,
 			baseId: 'cloudflare',
@@ -575,6 +720,7 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 			kv: 'cloudflare-kv',
 			status,
 			scenarios,
+			strategyBenchmark,
 			overallAvgMs: computeOverallAverage(scenarios),
 			durationMs: performance.now() - started
 		};
@@ -590,12 +736,412 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 			kv: 'cloudflare-kv',
 			status: 'failed',
 			scenarios,
+			strategyBenchmark,
 			durationMs: performance.now() - started,
 			error: `${message}\n${trimForReport(stderr || stdout, 2000)}`.trim()
 		};
 	} finally {
 		await terminateProcess(proc);
 	}
+}
+
+function createFailedCloudflareStrategyBenchmarkResult(statements: number, error: string): StrategyBenchmarkResult {
+	const rows: StrategyBenchmarkRow[] = STRATEGY_BENCHMARK_TARGET_REGIONS.map((targetRegion) => {
+		const failedColumns = Object.fromEntries(
+			STRATEGY_BENCHMARK_COLUMNS.map((column) => [
+				column.key,
+				{
+					status: 'failed' as Status,
+					statements: statements * 2,
+					samplesMs: [],
+					error
+				} satisfies StrategyBenchmarkCell
+			])
+		) as Record<string, StrategyBenchmarkCell>;
+
+		return {
+			targetRegion,
+			columns: failedColumns
+		};
+	});
+
+	return {
+		statementsPerOperation: statements,
+		writesPerStrategy: statements,
+		readsPerStrategy: statements,
+		shardCount: Object.keys(CLOUDFLARE_STRATEGY_SHARD_LOCATIONS).length,
+		shardLocations: CLOUDFLARE_STRATEGY_SHARD_LOCATIONS,
+		databaseSizesBytes: undefined,
+		columns: STRATEGY_BENCHMARK_COLUMNS,
+		rows,
+		error
+	};
+}
+
+async function benchmarkCloudflareStrategyBulkMatrix(options: CLIOptions, profile: AdapterProfile): Promise<StrategyBenchmarkResult> {
+	const statements = Math.max(10, Math.floor(options.strategyStatements / 2));
+
+	try {
+		const rows: StrategyBenchmarkRow[] = [];
+
+		for (const targetRegion of STRATEGY_BENCHMARK_TARGET_REGIONS) {
+			const columns: Record<string, StrategyBenchmarkCell> = {};
+
+			for (const column of STRATEGY_BENCHMARK_COLUMNS) {
+				columns[column.key] = await runCloudflareStrategyBenchmarkCell(column, targetRegion, statements, profile);
+			}
+
+			rows.push({
+				targetRegion,
+				columns
+			});
+		}
+
+		const databaseSizesBytes = await collectCloudflareStrategyBenchmarkDatabaseSizes(profile);
+
+		return {
+			statementsPerOperation: statements,
+			writesPerStrategy: statements,
+			readsPerStrategy: statements,
+			shardCount: Object.keys(CLOUDFLARE_STRATEGY_SHARD_LOCATIONS).length,
+			shardLocations: CLOUDFLARE_STRATEGY_SHARD_LOCATIONS,
+			databaseSizesBytes,
+			columns: STRATEGY_BENCHMARK_COLUMNS,
+			rows
+		};
+	} catch (error) {
+		return createFailedCloudflareStrategyBenchmarkResult(statements, error instanceof Error ? error.message : String(error));
+	}
+}
+
+async function runCloudflareStrategyBenchmarkCell(
+	column: StrategyMatrixColumn,
+	targetRegion: D1Region,
+	statementsPerOperation: number,
+	profile: AdapterProfile
+): Promise<StrategyBenchmarkCell> {
+	try {
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/strategy-bulk-rw',
+			{
+				strategy: column.strategy,
+				targetRegion,
+				writes: statementsPerOperation,
+				reads: statementsPerOperation,
+				prefix: `${column.key.replace(/[^a-z0-9]+/gi, '_')}_${targetRegion}`
+			},
+			profile
+		);
+
+		const body = (await response.json()) as {
+			success?: boolean;
+			samplesMs?: number[];
+			statements?: number;
+			error?: string;
+		};
+
+		const samplesMs = Array.isArray(body.samplesMs)
+			? body.samplesMs.filter((sample): sample is number => typeof sample === 'number' && Number.isFinite(sample))
+			: [];
+
+		if (!body.success) {
+			return {
+				status: 'failed',
+				statements: typeof body.statements === 'number' ? body.statements : samplesMs.length,
+				samplesMs,
+				...calculateLatencyStats(samplesMs),
+				error: body.error ?? 'Cloudflare strategy benchmark endpoint reported failure'
+			};
+		}
+
+		return {
+			status: 'passed',
+			statements: typeof body.statements === 'number' ? body.statements : samplesMs.length,
+			samplesMs,
+			...calculateLatencyStats(samplesMs)
+		};
+	} catch (error) {
+		return {
+			status: 'failed',
+			statements: 0,
+			samplesMs: [],
+			...calculateLatencyStats([]),
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+async function collectCloudflareStrategyBenchmarkDatabaseSizes(
+	profile: AdapterProfile
+): Promise<Record<string, number | undefined> | undefined> {
+	try {
+		const response = await fetch(cloudflareUrl('/api/benchmark/database-sizes', profile));
+		await assertOk(response, 'GET /api/benchmark/database-sizes');
+		const body = (await response.json()) as {
+			success?: boolean;
+			sizes?: Record<string, unknown>;
+		};
+
+		if (!body.success || !body.sizes || typeof body.sizes !== 'object') {
+			return undefined;
+		}
+
+		const out: Record<string, number | undefined> = {};
+		for (const [binding, value] of Object.entries(body.sizes)) {
+			const numeric = Number(value);
+			out[binding] = Number.isFinite(numeric) ? numeric : undefined;
+		}
+
+		return out;
+	} catch {
+		return undefined;
+	}
+}
+
+function strategyBenchmarkHasFailures(strategyBenchmark?: StrategyBenchmarkResult): boolean {
+	if (!strategyBenchmark) {
+		return false;
+	}
+
+	if (strategyBenchmark.error) {
+		return true;
+	}
+
+	for (const row of strategyBenchmark.rows) {
+		for (const column of strategyBenchmark.columns) {
+			const cell = row.columns[column.key];
+			if (!cell || cell.status === 'failed') {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+function createFailedStrategyBenchmarkResult(statements: number, error: string): StrategyBenchmarkResult {
+	const rows: StrategyBenchmarkRow[] = STRATEGY_BENCHMARK_TARGET_REGIONS.map((targetRegion) => {
+		const failedColumns = Object.fromEntries(
+			STRATEGY_BENCHMARK_COLUMNS.map((column) => [
+				column.key,
+				{
+					status: 'failed' as Status,
+					statements: statements * 2,
+					samplesMs: [],
+					error
+				} satisfies StrategyBenchmarkCell
+			])
+		) as Record<string, StrategyBenchmarkCell>;
+
+		return {
+			targetRegion,
+			columns: failedColumns
+		};
+	});
+
+	return {
+		statementsPerOperation: statements,
+		writesPerStrategy: statements,
+		readsPerStrategy: statements,
+		shardCount: STRATEGY_BENCHMARK_SHARDS.length,
+		shardLocations: getStrategyBenchmarkShardLocations(),
+		columns: STRATEGY_BENCHMARK_COLUMNS,
+		rows,
+		error
+	};
+}
+
+async function benchmarkStrategyBulkMatrix(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	options: CLIOptions,
+	kv: KVStorage
+): Promise<StrategyBenchmarkResult> {
+	let sqlRuntime: SQLRuntime | null = null;
+	const statements = options.strategyStatements;
+	const shardBindings = getStrategyBenchmarkShardBindings();
+	const shardLocations = getStrategyBenchmarkShardLocations();
+
+	try {
+		sqlRuntime = await createSQLRuntime(dbFlavor, createRunId(`strategy_${dbFlavor}_${profile}`), profile, shardBindings);
+
+		const baseConfig: Omit<CollegeDBConfig, 'strategy' | 'targetRegion'> = {
+			kv,
+			shards: sqlRuntime.shards,
+			shardLocations,
+			disableAutoMigration: true,
+			hashShardMappings: true,
+			mappingCacheTtlMs: 60_000,
+			knownShardsCacheTtlMs: 10_000,
+			sizeCacheTtlMs: 10_000,
+			migrationConcurrency: 25
+		};
+
+		initialize({ ...baseConfig, strategy: 'hash', targetRegion: 'wnam' });
+		await createSchemaAcrossShards(sqlRuntime.shards, BENCH_SCHEMA);
+
+		const rows: StrategyBenchmarkRow[] = [];
+
+		for (const targetRegion of STRATEGY_BENCHMARK_TARGET_REGIONS) {
+			const columns: Record<string, StrategyBenchmarkCell> = {};
+
+			for (const column of STRATEGY_BENCHMARK_COLUMNS) {
+				initialize({
+					...baseConfig,
+					strategy: column.strategy,
+					targetRegion
+				});
+
+				columns[column.key] = await runStrategyBenchmarkCell(column, targetRegion, statements);
+			}
+
+			rows.push({
+				targetRegion,
+				columns
+			});
+		}
+
+		const databaseSizesBytes = await collectStrategyBenchmarkDatabaseSizes(dbFlavor, shardBindings);
+
+		return {
+			statementsPerOperation: statements,
+			writesPerStrategy: statements,
+			readsPerStrategy: statements,
+			shardCount: shardBindings.length,
+			shardLocations,
+			databaseSizesBytes,
+			columns: STRATEGY_BENCHMARK_COLUMNS,
+			rows
+		};
+	} catch (error) {
+		return createFailedStrategyBenchmarkResult(statements, error instanceof Error ? error.message : String(error));
+	} finally {
+		await safely(async () => flush());
+		resetConfig();
+
+		if (sqlRuntime) {
+			await safely(async () => sqlRuntime?.close());
+		}
+	}
+}
+
+async function runStrategyBenchmarkCell(
+	column: StrategyMatrixColumn,
+	targetRegion: D1Region,
+	statementsPerOperation: number
+): Promise<StrategyBenchmarkCell> {
+	const samplesMs: number[] = [];
+	const existingReadCount = Math.floor(statementsPerOperation / 2);
+	const missReadCount = statementsPerOperation - existingReadCount;
+
+	try {
+		await resetBenchData();
+
+		const prefix = `${column.key.replace(/[^a-z0-9]+/gi, '_')}_${targetRegion}_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+		const writeKeys = new Array(statementsPerOperation).fill(null).map((_, i) => `${prefix}_write_${i}`);
+
+		for (let i = 0; i < writeKeys.length; i++) {
+			const key = writeKeys[i]!;
+			const sample = await measureLatencySample(async () => {
+				await run(key, INSERT_USER_SQL, [key, `Strategy Write ${i}`, `${key}@strategy.local`, Date.now()]);
+			});
+			samplesMs.push(sample);
+		}
+
+		for (let i = 0; i < existingReadCount; i++) {
+			const key = writeKeys[i]!;
+			const sample = await measureLatencySample(async () => {
+				const row = await first<Record<string, unknown>>(key, SELECT_USER_SQL, [key]);
+				if (!row) {
+					throw new Error(`Missing row for existing-key read: ${key}`);
+				}
+			});
+			samplesMs.push(sample);
+		}
+
+		for (let i = 0; i < missReadCount; i++) {
+			const key = `${prefix}_readmiss_${i}`;
+			const sample = await measureLatencySample(async () => {
+				await first<Record<string, unknown>>(key, SELECT_USER_SQL, [key]);
+			});
+			samplesMs.push(sample);
+		}
+
+		return {
+			status: 'passed',
+			statements: samplesMs.length,
+			samplesMs,
+			...calculateLatencyStats(samplesMs)
+		};
+	} catch (error) {
+		return {
+			status: 'failed',
+			statements: samplesMs.length,
+			samplesMs,
+			...calculateLatencyStats(samplesMs),
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+async function collectStrategyBenchmarkDatabaseSizes(
+	dbFlavor: DatabaseFlavor,
+	shardBindings: string[]
+): Promise<Record<string, number | undefined>> {
+	const out: Record<string, number | undefined> = {};
+
+	for (const shardBinding of shardBindings) {
+		out[shardBinding] = await getShardDatabaseSizeAfterBenchmark(dbFlavor, shardBinding);
+	}
+
+	return out;
+}
+
+async function getShardDatabaseSizeAfterBenchmark(dbFlavor: DatabaseFlavor, shardBinding: string): Promise<number | undefined> {
+	try {
+		switch (dbFlavor) {
+			case 'postgres': {
+				const result = await allShard<Record<string, unknown>>(shardBinding, 'SELECT pg_database_size(current_database()) AS size_bytes');
+				return extractFirstNumericFromRows(result.results);
+			}
+			case 'mysql':
+			case 'mariadb': {
+				const result = await allShard<Record<string, unknown>>(
+					shardBinding,
+					'SELECT COALESCE(SUM(data_length + index_length), 0) AS size_bytes FROM information_schema.tables WHERE table_schema = DATABASE()'
+				);
+				return extractFirstNumericFromRows(result.results);
+			}
+			case 'sqlite': {
+				const pageCountResult = await allShard<Record<string, unknown>>(shardBinding, 'PRAGMA page_count');
+				const pageSizeResult = await allShard<Record<string, unknown>>(shardBinding, 'PRAGMA page_size');
+				const pageCount = extractFirstNumericFromRows(pageCountResult.results);
+				const pageSize = extractFirstNumericFromRows(pageSizeResult.results);
+				if (typeof pageCount === 'number' && typeof pageSize === 'number') {
+					return pageCount * pageSize;
+				}
+				return undefined;
+			}
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+function extractFirstNumericFromRows(rows: Record<string, unknown>[]): number | undefined {
+	const firstRow = rows[0];
+	if (!firstRow) {
+		return undefined;
+	}
+
+	for (const value of Object.values(firstRow)) {
+		const numeric = Number(value);
+		if (Number.isFinite(numeric)) {
+			return numeric;
+		}
+	}
+
+	return undefined;
 }
 
 async function scenarioBasicCrud(iterations: number): Promise<ScenarioStats> {
@@ -1121,24 +1667,31 @@ async function scanRedisKeys(client: any, cursor: string, pattern: string): Prom
 	}
 }
 
-async function createSQLRuntime(dbFlavor: DatabaseFlavor, runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
+async function createSQLRuntime(
+	dbFlavor: DatabaseFlavor,
+	runId: string,
+	profile: AdapterProfile,
+	shardBindings: string[] = ['shard-a', 'shard-b']
+): Promise<SQLRuntime> {
 	switch (dbFlavor) {
 		case 'postgres':
-			return createPostgresRuntime(runId, profile);
+			return createPostgresRuntime(runId, profile, shardBindings);
 		case 'mysql':
-			return createMySQLRuntime(runId, 3306, profile);
+			return createMySQLRuntime(runId, 3306, profile, shardBindings);
 		case 'mariadb':
-			return createMySQLRuntime(runId, 3307, profile);
+			return createMySQLRuntime(runId, 3307, profile, shardBindings);
 		case 'sqlite':
-			return createSQLiteRuntime(runId, profile);
+			return createSQLiteRuntime(runId, profile, shardBindings);
 	}
 }
 
-async function createPostgresRuntime(runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
+async function createPostgresRuntime(runId: string, profile: AdapterProfile, shardBindings: string[]): Promise<SQLRuntime> {
 	await waitForPostgres();
 
-	const dbA = sanitizeDatabaseName(`collegedb_a_${runId}`);
-	const dbB = sanitizeDatabaseName(`collegedb_b_${runId}`);
+	const dbNamesByBinding = new Map<string, string>();
+	for (const binding of shardBindings) {
+		dbNamesByBinding.set(binding, sanitizeDatabaseName(`collegedb_${binding}_${runId}`));
+	}
 
 	const admin = new PostgresClient({
 		host: '127.0.0.1',
@@ -1148,44 +1701,36 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile): Pr
 		database: 'postgres'
 	});
 	await admin.connect();
-
-	await dropPostgresDatabase(admin, dbA);
-	await dropPostgresDatabase(admin, dbB);
-	await admin.query(`CREATE DATABASE "${escapePgIdentifier(dbA)}"`);
-	await admin.query(`CREATE DATABASE "${escapePgIdentifier(dbB)}"`);
+	for (const dbName of dbNamesByBinding.values()) {
+		await dropPostgresDatabase(admin, dbName);
+	}
+	for (const dbName of dbNamesByBinding.values()) {
+		await admin.query(`CREATE DATABASE "${escapePgIdentifier(dbName)}"`);
+	}
 	await admin.end();
 
-	const poolA = new PostgresPool({
-		host: '127.0.0.1',
-		port: 5432,
-		user: 'collegedb',
-		password: 'collegedb',
-		database: dbA,
-		max: 10
-	});
-	const poolB = new PostgresPool({
-		host: '127.0.0.1',
-		port: 5432,
-		user: 'collegedb',
-		password: 'collegedb',
-		database: dbB,
-		max: 10
-	});
-
-	await poolA.query('SELECT 1');
-	await poolB.query('SELECT 1');
-
-	const connA = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbA}`;
-	const connB = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbB}`;
+	const poolsByBinding = new Map<string, PostgresPool>();
+	for (const [binding, dbName] of dbNamesByBinding) {
+		const pool = new PostgresPool({
+			host: '127.0.0.1',
+			port: 5432,
+			user: 'collegedb',
+			password: 'collegedb',
+			database: dbName,
+			max: 10
+		});
+		await pool.query('SELECT 1');
+		poolsByBinding.set(binding, pool);
+	}
 
 	const createPostgresProviderForProfile = (pool: PostgresPool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
 		switch (currentProfile) {
 			case 'native':
-				return createPostgreSQLProvider(pool as any);
+				return createPostgreSQLProvider(pool);
 			case 'drizzle':
 			case 'nuxthub': {
-				const drizzleDb = drizzlePostgres(pool as any);
-				return createPostgreSQLProvider(drizzleDb as any, drizzleSql);
+				const drizzleDb = drizzlePostgres(pool);
+				return createPostgreSQLProvider(drizzleDb, drizzleSql);
 			}
 			case 'hyperdrive':
 				return createHyperdrivePostgresProvider({ connectionString }, (conn) => {
@@ -1210,14 +1755,23 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile): Pr
 		}
 	};
 
+	const shards: Record<string, SQLDatabase> = {};
+	for (const [binding, pool] of poolsByBinding) {
+		const dbName = dbNamesByBinding.get(binding);
+		if (!dbName) {
+			continue;
+		}
+		const connectionString = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbName}`;
+		shards[binding] = createPostgresProviderForProfile(pool, connectionString, profile);
+	}
+
 	return {
-		shards: {
-			'shard-a': createPostgresProviderForProfile(poolA, connA, profile),
-			'shard-b': createPostgresProviderForProfile(poolB, connB, profile)
-		},
+		shards,
 		close: async () => {
-			await poolA.end();
-			await poolB.end();
+			for (const pool of poolsByBinding.values()) {
+				await pool.end();
+			}
+
 			const closeAdmin = new PostgresClient({
 				host: '127.0.0.1',
 				port: 5432,
@@ -1226,18 +1780,21 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile): Pr
 				database: 'postgres'
 			});
 			await closeAdmin.connect();
-			await dropPostgresDatabase(closeAdmin, dbA);
-			await dropPostgresDatabase(closeAdmin, dbB);
+			for (const dbName of dbNamesByBinding.values()) {
+				await dropPostgresDatabase(closeAdmin, dbName);
+			}
 			await closeAdmin.end();
 		}
 	};
 }
 
-async function createMySQLRuntime(runId: string, port: number, profile: AdapterProfile): Promise<SQLRuntime> {
+async function createMySQLRuntime(runId: string, port: number, profile: AdapterProfile, shardBindings: string[]): Promise<SQLRuntime> {
 	await waitForMySQL(port);
 
-	const dbA = sanitizeDatabaseName(`collegedb_a_${runId}`);
-	const dbB = sanitizeDatabaseName(`collegedb_b_${runId}`);
+	const dbNamesByBinding = new Map<string, string>();
+	for (const binding of shardBindings) {
+		dbNamesByBinding.set(binding, sanitizeDatabaseName(`collegedb_${binding}_${runId}`));
+	}
 
 	const admin = await mysql.createConnection({
 		host: '127.0.0.1',
@@ -1245,43 +1802,36 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 		user: 'root',
 		password: 'root'
 	});
-	await admin.execute(`DROP DATABASE IF EXISTS \`${dbA}\``);
-	await admin.execute(`DROP DATABASE IF EXISTS \`${dbB}\``);
-	await admin.execute(`CREATE DATABASE \`${dbA}\``);
-	await admin.execute(`CREATE DATABASE \`${dbB}\``);
+	for (const dbName of dbNamesByBinding.values()) {
+		await admin.execute(`DROP DATABASE IF EXISTS \`${dbName}\``);
+	}
+	for (const dbName of dbNamesByBinding.values()) {
+		await admin.execute(`CREATE DATABASE \`${dbName}\``);
+	}
 	await admin.end();
 
-	const poolA = mysql.createPool({
-		host: '127.0.0.1',
-		port,
-		user: 'root',
-		password: 'root',
-		database: dbA,
-		connectionLimit: 10
-	});
-	const poolB = mysql.createPool({
-		host: '127.0.0.1',
-		port,
-		user: 'root',
-		password: 'root',
-		database: dbB,
-		connectionLimit: 10
-	});
-
-	await poolA.query('SELECT 1');
-	await poolB.query('SELECT 1');
-
-	const connA = `mysql://root:root@127.0.0.1:${port}/${dbA}`;
-	const connB = `mysql://root:root@127.0.0.1:${port}/${dbB}`;
+	const poolsByBinding = new Map<string, mysql.Pool>();
+	for (const [binding, dbName] of dbNamesByBinding) {
+		const pool = mysql.createPool({
+			host: '127.0.0.1',
+			port,
+			user: 'root',
+			password: 'root',
+			database: dbName,
+			connectionLimit: 10
+		});
+		await pool.query('SELECT 1');
+		poolsByBinding.set(binding, pool);
+	}
 
 	const createMySQLProviderForProfile = (pool: mysql.Pool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
 		switch (currentProfile) {
 			case 'native':
-				return createMySQLProvider(pool as any);
+				return createMySQLProvider(pool);
 			case 'drizzle':
 			case 'nuxthub': {
-				const drizzleDb = drizzleMySQL(pool as any);
-				return createMySQLProvider(drizzleDb as any, drizzleSql);
+				const drizzleDb = drizzleMySQL(pool);
+				return createMySQLProvider(drizzleDb, drizzleSql);
 			}
 			case 'hyperdrive':
 				return createHyperdriveMySQLProvider({ connectionString }, (conn) => ({
@@ -1297,52 +1847,69 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 		}
 	};
 
+	const shards: Record<string, SQLDatabase> = {};
+	for (const [binding, pool] of poolsByBinding) {
+		const dbName = dbNamesByBinding.get(binding);
+		if (!dbName) {
+			continue;
+		}
+		const connectionString = `mysql://root:root@127.0.0.1:${port}/${dbName}`;
+		shards[binding] = createMySQLProviderForProfile(pool, connectionString, profile);
+	}
+
 	return {
-		shards: {
-			'shard-a': createMySQLProviderForProfile(poolA, connA, profile),
-			'shard-b': createMySQLProviderForProfile(poolB, connB, profile)
-		},
+		shards,
 		close: async () => {
-			await poolA.end();
-			await poolB.end();
+			for (const pool of poolsByBinding.values()) {
+				await pool.end();
+			}
+
 			const closeAdmin = await mysql.createConnection({
 				host: '127.0.0.1',
 				port,
 				user: 'root',
 				password: 'root'
 			});
-			await closeAdmin.execute(`DROP DATABASE IF EXISTS \`${dbA}\``);
-			await closeAdmin.execute(`DROP DATABASE IF EXISTS \`${dbB}\``);
+			for (const dbName of dbNamesByBinding.values()) {
+				await closeAdmin.execute(`DROP DATABASE IF EXISTS \`${dbName}\``);
+			}
 			await closeAdmin.end();
 		}
 	};
 }
 
-async function createSQLiteRuntime(runId: string, profile: AdapterProfile): Promise<SQLRuntime> {
-	const fileA = resolve(TMP_DIR, `${runId}-a.sqlite`);
-	const fileB = resolve(TMP_DIR, `${runId}-b.sqlite`);
+async function createSQLiteRuntime(runId: string, profile: AdapterProfile, shardBindings: string[]): Promise<SQLRuntime> {
+	const shardFiles = shardBindings.map((binding, index) => ({
+		binding,
+		file: resolve(TMP_DIR, `${runId}-${index}-${sanitizeDatabaseName(binding)}.sqlite`)
+	}));
 
-	const dbA = new Database(fileA, { create: true });
-	const dbB = new Database(fileB, { create: true });
+	const dbByBinding = new Map<string, Database>();
+	for (const shardFile of shardFiles) {
+		dbByBinding.set(shardFile.binding, new Database(shardFile.file, { create: true }));
+	}
+
 	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
+	const shards: Record<string, SQLDatabase> = {};
 
-	const providerA = useDrizzle
-		? createSQLiteProvider(drizzleBunSQLite({ client: dbA }) as any, drizzleSql)
-		: createSQLiteProvider(dbA as any);
-	const providerB = useDrizzle
-		? createSQLiteProvider(drizzleBunSQLite({ client: dbB }) as any, drizzleSql)
-		: createSQLiteProvider(dbB as any);
+	for (const binding of shardBindings) {
+		const db = dbByBinding.get(binding);
+		if (!db) {
+			continue;
+		}
+
+		shards[binding] = useDrizzle ? createSQLiteProvider(drizzleBunSQLite({ client: db }), drizzleSql) : createSQLiteProvider(db);
+	}
 
 	return {
-		shards: {
-			'shard-a': providerA,
-			'shard-b': providerB
-		},
+		shards,
 		close: async () => {
-			dbA.close();
-			dbB.close();
-			await rm(fileA, { force: true });
-			await rm(fileB, { force: true });
+			for (const db of dbByBinding.values()) {
+				db.close();
+			}
+			for (const shardFile of shardFiles) {
+				await rm(shardFile.file, { force: true });
+			}
 		}
 	};
 }
@@ -1384,6 +1951,12 @@ function pragmaOrInfoQueryFor(dbFlavor: DatabaseFlavor): string {
 		case 'sqlite':
 			return 'PRAGMA page_count';
 	}
+}
+
+async function measureLatencySample(task: () => Promise<void>): Promise<number> {
+	const started = performance.now();
+	await task();
+	return performance.now() - started;
 }
 
 async function runInBatches<T>(items: T[], batchSize: number, task: (item: T, index: number) => Promise<void>): Promise<void> {
@@ -1713,6 +2286,113 @@ function formatMs(value: number | undefined): string {
 	return `${value.toFixed(2)} ms`;
 }
 
+function formatBytes(value: number | undefined): string {
+	if (value === undefined || Number.isNaN(value)) {
+		return 'n/a';
+	}
+
+	const units = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
+	let size = value;
+	let unitIndex = 0;
+
+	while (size >= 1024 && unitIndex < units.length - 1) {
+		size /= 1024;
+		unitIndex += 1;
+	}
+
+	return `${size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function emphasizeRowExtremes(cells: RowMetricCell[]): string[] {
+	const out = cells.map((cell) => cell.text);
+	const numeric = cells
+		.map((cell, index) => ({ index, metric: cell.metric }))
+		.filter((entry): entry is { index: number; metric: number } => typeof entry.metric === 'number' && Number.isFinite(entry.metric));
+
+	if (numeric.length === 0) {
+		return out;
+	}
+
+	let fastest = numeric[0]!;
+	let slowest = numeric[0]!;
+
+	for (const entry of numeric.slice(1)) {
+		if (entry.metric < fastest.metric) {
+			fastest = entry;
+		}
+		if (entry.metric > slowest.metric) {
+			slowest = entry;
+		}
+	}
+
+	out[fastest.index] = `**${out[fastest.index]}**`;
+	if (slowest.index !== fastest.index) {
+		out[slowest.index] = `*${out[slowest.index]}*`;
+	}
+
+	return out;
+}
+
+function strategyCellMetric(cell: StrategyBenchmarkCell | undefined): number | undefined {
+	if (!cell || cell.status !== 'passed') {
+		return undefined;
+	}
+	return cell.avgMs;
+}
+
+function strategyAggregateExtremes(strategyBenchmark?: StrategyBenchmarkResult): { best?: StrategyAggregate; worst?: StrategyAggregate } {
+	if (!strategyBenchmark) {
+		return {};
+	}
+
+	const aggregates: StrategyAggregate[] = [];
+
+	for (const column of strategyBenchmark.columns) {
+		const passing = strategyBenchmark.rows
+			.map((row) => row.columns[column.key])
+			.filter((cell): cell is StrategyBenchmarkCell => !!cell && cell.status === 'passed' && typeof cell.avgMs === 'number');
+
+		if (passing.length === 0) {
+			continue;
+		}
+
+		const avgMs = passing.reduce((sum, cell) => sum + (cell.avgMs ?? 0), 0) / passing.length;
+		const p95Ms =
+			passing.reduce((sum, cell) => sum + (typeof cell.p95Ms === 'number' ? cell.p95Ms : (cell.avgMs ?? 0)), 0) / passing.length;
+
+		aggregates.push({
+			label: column.label,
+			avgMs,
+			p95Ms
+		});
+	}
+
+	if (aggregates.length === 0) {
+		return {};
+	}
+
+	let best = aggregates[0]!;
+	let worst = aggregates[0]!;
+
+	for (const aggregate of aggregates.slice(1)) {
+		if (aggregate.avgMs < best.avgMs) {
+			best = aggregate;
+		}
+		if (aggregate.avgMs > worst.avgMs) {
+			worst = aggregate;
+		}
+	}
+
+	return { best, worst };
+}
+
+function formatStrategyAggregate(summary: StrategyAggregate | undefined): string {
+	if (!summary) {
+		return 'N/A';
+	}
+	return `${summary.label} (${formatMs(summary.avgMs)} / ${formatMs(summary.p95Ms)})`;
+}
+
 function scenarioCell(scenario: ScenarioStats): string {
 	if (scenario.status === 'failed') {
 		return 'FAILED';
@@ -1721,6 +2401,26 @@ function scenarioCell(scenario: ScenarioStats): string {
 		return 'N/A';
 	}
 	return `${formatMs(scenario.avgMs)} / ${formatMs(scenario.p95Ms)}`;
+}
+
+function strategyBenchmarkCell(cell: StrategyBenchmarkCell | undefined): string {
+	if (!cell) {
+		return 'N/A';
+	}
+	if (cell.status === 'failed') {
+		return 'FAILED';
+	}
+	if (cell.status === 'skipped') {
+		return 'N/A';
+	}
+	return `${formatMs(cell.avgMs)} / ${formatMs(cell.p95Ms)}`;
+}
+
+function scenarioMetric(scenario: ScenarioStats): number | undefined {
+	if (scenario.status !== 'passed') {
+		return undefined;
+	}
+	return scenario.avgMs;
 }
 
 function countScenarioStates(scenarios: Record<ScenarioName, ScenarioStats>): { passed: number; failed: number; skipped: number } {
@@ -1750,6 +2450,8 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	const lines: string[] = [];
 	const catalogPlan = buildIterationPlan(options.iterations);
 	const groupedByBase = new Map<string, Map<AdapterProfile, ComboResult>>();
+	const strategyResults = comboResults.filter((result) => result.strategyBenchmark);
+	const cloudflareStrategyResults = cloudflareResults.filter((result) => result.strategyBenchmark);
 
 	for (const result of comboResults) {
 		const byProfile = groupedByBase.get(result.baseId) ?? new Map<AdapterProfile, ComboResult>();
@@ -1762,14 +2464,17 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		groupedCloudflare.set(result.profile, result);
 	}
 
-	const profileCell = (result: ComboResult | undefined): string => {
+	const profileCell = (result: ComboResult | undefined): RowMetricCell => {
 		if (!result) {
-			return 'N/A';
+			return { text: 'N/A' };
 		}
 		if (result.status === 'failed') {
-			return 'FAILED';
+			return { text: 'FAILED' };
 		}
-		return formatMs(result.overallAvgMs);
+		return {
+			text: formatMs(result.overallAvgMs),
+			metric: result.overallAvgMs
+		};
 	};
 
 	lines.push('# CollegeDB Sandbox Benchmark Report');
@@ -1783,12 +2488,17 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	lines.push(`- Profile filter: ${options.profile}`);
 	lines.push(`- Base iterations: ${options.iterations}`);
 	lines.push(`- Bulk size: ${options.bulkSize}`);
+	lines.push(`- Strategy benchmark statements per operation: ${options.strategyStatements}`);
 	lines.push(`- Included Cloudflare run: ${options.includeCloudflare || options.cloudflareOnly ? 'yes' : 'no'}`);
 	lines.push('');
 	lines.push('## How To Read This Report');
 	lines.push('');
 	lines.push('- `Status` is `PASSED` only when every scenario in that environment passed.');
 	lines.push('- Matrix latency cells are `average / p95` in milliseconds.');
+	lines.push('- Fastest latency in each matrix row is bold; slowest latency is italicized.');
+	lines.push(
+		`- Strategy matrix cells execute ${options.strategyStatements} writes + ${options.strategyStatements} reads per strategy, per target-region profile.`
+	);
 	lines.push('- `N/A` indicates an intentionally skipped scenario for that environment.');
 	lines.push('- Use `Detailed Scenario Statistics` for full per-scenario latency distribution and errors.');
 	lines.push('');
@@ -1805,13 +2515,19 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	if (comboResults.length > 0) {
 		lines.push('## Matrix: SQL x KV (Overall)');
 		lines.push('');
-		lines.push('| Combination | Profile | Status | Passed | Failed | Skipped | Overall Avg | Duration |');
-		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+		lines.push('| Combination | Profile | Status | Passed | Failed | Skipped | Overall Avg | Duration | Best Strategy | Worst Strategy |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
 			const states = countScenarioStates(result.scenarios);
+			const strategyExtremes = strategyAggregateExtremes(result.strategyBenchmark);
+			const formattedStrategyCells = emphasizeRowExtremes([
+				{ text: formatStrategyAggregate(strategyExtremes.best), metric: strategyExtremes.best?.avgMs },
+				{ text: formatStrategyAggregate(strategyExtremes.worst), metric: strategyExtremes.worst?.avgMs }
+			]);
+
 			lines.push(
-				`| ${result.baseId} | ${result.profile} | ${result.status.toUpperCase()} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} |`
+				`| ${result.baseId} | ${result.profile} | ${result.status.toUpperCase()} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} | ${formattedStrategyCells[0]} | ${formattedStrategyCells[1]} |`
 			);
 		}
 		lines.push('');
@@ -1821,8 +2537,16 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('| Combination | native | drizzle | hyperdrive | nuxthub |');
 		lines.push('| --- | --- | --- | --- | --- |');
 		for (const [baseId, byProfile] of groupedByBase) {
+			const profileCells = [
+				profileCell(byProfile.get('native')),
+				profileCell(byProfile.get('drizzle')),
+				profileCell(byProfile.get('hyperdrive')),
+				profileCell(byProfile.get('nuxthub'))
+			];
+			const formattedProfileCells = emphasizeRowExtremes(profileCells);
+
 			lines.push(
-				`| ${baseId} | ${profileCell(byProfile.get('native'))} | ${profileCell(byProfile.get('drizzle'))} | ${profileCell(byProfile.get('hyperdrive'))} | ${profileCell(byProfile.get('nuxthub'))} |`
+				`| ${baseId} | ${formattedProfileCells[0]} | ${formattedProfileCells[1]} | ${formattedProfileCells[2]} | ${formattedProfileCells[3]} |`
 			);
 		}
 		lines.push('');
@@ -1833,8 +2557,18 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
+			const rowCells = [
+				{ text: scenarioCell(result.scenarios.basic_crud), metric: scenarioMetric(result.scenarios.basic_crud) },
+				{ text: scenarioCell(result.scenarios.advanced_usage), metric: scenarioMetric(result.scenarios.advanced_usage) },
+				{ text: scenarioCell(result.scenarios.migration_mapping), metric: scenarioMetric(result.scenarios.migration_mapping) },
+				{ text: scenarioCell(result.scenarios.bulk_crud), metric: scenarioMetric(result.scenarios.bulk_crud) },
+				{ text: scenarioCell(result.scenarios.indexing), metric: scenarioMetric(result.scenarios.indexing) },
+				{ text: formatMs(result.overallAvgMs), metric: result.overallAvgMs }
+			];
+			const formattedCells = emphasizeRowExtremes(rowCells);
+
 			lines.push(
-				`| ${result.baseId} | ${result.profile} | ${scenarioCell(result.scenarios.basic_crud)} | ${scenarioCell(result.scenarios.advanced_usage)} | ${scenarioCell(result.scenarios.migration_mapping)} | ${scenarioCell(result.scenarios.bulk_crud)} | ${scenarioCell(result.scenarios.indexing)} | ${formatMs(result.overallAvgMs)} |`
+				`| ${result.baseId} | ${result.profile} | ${formattedCells[0]} | ${formattedCells[1]} | ${formattedCells[2]} | ${formattedCells[3]} | ${formattedCells[4]} | ${formattedCells[5]} |`
 			);
 		}
 		lines.push('');
@@ -1845,11 +2579,75 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('| --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
+			const rowCells = [
+				{ text: scenarioCell(result.scenarios.metadata_fetch), metric: scenarioMetric(result.scenarios.metadata_fetch) },
+				{ text: scenarioCell(result.scenarios.pragma_or_info), metric: scenarioMetric(result.scenarios.pragma_or_info) },
+				{ text: scenarioCell(result.scenarios.counting), metric: scenarioMetric(result.scenarios.counting) },
+				{ text: scenarioCell(result.scenarios.shard_fanout), metric: scenarioMetric(result.scenarios.shard_fanout) },
+				{ text: scenarioCell(result.scenarios.reassignment), metric: scenarioMetric(result.scenarios.reassignment) }
+			];
+			const formattedCells = emphasizeRowExtremes(rowCells);
+
 			lines.push(
-				`| ${result.baseId} | ${result.profile} | ${scenarioCell(result.scenarios.metadata_fetch)} | ${scenarioCell(result.scenarios.pragma_or_info)} | ${scenarioCell(result.scenarios.counting)} | ${scenarioCell(result.scenarios.shard_fanout)} | ${scenarioCell(result.scenarios.reassignment)} |`
+				`| ${result.baseId} | ${result.profile} | ${formattedCells[0]} | ${formattedCells[1]} | ${formattedCells[2]} | ${formattedCells[3]} | ${formattedCells[4]} |`
 			);
 		}
 		lines.push('');
+
+		if (strategyResults.length > 0) {
+			const firstStrategy = strategyResults.find((result) => result.strategyBenchmark)?.strategyBenchmark;
+			if (firstStrategy) {
+				const shardLocationSummary = Object.entries(firstStrategy.shardLocations)
+					.map(([binding, location]) => `${binding}:${location.region}`)
+					.join(', ');
+
+				lines.push('## Matrix: Bulk Read/Write Strategy Mix (avg/p95)');
+				lines.push('');
+				lines.push(
+					`- Workload per strategy cell: ${firstStrategy.writesPerStrategy} writes + ${firstStrategy.readsPerStrategy} reads on ${firstStrategy.shardCount} mock databases.`
+				);
+				lines.push('- Strategy columns include every single strategy and mixed read/write permutations where read and write differ.');
+				lines.push(`- Mock shard locations (Cloudflare D1-style regions): ${shardLocationSummary}`);
+				lines.push('');
+
+				for (const targetRegion of STRATEGY_BENCHMARK_TARGET_REGIONS) {
+					lines.push(`### Target Region: ${targetRegion}`);
+					lines.push('');
+					const headers = ['Combination', 'Profile', ...firstStrategy.columns.map((column) => column.label)];
+					lines.push(`| ${headers.join(' | ')} |`);
+					lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+
+					for (const result of strategyResults) {
+						const benchmark = result.strategyBenchmark;
+						if (!benchmark) {
+							continue;
+						}
+
+						const row = benchmark.rows.find((entry) => entry.targetRegion === targetRegion);
+						const cells = benchmark.columns.map((column) => ({
+							text: strategyBenchmarkCell(row?.columns[column.key]),
+							metric: strategyCellMetric(row?.columns[column.key])
+						}));
+						const formattedCells = emphasizeRowExtremes(cells);
+						lines.push(`| ${result.baseId} | ${result.profile} | ${formattedCells.join(' | ')} |`);
+					}
+
+					lines.push('');
+				}
+
+				lines.push('## Matrix: Strategy Benchmark Database Sizes');
+				lines.push('');
+				lines.push('| Combination | Profile | db-wnam | db-enam | db-weur | db-apac | db-oc |');
+				lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+				for (const result of strategyResults) {
+					const sizes = result.strategyBenchmark?.databaseSizesBytes;
+					lines.push(
+						`| ${result.baseId} | ${result.profile} | ${formatBytes(sizes?.['db-wnam'])} | ${formatBytes(sizes?.['db-enam'])} | ${formatBytes(sizes?.['db-weur'])} | ${formatBytes(sizes?.['db-apac'])} | ${formatBytes(sizes?.['db-oc'])} |`
+					);
+				}
+				lines.push('');
+			}
+		}
 	}
 
 	if (cloudflareResults.length > 0) {
@@ -1860,8 +2658,23 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		);
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 		for (const result of cloudflareResults) {
+			const rowCells = [
+				{ text: scenarioCell(result.scenarios.basic_crud), metric: scenarioMetric(result.scenarios.basic_crud) },
+				{ text: scenarioCell(result.scenarios.advanced_usage), metric: scenarioMetric(result.scenarios.advanced_usage) },
+				{ text: scenarioCell(result.scenarios.migration_mapping), metric: scenarioMetric(result.scenarios.migration_mapping) },
+				{ text: scenarioCell(result.scenarios.bulk_crud), metric: scenarioMetric(result.scenarios.bulk_crud) },
+				{ text: scenarioCell(result.scenarios.indexing), metric: scenarioMetric(result.scenarios.indexing) },
+				{ text: scenarioCell(result.scenarios.metadata_fetch), metric: scenarioMetric(result.scenarios.metadata_fetch) },
+				{ text: scenarioCell(result.scenarios.pragma_or_info), metric: scenarioMetric(result.scenarios.pragma_or_info) },
+				{ text: scenarioCell(result.scenarios.counting), metric: scenarioMetric(result.scenarios.counting) },
+				{ text: scenarioCell(result.scenarios.shard_fanout), metric: scenarioMetric(result.scenarios.shard_fanout) },
+				{ text: scenarioCell(result.scenarios.reassignment), metric: scenarioMetric(result.scenarios.reassignment) },
+				{ text: formatMs(result.overallAvgMs), metric: result.overallAvgMs }
+			];
+			const formattedCells = emphasizeRowExtremes(rowCells);
+
 			lines.push(
-				`| cloudflare | ${result.profile} | ${result.status.toUpperCase()} | ${scenarioCell(result.scenarios.basic_crud)} | ${scenarioCell(result.scenarios.advanced_usage)} | ${scenarioCell(result.scenarios.migration_mapping)} | ${scenarioCell(result.scenarios.bulk_crud)} | ${scenarioCell(result.scenarios.indexing)} | ${scenarioCell(result.scenarios.metadata_fetch)} | ${scenarioCell(result.scenarios.pragma_or_info)} | ${scenarioCell(result.scenarios.counting)} | ${scenarioCell(result.scenarios.shard_fanout)} | ${scenarioCell(result.scenarios.reassignment)} | ${formatMs(result.overallAvgMs)} |`
+				`| cloudflare | ${result.profile} | ${result.status.toUpperCase()} | ${formattedCells[0]} | ${formattedCells[1]} | ${formattedCells[2]} | ${formattedCells[3]} | ${formattedCells[4]} | ${formattedCells[5]} | ${formattedCells[6]} | ${formattedCells[7]} | ${formattedCells[8]} | ${formattedCells[9]} | ${formattedCells[10]} |`
 			);
 		}
 		lines.push('');
@@ -1869,10 +2682,71 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('');
 		lines.push('| Environment | native | drizzle | nuxthub |');
 		lines.push('| --- | --- | --- | --- |');
+		const cloudflareProfileCells = [
+			profileCell(groupedCloudflare.get('native')),
+			profileCell(groupedCloudflare.get('drizzle')),
+			profileCell(groupedCloudflare.get('nuxthub'))
+		];
+		const formattedCloudflareProfiles = emphasizeRowExtremes(cloudflareProfileCells);
 		lines.push(
-			`| cloudflare | ${profileCell(groupedCloudflare.get('native'))} | ${profileCell(groupedCloudflare.get('drizzle'))} | ${profileCell(groupedCloudflare.get('nuxthub'))} |`
+			`| cloudflare | ${formattedCloudflareProfiles[0]} | ${formattedCloudflareProfiles[1]} | ${formattedCloudflareProfiles[2]} |`
 		);
 		lines.push('');
+
+		if (cloudflareStrategyResults.length > 0) {
+			const firstCloudflareStrategy = cloudflareStrategyResults.find((result) => result.strategyBenchmark)?.strategyBenchmark;
+			if (firstCloudflareStrategy) {
+				const shardLocationSummary = Object.entries(firstCloudflareStrategy.shardLocations)
+					.map(([binding, location]) => `${binding}:${location.region}`)
+					.join(', ');
+				const cloudflareShardBindings = Object.keys(firstCloudflareStrategy.shardLocations);
+
+				lines.push('## Matrix: Cloudflare Bulk Read/Write Strategy Mix (avg/p95)');
+				lines.push('');
+				lines.push(
+					`- Workload per strategy cell: ${firstCloudflareStrategy.writesPerStrategy} writes + ${firstCloudflareStrategy.readsPerStrategy} reads on ${firstCloudflareStrategy.shardCount} Cloudflare D1 shard bindings.`
+				);
+				lines.push('- Strategy columns include every single strategy and mixed read/write permutations where read and write differ.');
+				lines.push(`- Cloudflare D1 shard locations: ${shardLocationSummary}`);
+				lines.push('');
+
+				for (const targetRegion of STRATEGY_BENCHMARK_TARGET_REGIONS) {
+					lines.push(`### Cloudflare Target Region: ${targetRegion}`);
+					lines.push('');
+					const headers = ['Environment', 'Profile', ...firstCloudflareStrategy.columns.map((column) => column.label)];
+					lines.push(`| ${headers.join(' | ')} |`);
+					lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+
+					for (const result of cloudflareStrategyResults) {
+						const benchmark = result.strategyBenchmark;
+						if (!benchmark) {
+							continue;
+						}
+
+						const row = benchmark.rows.find((entry) => entry.targetRegion === targetRegion);
+						const cells = benchmark.columns.map((column) => ({
+							text: strategyBenchmarkCell(row?.columns[column.key]),
+							metric: strategyCellMetric(row?.columns[column.key])
+						}));
+						const formattedCells = emphasizeRowExtremes(cells);
+						lines.push(`| cloudflare | ${result.profile} | ${formattedCells.join(' | ')} |`);
+					}
+
+					lines.push('');
+				}
+
+				lines.push('## Matrix: Cloudflare Strategy Benchmark Database Sizes');
+				lines.push('');
+				lines.push(`| Environment | Profile | ${cloudflareShardBindings.join(' | ')} |`);
+				lines.push(`| ${['---', '---', ...cloudflareShardBindings.map(() => '---')].join(' | ')} |`);
+				for (const result of cloudflareStrategyResults) {
+					const sizes = result.strategyBenchmark?.databaseSizesBytes;
+					const sizeCells = cloudflareShardBindings.map((binding) => formatBytes(sizes?.[binding]));
+					lines.push(`| cloudflare | ${result.profile} | ${sizeCells.join(' | ')} |`);
+				}
+				lines.push('');
+			}
+		}
 	}
 
 	lines.push('## Detailed Scenario Statistics');
@@ -1899,6 +2773,46 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 				lines.push(`- ${scenario.name} (${label}): SKIPPED (${scenario.notes ?? 'not applicable'})`);
 			}
 		}
+
+		if (result.strategyBenchmark) {
+			const benchmark = result.strategyBenchmark;
+			lines.push(
+				`- strategy_bulk_rw_matrix: writes=${benchmark.writesPerStrategy}, reads=${benchmark.readsPerStrategy}, shards=${benchmark.shardCount}, columns=${benchmark.columns.length}`
+			);
+			if (benchmark.databaseSizesBytes) {
+				lines.push(
+					`- strategy_bulk_rw_matrix sizes: db-wnam=${formatBytes(benchmark.databaseSizesBytes['db-wnam'])}, db-enam=${formatBytes(benchmark.databaseSizesBytes['db-enam'])}, db-weur=${formatBytes(benchmark.databaseSizesBytes['db-weur'])}, db-apac=${formatBytes(benchmark.databaseSizesBytes['db-apac'])}, db-oc=${formatBytes(benchmark.databaseSizesBytes['db-oc'])}`
+				);
+			}
+			if (benchmark.error) {
+				lines.push(`- strategy_bulk_rw_matrix error: ${benchmark.error}`);
+			}
+
+			for (const row of benchmark.rows) {
+				let passed = 0;
+				const failedColumns: string[] = [];
+
+				for (const column of benchmark.columns) {
+					const cell = row.columns[column.key];
+					if (cell?.status === 'passed') {
+						passed += 1;
+					} else {
+						failedColumns.push(column.label);
+					}
+				}
+
+				const failed = benchmark.columns.length - passed;
+				if (failed > 0) {
+					const preview = failedColumns.slice(0, 4).join(', ');
+					lines.push(
+						`- strategy_bulk_rw_matrix[${row.targetRegion}]: passed=${passed}, failed=${failed} (${preview}${failedColumns.length > 4 ? ', ...' : ''})`
+					);
+				} else {
+					lines.push(`- strategy_bulk_rw_matrix[${row.targetRegion}]: passed=${passed}, failed=${failed}`);
+				}
+			}
+		}
+
 		lines.push('');
 	}
 
@@ -1923,6 +2837,46 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 				lines.push(`- ${scenario.name} (${label}): SKIPPED (${scenario.notes ?? 'not applicable'})`);
 			}
 		}
+
+		if (cloudflareResult.strategyBenchmark) {
+			const benchmark = cloudflareResult.strategyBenchmark;
+			lines.push(
+				`- strategy_bulk_rw_matrix: writes=${benchmark.writesPerStrategy}, reads=${benchmark.readsPerStrategy}, shards=${benchmark.shardCount}, columns=${benchmark.columns.length}`
+			);
+			if (benchmark.databaseSizesBytes) {
+				const sizeSummary = Object.keys(benchmark.shardLocations)
+					.map((binding) => `${binding}=${formatBytes(benchmark.databaseSizesBytes?.[binding])}`)
+					.join(', ');
+				lines.push(`- strategy_bulk_rw_matrix sizes: ${sizeSummary}`);
+			}
+			if (benchmark.error) {
+				lines.push(`- strategy_bulk_rw_matrix error: ${benchmark.error}`);
+			}
+
+			for (const row of benchmark.rows) {
+				let passed = 0;
+				const failedColumns: string[] = [];
+
+				for (const column of benchmark.columns) {
+					const cell = row.columns[column.key];
+					if (cell?.status === 'passed') {
+						passed += 1;
+					} else {
+						failedColumns.push(column.label);
+					}
+				}
+
+				const failed = benchmark.columns.length - passed;
+				if (failed > 0) {
+					const preview = failedColumns.slice(0, 4).join(', ');
+					lines.push(
+						`- strategy_bulk_rw_matrix[${row.targetRegion}]: passed=${passed}, failed=${failed} (${preview}${failedColumns.length > 4 ? ', ...' : ''})`
+					);
+				} else {
+					lines.push(`- strategy_bulk_rw_matrix[${row.targetRegion}]: passed=${passed}, failed=${failed}`);
+				}
+			}
+		}
 		lines.push('');
 	}
 
@@ -1930,6 +2884,8 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	lines.push('');
 	lines.push('- Metric format in matrix cells: average latency / p95 latency.');
 	lines.push('- Measurements are end-to-end and include routing, KV mapping operations, and SQL execution.');
+	lines.push('- Strategy matrix runs all ShardingStrategy values plus all read/write mixed permutations across five regional shard mocks.');
+	lines.push('- Location strategy is evaluated across target regions: wnam, enam, weur, apac, and oc.');
 	lines.push('- Cloudflare benchmark uses sandbox Worker endpoints via `wrangler dev --local`.');
 	lines.push('- Cloudflare iterations are intentionally scaled down from the local matrix to keep dev-server runs stable.');
 	lines.push('');

@@ -20,7 +20,7 @@ import {
 	ShardCoordinator
 } from '../src/index';
 import { KVShardMapper } from '../src/kvmap';
-import type { CollegeDBConfig } from '../src/types';
+import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy, ShardLocation } from '../src/types';
 
 export { ShardCoordinator };
 
@@ -56,6 +56,13 @@ const SELECT_USER_SQL = 'SELECT id, name, email, created_at FROM users WHERE id 
 const UPDATE_USER_SQL = 'UPDATE users SET name = ?, email = ? WHERE id = ?';
 const DELETE_USER_SQL = 'DELETE FROM users WHERE id = ?';
 const INSERT_POST_SQL = 'INSERT INTO posts (id, user_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)';
+const CLOUDFLARE_BENCH_SHARD_LOCATIONS: Record<string, ShardLocation> = {
+	'db-east': { region: 'enam', priority: 2 },
+	'db-west': { region: 'wnam', priority: 2 },
+	'db-central': { region: 'weur', priority: 1 }
+};
+const VALID_D1_REGIONS = new Set<D1Region>(['wnam', 'enam', 'weur', 'eeur', 'apac', 'oc', 'me', 'af']);
+const VALID_SHARDING_STRATEGIES = new Set<ShardingStrategy>(['round-robin', 'random', 'hash', 'location']);
 
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
@@ -97,16 +104,7 @@ function createNuxtHubKVCompatClient(kv: KVNamespace): {
 }
 
 function createDrizzleD1CompatProvider(db: D1Database) {
-	const drizzleDb = drizzleD1(db) as any;
-	return createSQLiteProvider(
-		{
-			run: async (query: unknown) => await drizzleDb.run(query as any),
-			all: async (query: unknown) => await drizzleDb.all(query as any),
-			get: async (query: unknown) => await drizzleDb.get(query as any),
-			execute: async (query: unknown) => await drizzleDb.run(query as any)
-		},
-		drizzleSql as any
-	);
+	return createSQLiteProvider(drizzleD1(db), drizzleSql);
 }
 
 function normalizeProfile(raw: string | null): SandboxProfile {
@@ -116,23 +114,32 @@ function normalizeProfile(raw: string | null): SandboxProfile {
 	return 'native';
 }
 
-function buildConfig(env: Env, profile: SandboxProfile): CollegeDBConfig {
+function buildConfig(
+	env: Env,
+	profile: SandboxProfile,
+	overrides?: {
+		strategy?: ShardingStrategy | MixedShardingStrategy;
+		targetRegion?: D1Region;
+	}
+): CollegeDBConfig {
 	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
-	const shardA = useDrizzle ? createDrizzleD1CompatProvider(env['db-east']) : (env['db-east'] as any);
-	const shardB = useDrizzle ? createDrizzleD1CompatProvider(env['db-west']) : (env['db-west'] as any);
-	const shardC = useDrizzle ? createDrizzleD1CompatProvider(env['db-central']) : (env['db-central'] as any);
+	const shardA = useDrizzle ? createDrizzleD1CompatProvider(env['db-east']) : env['db-east'];
+	const shardB = useDrizzle ? createDrizzleD1CompatProvider(env['db-west']) : env['db-west'];
+	const shardC = useDrizzle ? createDrizzleD1CompatProvider(env['db-central']) : env['db-central'];
 
-	const kv = profile === 'nuxthub' ? createNuxtHubKVProvider(createNuxtHubKVCompatClient(env.KV)) : (env.KV as any);
+	const kv = profile === 'nuxthub' ? createNuxtHubKVProvider(createNuxtHubKVCompatClient(env.KV)) : env.KV;
 
 	return {
 		kv,
-		coordinator: env.ShardCoordinator as any,
+		coordinator: env.ShardCoordinator,
 		shards: {
 			'db-east': shardA,
 			'db-west': shardB,
 			'db-central': shardC
 		},
-		strategy: 'hash',
+		strategy: overrides?.strategy ?? 'hash',
+		targetRegion: overrides?.targetRegion ?? 'wnam',
+		shardLocations: CLOUDFLARE_BENCH_SHARD_LOCATIONS,
 		disableAutoMigration: true,
 		hashShardMappings: true,
 		mappingCacheTtlMs: 60_000,
@@ -162,6 +169,51 @@ function toBoundedInt(value: unknown, fallback: number, min: number, max: number
 	return Math.max(min, Math.min(max, parsed));
 }
 
+function isShardingStrategy(value: unknown): value is ShardingStrategy {
+	return typeof value === 'string' && VALID_SHARDING_STRATEGIES.has(value as ShardingStrategy);
+}
+
+function parseStrategy(value: unknown): ShardingStrategy | MixedShardingStrategy | undefined {
+	if (isShardingStrategy(value)) {
+		return value;
+	}
+
+	if (!value || typeof value !== 'object') {
+		return undefined;
+	}
+
+	const read = (value as { read?: unknown }).read;
+	const write = (value as { write?: unknown }).write;
+	if (!isShardingStrategy(read) || !isShardingStrategy(write)) {
+		return undefined;
+	}
+
+	return { read, write };
+}
+
+function parseTargetRegion(value: unknown): D1Region | undefined {
+	if (typeof value !== 'string') {
+		return undefined;
+	}
+
+	return VALID_D1_REGIONS.has(value as D1Region) ? (value as D1Region) : undefined;
+}
+
+function extractNumericValue(row: Record<string, unknown> | null): number | undefined {
+	if (!row) {
+		return undefined;
+	}
+
+	for (const value of Object.values(row)) {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+
+	return undefined;
+}
+
 function extractCount(row: Record<string, unknown>): number {
 	const keys = ['count', 'COUNT(*)', 'count(*)', 'COUNT'];
 	for (const key of keys) {
@@ -180,6 +232,28 @@ async function resetData(): Promise<void> {
 	await runAllShards('DELETE FROM posts');
 	await runAllShards('DELETE FROM users');
 	await flush();
+}
+
+async function collectDatabaseSizes(config: CollegeDBConfig): Promise<Record<string, number | undefined>> {
+	const sizes: Record<string, number | undefined> = {};
+
+	for (const [binding, shard] of Object.entries(config.shards)) {
+		try {
+			const pageCountRow = await shard.prepare('PRAGMA page_count').first<Record<string, unknown>>();
+			const pageSizeRow = await shard.prepare('PRAGMA page_size').first<Record<string, unknown>>();
+			const pageCount = extractNumericValue(pageCountRow ?? null);
+			const pageSize = extractNumericValue(pageSizeRow ?? null);
+
+			sizes[binding] =
+				typeof pageCount === 'number' && typeof pageSize === 'number' && Number.isFinite(pageCount * pageSize)
+					? pageCount * pageSize
+					: undefined;
+		} catch {
+			sizes[binding] = undefined;
+		}
+	}
+
+	return sizes;
 }
 
 export default {
@@ -397,6 +471,66 @@ export default {
 				}
 
 				return json({ success: true, reassignedTo });
+			}
+
+			if (pathname === '/api/benchmark/strategy-bulk-rw' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const strategy = parseStrategy(body.strategy);
+				if (!strategy) {
+					return json({ success: false, error: 'Invalid or missing strategy payload' }, 400);
+				}
+
+				const targetRegion = parseTargetRegion(body.targetRegion) ?? 'wnam';
+				const writes = toBoundedInt(body.writes, 25, 1, 250);
+				const reads = toBoundedInt(body.reads, 25, 1, 250);
+				const prefix = typeof body.prefix === 'string' && body.prefix.length > 0 ? body.prefix : `strategy-${Date.now()}`;
+
+				const strategyConfig = buildConfig(env, profile, {
+					strategy,
+					targetRegion
+				});
+				initialize(strategyConfig);
+				await resetData();
+
+				const samplesMs: number[] = [];
+
+				for (let i = 0; i < writes; i += 1) {
+					const id = `${prefix}-w-${i}`;
+					const started = performance.now();
+					await run(id, INSERT_USER_SQL, [id, `Strategy ${i}`, `${id}@strategy.cloudflare.local`, Date.now()]);
+					samplesMs.push(performance.now() - started);
+				}
+
+				for (let i = 0; i < reads; i += 1) {
+					const existingId = `${prefix}-w-${i % writes}`;
+					const existingStarted = performance.now();
+					await first(existingId, SELECT_USER_SQL, [existingId]);
+					samplesMs.push(performance.now() - existingStarted);
+
+					const missingId = `${prefix}-missing-${i}`;
+					const missingStarted = performance.now();
+					await first(missingId, SELECT_USER_SQL, [missingId]);
+					samplesMs.push(performance.now() - missingStarted);
+				}
+
+				return json({
+					success: true,
+					statements: samplesMs.length,
+					writes,
+					reads,
+					samplesMs,
+					targetRegion,
+					shardLocations: strategyConfig.shardLocations
+				});
+			}
+
+			if (pathname === '/api/benchmark/database-sizes' && request.method === 'GET') {
+				const sizes = await collectDatabaseSizes(config);
+				return json({
+					success: true,
+					sizes,
+					shardLocations: config.shardLocations
+				});
 			}
 
 			return new Response('Not Found', { status: 404 });
