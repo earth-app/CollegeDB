@@ -1111,6 +1111,86 @@ export async function first<T = Record<string, unknown>>(key: string, sql: strin
 }
 
 /**
+ * Retrieves all records using a secondary lookup key when available.
+ *
+ * This helper attempts to resolve the lookup key through KV first. If a mapping
+ * exists, the query executes on that shard directly. If the mapping is missing,
+ * stale, or returns no rows, the helper safely falls back to fanout (`allAllShards`)
+ * and returns merged results.
+ *
+ * @template T - Type of the result records
+ * @param lookupKey - Secondary key such as `email:user@example.com` or `username:alice`
+ * @param sql - SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param batchSize - Number of concurrent shard queries during fanout (default: 50)
+ * @returns Promise resolving to merged query results
+ * @since 1.1.4
+ */
+export async function allByLookupKey<T = Record<string, unknown>>(
+	lookupKey: string,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<QueryResult<T>> {
+	const config = getConfig();
+	const mapper = getMapper(config);
+	const mapping = await mapper.getShardMapping(lookupKey);
+
+	if (mapping) {
+		const mappedShardDb = config.shards[mapping.shard];
+		if (mappedShardDb) {
+			const mappedResult = await allShard<T>(mapping.shard, sql, bindings);
+			if (mappedResult.success && mappedResult.results.length > 0) {
+				return mappedResult;
+			}
+		}
+	}
+
+	const shardResults = await allAllShards<T>(sql, bindings, batchSize);
+	return mergeAllShardQueryResults(shardResults);
+}
+
+/**
+ * Retrieves the first record using a secondary lookup key when available.
+ *
+ * This helper avoids creating new primary-key mappings for secondary identifiers.
+ * It first checks KV for a lookup-key mapping and queries that shard directly.
+ * If no mapping exists (or the mapping is stale), it falls back to fanout
+ * (`firstAllShards`) and returns the first non-null result.
+ *
+ * @template T - Type of the result record
+ * @param lookupKey - Secondary key such as `email:user@example.com` or `username:alice`
+ * @param sql - SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param batchSize - Number of concurrent shard queries during fanout (default: 50)
+ * @returns Promise resolving to the first matching record, or null
+ * @since 1.1.4
+ */
+export async function firstByLookupKey<T = Record<string, unknown>>(
+	lookupKey: string,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<T | null> {
+	const config = getConfig();
+	const mapper = getMapper(config);
+	const mapping = await mapper.getShardMapping(lookupKey);
+
+	if (mapping) {
+		const mappedShardDb = config.shards[mapping.shard];
+		if (mappedShardDb) {
+			const mappedFirst = await firstShard<T>(mapping.shard, sql, bindings);
+			if (mappedFirst !== null) {
+				return mappedFirst;
+			}
+		}
+	}
+
+	const fanoutResults = await firstAllShards<T>(sql, bindings, batchSize);
+	return fanoutResults.find((row): row is T => row !== null) ?? null;
+}
+
+/**
  * Reassigns a primary key to a different shard
  *
  * Moves a primary key and its associated data from one shard to another. This
@@ -1540,6 +1620,166 @@ export async function allAllShards<T = Record<string, unknown>>(
 }
 
 /**
+ * Options for global all-shards merge/sort/pagination.
+ * @since 1.1.4
+ */
+export interface GlobalAllShardsOptions<T = Record<string, unknown>> {
+	/** Number of concurrent shard queries to run at once (default: 50). */
+	batchSize?: number;
+	/** Number of rows to skip after global merge/sort (default: 0). */
+	offset?: number;
+	/** Maximum rows to return after global merge/sort. */
+	limit?: number;
+	/** Field name or selector used for global sorting. */
+	sortBy?: keyof T | ((row: T) => unknown);
+	/** Sort direction for `sortBy` (default: `asc`). */
+	sortDirection?: 'asc' | 'desc';
+	/** Optional custom comparator; takes precedence over `sortBy`. */
+	comparator?: (left: T, right: T) => number;
+	/** Optional global row filter applied before sort/paginate. */
+	filter?: (row: T) => boolean;
+}
+
+function normalizeBatchSize(batchSize: number | undefined, defaultValue: number = 50): number {
+	if (!Number.isFinite(batchSize ?? defaultValue)) {
+		return defaultValue;
+	}
+
+	return Math.max(1, Math.floor(batchSize ?? defaultValue));
+}
+
+function normalizeOffset(offset: number | undefined): number {
+	if (!Number.isFinite(offset ?? 0)) {
+		return 0;
+	}
+
+	return Math.max(0, Math.floor(offset ?? 0));
+}
+
+function normalizeLimit(limit: number | undefined): number | undefined {
+	if (limit === undefined) {
+		return undefined;
+	}
+
+	if (!Number.isFinite(limit)) {
+		return undefined;
+	}
+
+	return Math.max(0, Math.floor(limit));
+}
+
+function getRowSortValue<T>(row: T, sortBy: GlobalAllShardsOptions<T>['sortBy']): unknown {
+	if (typeof sortBy === 'function') {
+		return sortBy(row);
+	}
+
+	if (!sortBy || typeof row !== 'object' || row === null) {
+		return undefined;
+	}
+
+	return (row as Record<string, unknown>)[String(sortBy)];
+}
+
+function compareUnknown(left: unknown, right: unknown): number {
+	if (left === right) return 0;
+	if (left === null || left === undefined) return 1;
+	if (right === null || right === undefined) return -1;
+
+	if (typeof left === 'number' && typeof right === 'number') {
+		return left - right;
+	}
+
+	if (typeof left === 'bigint' && typeof right === 'bigint') {
+		return left < right ? -1 : 1;
+	}
+
+	if (left instanceof Date && right instanceof Date) {
+		return left.getTime() - right.getTime();
+	}
+
+	if (typeof left === 'boolean' && typeof right === 'boolean') {
+		return Number(left) - Number(right);
+	}
+
+	return String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function mergeAllShardQueryResults<T = Record<string, unknown>>(shardResults: QueryResult<T>[]): QueryResult<T> {
+	const allResults = shardResults.flatMap((result) => result.results || []);
+	const failures = shardResults.filter((result) => !result.success);
+	const totalDuration = shardResults.reduce((sum, result) => sum + (result.meta?.duration || 0), 0);
+
+	if (failures.length === 0) {
+		return {
+			success: true,
+			results: allResults,
+			meta: { duration: totalDuration }
+		};
+	}
+
+	const errorMessage = failures
+		.map((failure) => failure.error || 'Unknown shard query error')
+		.filter(Boolean)
+		.join('; ');
+
+	return {
+		success: false,
+		results: allResults,
+		error: errorMessage || 'One or more shard queries failed',
+		meta: { duration: totalDuration }
+	};
+}
+
+/**
+ * Executes a query on all shards and applies global merge/sort/pagination in-library.
+ *
+ * Unlike `allAllShards`, this helper returns a single merged `QueryResult` and can
+ * sort/paginate across the full combined result set after fanout.
+ *
+ * @template T - Type of the result records
+ * @param sql - SQL statement to execute on each shard
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Global merge/sort/pagination options
+ * @returns Promise resolving to one globally-processed query result
+ * @since 1.1.4
+ */
+export async function allAllShardsGlobal<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: GlobalAllShardsOptions<T> = {}
+): Promise<QueryResult<T>> {
+	const batchSize = normalizeBatchSize(options.batchSize);
+	const offset = normalizeOffset(options.offset);
+	const limit = normalizeLimit(options.limit);
+
+	const merged = mergeAllShardQueryResults(await allAllShards<T>(sql, bindings, batchSize));
+	let rows = merged.results;
+
+	if (options.filter) {
+		rows = rows.filter((row) => options.filter?.(row));
+	}
+
+	if (options.comparator) {
+		rows = [...rows].sort(options.comparator);
+	} else if (options.sortBy) {
+		const direction = options.sortDirection === 'desc' ? -1 : 1;
+		rows = [...rows].sort((left, right) => {
+			const leftValue = getRowSortValue(left, options.sortBy);
+			const rightValue = getRowSortValue(right, options.sortBy);
+			return compareUnknown(leftValue, rightValue) * direction;
+		});
+	}
+
+	const end = limit === undefined ? undefined : offset + limit;
+	const pagedRows = rows.slice(offset, end);
+
+	return {
+		...merged,
+		results: pagedRows
+	};
+}
+
+/**
  * Executes a query on all shards and returns the first matching record from each shard.
  *
  * This function is useful for scenarios where you need to retrieve a single record
@@ -1584,6 +1824,30 @@ export async function firstAllShards<T = Record<string, unknown>>(
 	}
 
 	return out;
+}
+
+/**
+ * Executes a query on all shards with global merge/sort/pagination and returns
+ * the first row after global processing.
+ *
+ * @template T - Type of the result record
+ * @param sql - SQL statement to execute on each shard
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Global merge/sort/pagination options (batchSize, sort, offset)
+ * @returns Promise resolving to the first globally-processed row, or null
+ * @since 1.1.4
+ */
+export async function firstAllShardsGlobal<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<GlobalAllShardsOptions<T>, 'limit'> = {}
+): Promise<T | null> {
+	const merged = await allAllShardsGlobal<T>(sql, bindings, {
+		...options,
+		limit: 1
+	});
+
+	return merged.results[0] ?? null;
 }
 
 /**
@@ -1659,4 +1923,436 @@ export async function getDatabaseSizeForShard(shardBinding: string): Promise<num
 	}
 
 	return await getDatabaseSize(database);
+}
+
+const SQL_IDENTIFIER_PART_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function quoteIdentifier(identifier: string): string {
+	const trimmed = identifier.trim();
+	if (!trimmed) {
+		throw new CollegeDBError('Identifier cannot be empty', 'INVALID_IDENTIFIER');
+	}
+
+	const parts = trimmed.split('.').map((part) => part.trim());
+	if (parts.some((part) => !part || !SQL_IDENTIFIER_PART_REGEX.test(part))) {
+		throw new CollegeDBError(`Invalid SQL identifier: ${identifier}`, 'INVALID_IDENTIFIER');
+	}
+
+	return parts.map((part) => `"${part}"`).join('.');
+}
+
+function normalizeIndexNameSegment(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9_]+/g, '_')
+		.replace(/_+/g, '_')
+		.replace(/^_+|_+$/g, '');
+}
+
+/**
+ * Column specification for index creation helpers.
+ * @since 1.1.4
+ */
+export interface IndexColumnDefinition {
+	/** Column name to include in the index. */
+	name: string;
+	/** Optional sort direction for this column. */
+	order?: 'ASC' | 'DESC';
+	/** Optional collation (e.g., NOCASE). */
+	collate?: string;
+}
+
+/**
+ * Options for index creation helpers.
+ * @since 1.1.4
+ */
+export interface CreateIndexOptions {
+	/** Explicit index name. When omitted, a deterministic name is generated. */
+	indexName?: string;
+	/** Create a unique index. */
+	unique?: boolean;
+	/** Include `IF NOT EXISTS` in generated SQL. @default true */
+	ifNotExists?: boolean;
+	/** Optional partial-index predicate (trusted SQL only). */
+	where?: string;
+	/** Number of concurrent shard operations for all-shard variants. @default 50 */
+	batchSize?: number;
+}
+
+function normalizeIndexColumns(columns: string | string[] | IndexColumnDefinition[]): IndexColumnDefinition[] {
+	if (typeof columns === 'string') {
+		return [{ name: columns }];
+	}
+
+	if (!Array.isArray(columns) || columns.length === 0) {
+		throw new CollegeDBError('At least one index column is required', 'INVALID_INDEX_COLUMNS');
+	}
+
+	return columns.map((column) => {
+		if (typeof column === 'string') {
+			return { name: column };
+		}
+
+		if (!column?.name) {
+			throw new CollegeDBError('Index column name is required', 'INVALID_INDEX_COLUMNS');
+		}
+
+		return {
+			name: column.name,
+			order: column.order,
+			collate: column.collate
+		};
+	});
+}
+
+function buildCreateIndexSQL(
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: CreateIndexOptions = {}
+): string {
+	const normalizedColumns = normalizeIndexColumns(columns);
+	const quotedTable = quoteIdentifier(table);
+	const generatedIndexName = options.indexName
+		? options.indexName
+		: ['idx', normalizeIndexNameSegment(table), ...normalizedColumns.map((column) => normalizeIndexNameSegment(column.name))]
+				.filter(Boolean)
+				.join('_')
+				.slice(0, 120);
+	const quotedIndexName = quoteIdentifier(generatedIndexName || 'idx_auto');
+
+	const columnClauses = normalizedColumns
+		.map((column) => {
+			const quotedColumn = quoteIdentifier(column.name);
+			const order = column.order ? ` ${column.order}` : '';
+			const collate = column.collate ? ` COLLATE ${quoteIdentifier(column.collate).replace(/"/g, '')}` : '';
+			return `${quotedColumn}${collate}${order}`;
+		})
+		.join(', ');
+
+	const ifNotExistsClause = options.ifNotExists === false ? '' : ' IF NOT EXISTS';
+	const uniqueClause = options.unique ? 'UNIQUE ' : '';
+	const whereClause = options.where?.trim() ? ` WHERE ${options.where.trim()}` : '';
+
+	return `CREATE ${uniqueClause}INDEX${ifNotExistsClause} ${quotedIndexName} ON ${quotedTable} (${columnClauses})${whereClause}`;
+}
+
+/**
+ * Creates an index on the shard resolved by the provided key.
+ *
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param columns - One or more columns to index
+ * @param options - Index creation options
+ * @returns Query result for the DDL statement
+ * @since 1.1.4
+ */
+export async function index<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: Omit<CreateIndexOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	const sql = buildCreateIndexSQL(table, columns, options);
+	return run<T>(key, sql);
+}
+
+/**
+ * Creates an index directly on a specific shard.
+ *
+ * @param shardBinding - Shard binding name
+ * @param table - Target table name
+ * @param columns - One or more columns to index
+ * @param options - Index creation options
+ * @returns Query result for the DDL statement
+ * @since 1.1.4
+ */
+export async function indexShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: Omit<CreateIndexOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	const sql = buildCreateIndexSQL(table, columns, options);
+	return runShard<T>(shardBinding, sql);
+}
+
+/**
+ * Creates an index across all configured shards.
+ *
+ * @param table - Target table name
+ * @param columns - One or more columns to index
+ * @param options - Index creation options, including `batchSize`
+ * @returns Per-shard query results
+ * @since 1.1.4
+ */
+export async function indexAllShards<T = Record<string, unknown>>(
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: CreateIndexOptions = {}
+): Promise<QueryResult<T>[]> {
+	const sql = buildCreateIndexSQL(table, columns, options);
+	return runAllShards<T>(sql, [], normalizeBatchSize(options.batchSize));
+}
+
+/**
+ * Explain helpers options.
+ * @since 1.1.4
+ */
+export interface ExplainOptions {
+	/** Explain mode. @default query-plan */
+	mode?: 'query-plan' | 'raw' | 'analyze';
+	/** Number of concurrent shard operations for all-shard variants. @default 50 */
+	batchSize?: number;
+}
+
+function buildExplainSQL(sql: string, mode: ExplainOptions['mode'] = 'query-plan'): string {
+	switch (mode) {
+		case 'raw':
+			return `EXPLAIN ${sql}`;
+		case 'analyze':
+			return `EXPLAIN ANALYZE ${sql}`;
+		case 'query-plan':
+		default:
+			return `EXPLAIN QUERY PLAN ${sql}`;
+	}
+}
+
+/**
+ * Executes an explain query on the shard resolved by key.
+ *
+ * @param key - Primary key used for shard routing
+ * @param sql - SQL statement to inspect
+ * @param bindings - Parameter values for the SQL statement
+ * @param options - Explain mode options
+ * @returns Explain rows as a QueryResult
+ * @since 1.1.4
+ */
+export async function explain<T = Record<string, unknown>>(
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<ExplainOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	return all<T>(key, buildExplainSQL(sql, options.mode), bindings);
+}
+
+/**
+ * Executes an explain query on a specific shard.
+ *
+ * @param shardBinding - Shard binding name
+ * @param sql - SQL statement to inspect
+ * @param bindings - Parameter values for the SQL statement
+ * @param options - Explain mode options
+ * @returns Explain rows as a QueryResult
+ * @since 1.1.4
+ */
+export async function explainShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<ExplainOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	return allShard<T>(shardBinding, buildExplainSQL(sql, options.mode), bindings);
+}
+
+/**
+ * Executes an explain query across all shards.
+ *
+ * @param sql - SQL statement to inspect
+ * @param bindings - Parameter values for the SQL statement
+ * @param options - Explain options, including `batchSize`
+ * @returns Per-shard explain query results
+ * @since 1.1.4
+ */
+export async function explainAllShards<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: ExplainOptions = {}
+): Promise<QueryResult<T>[]> {
+	return allAllShards<T>(buildExplainSQL(sql, options.mode), bindings, normalizeBatchSize(options.batchSize));
+}
+
+/**
+ * Table row-count result for a shard.
+ * @since 1.1.4
+ */
+export interface ShardTableCount {
+	shard: string;
+	count: number | null;
+	success: boolean;
+	error?: string;
+}
+
+/**
+ * Counts rows for a table on the shard resolved by key.
+ *
+ * @param key - Primary key used for shard routing
+ * @param table - Table name to count
+ * @returns Row count for that routed shard
+ * @since 1.1.4
+ */
+export async function count(key: string, table: string): Promise<number> {
+	const quotedTable = quoteIdentifier(table);
+	const row = await first<{ row_count?: number | string }>(key, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
+	if (!row || row.row_count === undefined || row.row_count === null) {
+		return 0;
+	}
+
+	return Number(row.row_count) || 0;
+}
+
+/**
+ * Counts rows for a table on a specific shard.
+ *
+ * @param shardBinding - Shard binding name
+ * @param table - Table name to count
+ * @returns Row count for the shard
+ * @since 1.1.4
+ */
+export async function countShard(shardBinding: string, table: string): Promise<number> {
+	const quotedTable = quoteIdentifier(table);
+	const row = await firstShard<{ row_count?: number | string }>(shardBinding, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
+	if (!row || row.row_count === undefined || row.row_count === null) {
+		return 0;
+	}
+
+	return Number(row.row_count) || 0;
+}
+
+/**
+ * Counts rows for a table across all shards.
+ *
+ * @param table - Table name to count
+ * @param batchSize - Number of concurrent shard queries (default: 50)
+ * @returns Per-shard counts and global total
+ * @since 1.1.4
+ */
+export async function countAllShards(table: string, batchSize: number = 50): Promise<{ total: number; shards: ShardTableCount[] }> {
+	const config = getConfig();
+	const normalizedBatchSize = normalizeBatchSize(batchSize);
+	const quotedTable = quoteIdentifier(table);
+	const sql = `SELECT COUNT(*) AS row_count FROM ${quotedTable}`;
+	const tasks: Array<() => Promise<ShardTableCount>> = [];
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		if (!binding || !db) {
+			continue;
+		}
+
+		tasks.push(async () => {
+			try {
+				const row = await db.prepare(sql).first<{ row_count?: number | string }>();
+				const parsed = Number(row?.row_count ?? 0);
+				return {
+					shard: binding,
+					count: Number.isFinite(parsed) ? parsed : 0,
+					success: true
+				};
+			} catch (error) {
+				return {
+					shard: binding,
+					count: null,
+					success: false,
+					error: error instanceof Error ? error.message : String(error)
+				};
+			}
+		});
+	}
+
+	const shards: ShardTableCount[] = [];
+	for (let i = 0; i < tasks.length; i += normalizedBatchSize) {
+		const batch = tasks.slice(i, i + normalizedBatchSize).map((task) => task());
+		shards.push(...(await Promise.all(batch)));
+	}
+
+	const total = shards.reduce((sum, shard) => sum + (shard.count ?? 0), 0);
+	return { total, shards };
+}
+
+/**
+ * Size information for a shard.
+ * @since 1.1.4
+ */
+export interface ShardSizeResult {
+	shard: string;
+	size: number | null;
+	success: boolean;
+	error?: string;
+}
+
+/**
+ * Gets the size in bytes for the shard resolved by key.
+ *
+ * @param key - Primary key used for shard routing
+ * @returns Database size in bytes
+ * @since 1.1.4
+ */
+export async function getDatabaseSizeForKey(key: string): Promise<number> {
+	const config = getConfig();
+	const shardBinding = await getShardForKey(key, 'read');
+	const database = config.shards[shardBinding];
+
+	if (!database) {
+		throw new CollegeDBError(`Shard ${shardBinding} not found in configuration`, 'SHARD_NOT_FOUND');
+	}
+
+	return getDatabaseSize(database);
+}
+
+/**
+ * Gets database sizes for all shards.
+ *
+ * @param batchSize - Number of concurrent shard queries (default: 50)
+ * @returns Per-shard size results with success/error status
+ * @since 1.1.4
+ */
+export async function getDatabaseSizesAllShards(batchSize: number = 50): Promise<ShardSizeResult[]> {
+	const config = getConfig();
+	const normalizedBatchSize = normalizeBatchSize(batchSize);
+	const tasks: Array<() => Promise<ShardSizeResult>> = [];
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		if (!binding || !db) {
+			continue;
+		}
+
+		tasks.push(async () => {
+			try {
+				return {
+					shard: binding,
+					size: await getDatabaseSize(db),
+					success: true
+				};
+			} catch (error) {
+				return {
+					shard: binding,
+					size: null,
+					success: false,
+					error: error instanceof Error ? error.message : String(error)
+				};
+			}
+		});
+	}
+
+	const results: ShardSizeResult[] = [];
+	for (let i = 0; i < tasks.length; i += normalizedBatchSize) {
+		const batch = tasks.slice(i, i + normalizedBatchSize).map((task) => task());
+		results.push(...(await Promise.all(batch)));
+	}
+
+	return results;
+}
+
+/**
+ * Gets the combined size in bytes across all shards.
+ *
+ * Failed shard size checks are excluded from the sum.
+ *
+ * @param batchSize - Number of concurrent shard queries (default: 50)
+ * @returns Total size in bytes across successfully measured shards
+ * @since 1.1.4
+ */
+export async function getTotalDatabaseSize(batchSize: number = 50): Promise<number> {
+	const sizes = await getDatabaseSizesAllShards(batchSize);
+	return sizes.reduce((sum, result) => sum + (result.size ?? 0), 0);
 }

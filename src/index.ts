@@ -13,16 +13,32 @@
 export {
 	all,
 	allAllShards,
+	allAllShardsGlobal,
+	allByLookupKey,
 	allShard,
 	collegedb,
+	count,
+	countAllShards,
+	countShard,
 	createSchema,
+	explain,
+	explainAllShards,
+	explainShard,
 	first,
 	firstAllShards,
+	firstAllShardsGlobal,
+	firstByLookupKey,
 	firstShard,
 	flush,
 	getClosestRegionFromIP,
+	getDatabaseSizeForKey,
 	getDatabaseSizeForShard,
+	getDatabaseSizesAllShards,
 	getShardStats,
+	getTotalDatabaseSize,
+	index,
+	indexAllShards,
+	indexShard,
 	initialize,
 	initializeAsync,
 	listKnownShards,
@@ -32,6 +48,15 @@ export {
 	run,
 	runAllShards,
 	runShard
+} from './router';
+
+export type {
+	CreateIndexOptions,
+	ExplainOptions,
+	GlobalAllShardsOptions,
+	IndexColumnDefinition,
+	ShardSizeResult,
+	ShardTableCount
 } from './router';
 
 // Export utility classes
