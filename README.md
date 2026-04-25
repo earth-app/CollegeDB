@@ -23,6 +23,8 @@ A TypeScript library for **true horizontal scaling** of SQLite-style databases p
 - [Multi-Key Shard Mappings](#multi-key-shard-mappings)
 - [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
 - [Troubleshooting](#troubleshooting)
+- [Cross-Shard Pagination Behavior](#cross-shard-pagination-behavior)
+- [Database Query Best Practices](#database-query-best-practices)
 - [API Reference](#api-reference)
 - [Architecture](#architecture)
 - [Cloudflare Setup](#cloudflare-setup)
@@ -616,6 +618,22 @@ await mapper.addLookupKeys('user-456', ['email:jane@example.com', 'username:jane
 const user = await first('email:jane@example.com', 'SELECT * FROM users WHERE email = ?', ['jane@example.com']);
 ```
 
+### Lookup-Key Read Helpers With Fanout Fallback
+
+When you query by a secondary key and want safe behavior even when a lookup mapping is missing or stale, use the router-level helpers:
+
+```typescript
+import { allByLookupKey, firstByLookupKey } from '@earth-app/collegedb';
+
+// Uses lookup-key mapping when present, then falls back to all-shard fanout if needed
+const user = await firstByLookupKey('email:john@example.com', 'SELECT * FROM users WHERE email = ? LIMIT 1', ['john@example.com']);
+
+// Same resolution flow, but returns merged row sets
+const matches = await allByLookupKey('username:john_doe', 'SELECT id, username FROM users WHERE username = ?', ['john_doe']);
+```
+
+This avoids accidentally creating a new primary-key mapping for secondary identifiers while still returning results when mappings are unavailable.
+
 ### Security and Privacy
 
 **SHA-256 Hashing (Enabled by Default)**: Sensitive data like emails are hashed before being stored as KV keys, protecting user privacy:
@@ -908,28 +926,138 @@ for (const [table, pkColumn] of Object.entries(customIntegration)) {
 }
 ```
 
+## Cross-Shard Pagination Behavior
+
+`allAllShards` and `firstAllShards` execute the exact SQL on each shard independently. That means SQL `LIMIT`/`OFFSET` applies per shard, not globally.
+
+```typescript
+// With two shards, this can return up to 20 total rows (10 per shard)
+const perShard = await allAllShards('SELECT * FROM posts ORDER BY created_at DESC LIMIT 10');
+```
+
+If you need true global merge/sort/pagination across all shard results, use `allAllShardsGlobal` / `firstAllShardsGlobal` and pass sort/pagination options to the library:
+
+```typescript
+import { allAllShardsGlobal, firstAllShardsGlobal } from '@earth-app/collegedb';
+
+const page = await allAllShardsGlobal<{ id: string; created_at: number }>('SELECT id, created_at FROM posts', [], {
+	sortBy: 'created_at',
+	sortDirection: 'desc',
+	offset: 20,
+	limit: 10
+});
+
+const newest = await firstAllShardsGlobal<{ id: string; created_at: number }>('SELECT id, created_at FROM posts', [], {
+	sortBy: 'created_at',
+	sortDirection: 'desc'
+});
+```
+
+## Database Query Best Practices
+
+### Use Library Utility Operations for DDL and Inspection
+
+CollegeDB now exposes utility helpers for operational tasks that need shard awareness:
+
+```typescript
+import { countAllShards, explainAllShards, getDatabaseSizesAllShards, indexAllShards } from '@earth-app/collegedb';
+
+// Create index across all shards
+await indexAllShards('posts', [{ name: 'user_id' }, { name: 'created_at', order: 'DESC' }], {
+	ifNotExists: true
+});
+
+// Inspect query plan across all shards
+const plans = await explainAllShards('SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', ['user-123']);
+
+// Count rows globally
+const counts = await countAllShards('posts');
+
+// Get per-shard size measurements
+const sizes = await getDatabaseSizesAllShards();
+```
+
+Recommended pattern:
+
+- Use `indexAllShards` for schema/index consistency.
+- Use `explain`/`explainAllShards` before adding indexes or changing query shapes.
+- Use `countAllShards` and `getDatabaseSizesAllShards` for operational dashboards and rebalancing thresholds.
+
+### Create Targeted Indexes
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_posts_user_id_created_at ON posts(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+```
+
+### Inspect Query Plans and Statistics
+
+```sql
+EXPLAIN QUERY PLAN SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT 20;
+PRAGMA optimize;
+ANALYZE;
+```
+
+### Use Bound Parameters (SQL Injection Protection)
+
+```typescript
+// Safe: parameterized query
+await first('user-123', 'SELECT * FROM users WHERE email = ?', [email]);
+
+// Avoid string interpolation with user input
+// BAD: `... WHERE email = '${email}'`
+```
+
+### Design Search for Scale
+
+- Exact-match or prefix search fields should be indexed.
+- Prefer bounded result sets (`LIMIT`) and stable sorting.
+- For global search pages, pair lightweight per-shard SQL with `allAllShardsGlobal` for final merge/sort/pagination.
+
+### Pagination Guidance
+
+- For routed single-key reads (`first`, `all`), SQL pagination is naturally shard-local and predictable.
+- For fanout (`allAllShards`, `firstAllShards`), SQL pagination is per-shard.
+- For user-facing global pages, use `allAllShardsGlobal` so offset/limit apply once after merge.
+
 ## API Reference
 
-| Function                                   | Description                                                      | Parameters                 |
-| ------------------------------------------ | ---------------------------------------------------------------- | -------------------------- |
-| `collegedb(config, callback)`              | Initialize CollegeDB, then run a callback                        | `CollegeDBConfig, () => T` |
-| `initialize(config)`                       | Initialize CollegeDB with configuration                          | `CollegeDBConfig`          |
-| `createSchema(db, schema)`                 | Create schema on a shard database                                | `SQLDatabase, string`      |
-| `prepare(key, sql)`                        | Prepare a SQL statement for execution                            | `string, string`           |
-| `run(key, sql, bindings)`                  | Execute a SQL query with primary key routing                     | `string, string, any[]`    |
-| `first(key, sql, bindings)`                | Execute a SQL query and return first result                      | `string, string, any[]`    |
-| `all(key, sql, bindings)`                  | Execute a SQL query and return all results                       | `string, string, any[]`    |
-| `runShard(shard, sql, bindings)`           | Execute a query directly on a specific shard                     | `string, string, any[]`    |
-| `allShard(shard, sql, bindings)`           | Execute a query on specific shard, return all results            | `string, string, any[]`    |
-| `firstShard(shard, sql, bindings)`         | Execute a query on specific shard, return first result           | `string, string, any[]`    |
-| `runAllShards(sql, bindings, batchSize)`   | Execute query on all shards                                      | `string, any[], number`    |
-| `allAllShards(sql, bindings, batchSize)`   | Execute query on all shards, return all results from all shards  | `string, any[], number`    |
-| `firstAllShards(sql, bindings, batchSize)` | Execute query on all shards, return first result from all shards | `string, any[], number`    |
-| `reassignShard(key, newShard)`             | Move primary key to different shard                              | `string, string`           |
-| `listKnownShards()`                        | Get list of available shards                                     | `void`                     |
-| `getShardStats()`                          | Get statistics for all shards                                    | `void`                     |
-| `getDatabaseSizeForShard(shard)`           | Get size of a specific shard in bytes                            | `string`                   |
-| `flush()`                                  | Clear all shard mappings (development only)                      | `void`                     |
+| Function                                          | Description                                                    | Parameters                                                         |
+| ------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `collegedb(config, callback)`                     | Initialize CollegeDB, then run a callback                      | `CollegeDBConfig, () => T`                                         |
+| `initialize(config)`                              | Initialize CollegeDB with configuration                        | `CollegeDBConfig`                                                  |
+| `createSchema(db, schema)`                        | Create schema on a shard database                              | `SQLDatabase, string`                                              |
+| `prepare(key, sql)`                               | Prepare a SQL statement for execution                          | `string, string`                                                   |
+| `run(key, sql, bindings)`                         | Execute a SQL query with primary key routing                   | `string, string, any[]`                                            |
+| `first(key, sql, bindings)`                       | Execute a SQL query and return first result                    | `string, string, any[]`                                            |
+| `all(key, sql, bindings)`                         | Execute a SQL query and return all results                     | `string, string, any[]`                                            |
+| `index(key, table, columns, options)`             | Create an index on routed shard                                | `string, string, string or index-column array, CreateIndexOptions` |
+| `indexShard(shard, table, columns, options)`      | Create an index on one shard                                   | `string, string, string or index-column array, CreateIndexOptions` |
+| `indexAllShards(table, columns, options)`         | Create an index on all shards                                  | `string, string or index-column array, CreateIndexOptions`         |
+| `firstByLookupKey(key, sql, bindings, batchSize)` | Resolve secondary-key mapping, fallback to fanout              | `string, string, any[], number`                                    |
+| `allByLookupKey(key, sql, bindings, batchSize)`   | Resolve secondary-key mapping, fallback to fanout              | `string, string, any[], number`                                    |
+| `runShard(shard, sql, bindings)`                  | Execute a query directly on a specific shard                   | `string, string, any[]`                                            |
+| `allShard(shard, sql, bindings)`                  | Execute a query on specific shard, return all results          | `string, string, any[]`                                            |
+| `firstShard(shard, sql, bindings)`                | Execute a query on specific shard, return first result         | `string, string, any[]`                                            |
+| `explain(key, sql, bindings, options)`            | Inspect query plan on routed shard                             | `string, string, any[], ExplainOptions`                            |
+| `explainShard(shard, sql, bindings, options)`     | Inspect query plan on one shard                                | `string, string, any[], ExplainOptions`                            |
+| `explainAllShards(sql, bindings, options)`        | Inspect query plan on all shards                               | `string, any[], ExplainOptions`                                    |
+| `count(key, table)`                               | Count rows on routed shard                                     | `string, string`                                                   |
+| `countShard(shard, table)`                        | Count rows on a specific shard                                 | `string, string`                                                   |
+| `countAllShards(table, batchSize)`                | Count rows per shard and global total                          | `string, number`                                                   |
+| `runAllShards(sql, bindings, batchSize)`          | Execute query on all shards                                    | `string, any[], number`                                            |
+| `allAllShards(sql, bindings, batchSize)`          | Execute query on all shards (SQL pagination applies per shard) | `string, any[], number`                                            |
+| `firstAllShards(sql, bindings, batchSize)`        | Execute query on all shards, return first row per shard        | `string, any[], number`                                            |
+| `allAllShardsGlobal(sql, bindings, options)`      | Execute query on all shards, then globally merge/sort/paginate | `string, any[], GlobalAllShardsOptions`                            |
+| `firstAllShardsGlobal(sql, bindings, options)`    | Return first row after global merge/sort/paginate              | `string, any[], GlobalAllShardsOptions`                            |
+| `reassignShard(key, newShard)`                    | Move primary key to different shard                            | `string, string`                                                   |
+| `listKnownShards()`                               | Get list of available shards                                   | `void`                                                             |
+| `getShardStats()`                                 | Get statistics for all shards                                  | `void`                                                             |
+| `getDatabaseSizeForKey(key)`                      | Get size of key-routed shard in bytes                          | `string`                                                           |
+| `getDatabaseSizeForShard(shard)`                  | Get size of a specific shard in bytes                          | `string`                                                           |
+| `getDatabaseSizesAllShards(batchSize)`            | Get per-shard size data                                        | `number`                                                           |
+| `getTotalDatabaseSize(batchSize)`                 | Get total size across all shards                               | `number`                                                           |
+| `flush()`                                         | Clear all shard mappings (development only)                    | `void`                                                             |
 
 ### Provider Adapter Functions
 
@@ -1192,22 +1320,27 @@ const config: CollegeDBConfig = {
 
 CollegeDB exports TypeScript types for better development experience and type safety:
 
-| Type                    | Description                    | Example                                             |
-| ----------------------- | ------------------------------ | --------------------------------------------------- |
-| `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                          |
-| `KVStorage`             | Provider-agnostic KV contract  | `createRedisKVProvider(redisClient)`                |
-| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgreSQLProvider(pgPool)`                  |
-| `NuxtHubKVLike`         | NuxtHub/Unstorage KV contract  | `createNuxtHubKVProvider(kv)`                       |
-| `DrizzleClientLike`     | Minimal Drizzle DB contract    | `createPostgreSQLProvider(drizzleDb, sql)`          |
-| `DrizzleSqlTagLike`     | Drizzle SQL tag contract       | `createSQLiteProvider(drizzleDb, sql)`              |
-| `QueryResult`           | Standard query response shape  | `{ success, results, meta }`                        |
-| `QueryResultMeta`       | Query execution metadata       | `{ duration, changes?, last_row_id? }`              |
-| `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'` |
-| `MixedShardingStrategy` | Mixed strategy configuration   | `{ read: 'hash', write: 'location' }`               |
-| `OperationType`         | Database operation types       | `'read' \| 'write'`                                 |
-| `D1Region`              | Cloudflare D1 regions          | `'wnam' \| 'enam' \| 'weur' \| ...`                 |
-| `ShardLocation`         | Geographic shard configuration | `{ region: 'wnam', priority: 2 }`                   |
-| `ShardStats`            | Shard usage statistics         | `{ binding: 'db-east', count: 1542 }`               |
+| Type                    | Description                    | Example                                               |
+| ----------------------- | ------------------------------ | ----------------------------------------------------- |
+| `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                            |
+| `KVStorage`             | Provider-agnostic KV contract  | `createRedisKVProvider(redisClient)`                  |
+| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgreSQLProvider(pgPool)`                    |
+| `NuxtHubKVLike`         | NuxtHub/Unstorage KV contract  | `createNuxtHubKVProvider(kv)`                         |
+| `DrizzleClientLike`     | Minimal Drizzle DB contract    | `createPostgreSQLProvider(drizzleDb, sql)`            |
+| `DrizzleSqlTagLike`     | Drizzle SQL tag contract       | `createSQLiteProvider(drizzleDb, sql)`                |
+| `QueryResult`           | Standard query response shape  | `{ success, results, meta }`                          |
+| `QueryResultMeta`       | Query execution metadata       | `{ duration, changes?, last_row_id? }`                |
+| `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'`   |
+| `MixedShardingStrategy` | Mixed strategy configuration   | `{ read: 'hash', write: 'location' }`                 |
+| `OperationType`         | Database operation types       | `'read' \| 'write'`                                   |
+| `D1Region`              | Cloudflare D1 regions          | `'wnam' \| 'enam' \| 'weur' \| ...`                   |
+| `ShardLocation`         | Geographic shard configuration | `{ region: 'wnam', priority: 2 }`                     |
+| `ShardStats`            | Shard usage statistics         | `{ binding: 'db-east', count: 1542 }`                 |
+| `IndexColumnDefinition` | Index column definition        | `{ name: 'created_at', order: 'DESC' }`               |
+| `CreateIndexOptions`    | Index creation options         | `{ ifNotExists: true, unique: false }`                |
+| `ExplainOptions`        | Explain mode options           | `{ mode: 'query-plan' }`                              |
+| `ShardTableCount`       | Per-shard row-count result     | `{ shard: 'db-east', count: 100, success: true }`     |
+| `ShardSizeResult`       | Per-shard size result          | `{ shard: 'db-east', size: 10485760, success: true }` |
 
 #### Mixed Strategy Configuration
 
