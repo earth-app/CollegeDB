@@ -5,12 +5,15 @@ import {
 	count,
 	countAllShards,
 	explain,
+	first,
 	firstAllShardsGlobal,
 	firstByLookupKey,
 	getDatabaseSizesAllShards,
 	getTotalDatabaseSize,
 	indexAllShards,
 	initialize,
+	insert,
+	insertShard,
 	resetConfig
 } from '../src/index';
 import { KVShardMapper } from '../src/kvmap';
@@ -135,6 +138,101 @@ class MockDatabase {
 		}
 
 		return [...this.rows];
+	}
+}
+
+class GeneratedIdMockDatabase {
+	private rows: Row[] = [];
+	public runCalls = 0;
+	public allCalls = 0;
+
+	prepare(sql: string) {
+		const self = this;
+		return {
+			bind(...bindings: any[]) {
+				return {
+					async run<T = Row>() {
+						self.runCalls += 1;
+						if (sql.toLowerCase().includes('insert into auto_users')) {
+							const generatedId = 41;
+							self.rows.push({
+								id: generatedId,
+								name: bindings[0],
+								email: bindings[1],
+								created_at: bindings[2]
+							});
+							return {
+								success: true,
+								results: [] as T[],
+								meta: { duration: 1, last_row_id: generatedId }
+							};
+						}
+
+						if (sql.toLowerCase().includes('insert into')) {
+							return {
+								success: true,
+								results: [] as T[],
+								meta: { duration: 1 }
+							};
+						}
+
+						return {
+							success: true,
+							results: [] as T[],
+							meta: { duration: 1 }
+						};
+					},
+					async all<T = Row>() {
+						self.allCalls += 1;
+						if (sql.toLowerCase().includes('returning id')) {
+							const generatedId = 84;
+							self.rows.push({
+								id: generatedId,
+								name: bindings[0],
+								email: bindings[1],
+								created_at: bindings[2]
+							});
+							return {
+								success: true,
+								results: [{ id: generatedId }] as T[],
+								meta: { duration: 1 }
+							};
+						}
+
+						return {
+							success: true,
+							results: [] as T[],
+							meta: { duration: 1 }
+						};
+					},
+					async first<T = Row>() {
+						if (sql.toLowerCase().includes('select') && sql.toLowerCase().includes('where id = ?')) {
+							const row = self.rows.find((item) => String(item.id) === String(bindings[0]));
+							return (row as T) ?? null;
+						}
+
+						return null;
+					}
+				};
+			},
+			async run<T = Row>() {
+				return {
+					success: true,
+					results: [] as T[],
+					meta: { duration: 1, last_row_id: 41 }
+				};
+			},
+			async all<T = Row>() {
+				return {
+					success: true,
+					results: [{ id: 84 }] as T[],
+					meta: { duration: 1 }
+				};
+			},
+			async first<T = Row>() {
+				return null;
+			}
+		};
 	}
 }
 
@@ -263,6 +361,99 @@ describe('router helper APIs', () => {
 
 	it('indexAllShards rejects unsafe identifiers', async () => {
 		await expect(indexAllShards('users; DROP TABLE users', ['email'])).rejects.toThrow('Invalid SQL identifier');
+	});
+
+	it('insert automatically selects a shard and stores generated ids', async () => {
+		const east = new GeneratedIdMockDatabase();
+		const west = new GeneratedIdMockDatabase();
+		initialize({
+			kv: kv as any,
+			shards: {
+				'db-east': east as any,
+				'db-west': west as any
+			},
+			strategy: 'round-robin',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		const result = await insert('INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)', ['Alice', 'alice@example.com', 123]);
+		expect(result.generatedId).toBe(41);
+		expect(east.runCalls).toBe(1);
+		expect(west.runCalls).toBe(0);
+
+		const row = await first(String(result.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [result.generatedId]);
+		expect(row?.name).toBe('Alice');
+	});
+
+	it('insertShard returns generated ids from RETURNING rows', async () => {
+		const db = new GeneratedIdMockDatabase();
+		initialize({
+			kv: kv as any,
+			shards: {
+				'db-east': db as any
+			},
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		const result = await insertShard('db-east', 'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?) RETURNING id', [
+			'Bob',
+			'bob@example.com',
+			456
+		]);
+		expect(result.generatedId).toBe(84);
+		expect(db.allCalls).toBe(1);
+		expect(db.runCalls).toBe(0);
+
+		const row = await first(String(result.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [result.generatedId]);
+		expect(row?.name).toBe('Bob');
+	});
+
+	it('insertShard throws when a generated id cannot be determined', async () => {
+		const db = {
+			prepare() {
+				return {
+					bind() {
+						return {
+							async run() {
+								return { success: true, results: [], meta: { duration: 1 } };
+							},
+							async all() {
+								return { success: true, results: [], meta: { duration: 1 } };
+							},
+							async first() {
+								return null;
+							}
+						};
+					},
+					async run() {
+						return { success: true, results: [], meta: { duration: 1 } };
+					},
+					async all() {
+						return { success: true, results: [], meta: { duration: 1 } };
+					},
+					async first() {
+						return null;
+					}
+				};
+			}
+		};
+
+		initialize({
+			kv: kv as any,
+			shards: {
+				'db-east': db as any
+			},
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await expect(
+			insertShard('db-east', 'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)', ['Carol', 'carol@example.com', 789])
+		).rejects.toThrow('Insert did not return a generated primary key');
 	});
 
 	it('explain returns query-plan rows', async () => {
