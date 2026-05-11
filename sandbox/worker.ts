@@ -13,6 +13,7 @@ import {
 	flush,
 	getShardStats,
 	initialize,
+	insert,
 	listKnownShards,
 	run,
 	runAllShards,
@@ -49,6 +50,13 @@ const BENCH_SCHEMA = `
 		content TEXT,
 		created_at INTEGER
 	);
+
+	CREATE TABLE IF NOT EXISTS auto_users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE,
+		created_at INTEGER
+	);
 `;
 
 const INSERT_USER_SQL = 'INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)';
@@ -56,6 +64,8 @@ const SELECT_USER_SQL = 'SELECT id, name, email, created_at FROM users WHERE id 
 const UPDATE_USER_SQL = 'UPDATE users SET name = ?, email = ? WHERE id = ?';
 const DELETE_USER_SQL = 'DELETE FROM users WHERE id = ?';
 const INSERT_POST_SQL = 'INSERT INTO posts (id, user_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)';
+const INSERT_AUTO_USER_SQL = 'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)';
+const SELECT_AUTO_USER_SQL = 'SELECT id, name, email, created_at FROM auto_users WHERE id = ?';
 const CLOUDFLARE_BENCH_SHARD_LOCATIONS: Record<string, ShardLocation> = {
 	'db-east': { region: 'enam', priority: 2 },
 	'db-west': { region: 'wnam', priority: 2 },
@@ -362,6 +372,26 @@ export default {
 					await run(id, INSERT_USER_SQL, [id, `Seed ${i}`, `${id}@seed.local`, Date.now()]);
 				}
 				return json({ success: true, inserted: records });
+			}
+
+			if (pathname === '/api/benchmark/auto-increment' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const prefix = String(body.prefix ?? `auto-${Date.now()}`);
+				const records = toBoundedInt(body.records, 10, 1, 100);
+				const generatedIds: Array<number | string> = [];
+
+				for (let i = 0; i < records; i++) {
+					const routingKey = `${prefix}-${i}`;
+					const result = await insert(INSERT_AUTO_USER_SQL, [`Auto ${i}`, `${routingKey}@auto.local`, Date.now()]);
+					generatedIds.push(result.generatedId);
+
+					const row = await first<Record<string, unknown>>(String(result.generatedId), SELECT_AUTO_USER_SQL, [result.generatedId]);
+					if (!row) {
+						return json({ success: false, error: 'Generated id could not be read back' }, 500);
+					}
+				}
+
+				return json({ success: true, inserted: records, generatedIds });
 			}
 
 			if (pathname === '/api/benchmark/migration' && request.method === 'POST') {
