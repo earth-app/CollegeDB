@@ -71,6 +71,7 @@ This allows you to:
 - Automatic query routing (primary key to shard mapping)
 - Provider adapters for Redis/Valkey/NuxtHub KV plus PostgreSQL/MySQL/SQLite SQL
 - Drizzle interop through existing SQL providers (`createPostgreSQLProvider`, `createMySQLProvider`, `createSQLiteProvider`)
+- Auto-allocated generated-id inserts via `insert()` and direct-shard inserts via `insertShard()` for AUTOINCREMENT / RETURNING workflows
 - Hyperdrive helpers for PostgreSQL and MySQL
 - Multiple allocation strategies: round-robin, random, hash, location-aware, and mixed read/write strategies
 - Durable Object shard coordination and shard statistics
@@ -193,18 +194,19 @@ CollegeDB includes a benchmark runner that executes each SQL+KV combination acro
 
 ### Scenario Catalog
 
-| Scenario Key      | Scenario                         | What Happens                                                                                        | Workload Per Run                                                       |
-| ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| basic_crud        | Basic CRUD round-trip            | Insert, read, update, and delete a user via routed queries.                                         | 20 iterations; 4 routed SQL ops per iteration                          |
-| advanced_usage    | Advanced lookup workflow         | Writes user+post, adds lookup aliases, then validates join and alias-based lookup.                  | 15 iterations; ~5 routed SQL ops + KV lookup-key updates per iteration |
-| migration_mapping | Migration-style mapping creation | Inserts legacy records on a fixed shard, then builds shard mappings in batch and validates routing. | 10 iterations; 20 legacy records mapped per iteration                  |
-| bulk_crud         | Bulk CRUD pressure               | Performs bulk inserts, half updates, and full delete sweep, then validates shard-wide totals.       | 7 iterations; 160 inserts + 80 updates + 160 deletes per iteration     |
-| indexing          | Indexed query scan               | Creates an index on posts(user_id) and repeatedly queries the indexed path.                         | 15 iterations after warmup dataset build                               |
-| metadata_fetch    | Metadata inspection              | Reads table metadata/introspection rows from one shard.                                             | 14 iterations; 1 metadata query per iteration                          |
-| pragma_or_info    | PRAGMA / server info             | Runs provider-specific PRAGMA/info query to sample low-level metadata latency.                      | 14 iterations; 1 pragma/info query per iteration                       |
-| counting          | Cross-shard counting             | Counts users across all shards to measure fanout aggregation overhead.                              | 14 iterations; all-shard count aggregation per iteration               |
-| shard_fanout      | Shard fanout query               | Runs query fanout to all shards and aggregates shard-level responses.                               | 14 iterations; 1 all-shards query per iteration                        |
-| reassignment      | Shard reassignment flow          | Creates a record, reassigns it to another shard, and verifies routed reads still succeed.           | 10 iterations; insert + reassignment + verification per iteration      |
+| Scenario Key      | Scenario                         | What Happens                                                                                                                    | Workload Per Run                                                       |
+| ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| basic_crud        | Basic CRUD round-trip            | Insert, read, update, and delete a user via routed queries.                                                                     | 20 iterations; 4 routed SQL ops per iteration                          |
+| advanced_usage    | Advanced lookup workflow         | Writes user+post, adds lookup aliases, then validates join and alias-based lookup.                                              | 15 iterations; ~5 routed SQL ops + KV lookup-key updates per iteration |
+| migration_mapping | Migration-style mapping creation | Inserts legacy records on a fixed shard, then builds shard mappings in batch and validates routing.                             | 10 iterations; 20 legacy records mapped per iteration                  |
+| bulk_crud         | Bulk CRUD pressure               | Performs bulk inserts, half updates, and full delete sweep, then validates shard-wide totals.                                   | 7 iterations; 160 inserts + 80 updates + 160 deletes per iteration     |
+| auto_increment    | Auto-generated primary keys      | Inserts rows with generated ids on an automatically selected shard, captures the generated key, then validates routed readback. | 6 iterations; insert + generated-id readback per iteration             |
+| indexing          | Indexed query scan               | Creates an index on posts(user_id) and repeatedly queries the indexed path.                                                     | 15 iterations after warmup dataset build                               |
+| metadata_fetch    | Metadata inspection              | Reads table metadata/introspection rows from one shard.                                                                         | 14 iterations; 1 metadata query per iteration                          |
+| pragma_or_info    | PRAGMA / server info             | Runs provider-specific PRAGMA/info query to sample low-level metadata latency.                                                  | 14 iterations; 1 pragma/info query per iteration                       |
+| counting          | Cross-shard counting             | Counts users across all shards to measure fanout aggregation overhead.                                                          | 14 iterations; all-shard count aggregation per iteration               |
+| shard_fanout      | Shard fanout query               | Runs query fanout to all shards and aggregates shard-level responses.                                                           | 14 iterations; 1 all-shards query per iteration                        |
+| reassignment      | Shard reassignment flow          | Creates a record, reassigns it to another shard, and verifies routed reads still succeed.                                       | 10 iterations; insert + reassignment + verification per iteration      |
 
 ### Report Matrices
 
@@ -439,6 +441,7 @@ Benchmark coverage includes:
 - advanced lookup/routing workflows
 - migration-style mapping creation
 - bulk CRUD
+- auto-generated primary key inserts and readback
 - indexing queries
 - metadata fetch
 - pragma/info queries (provider-specific)
@@ -571,6 +574,67 @@ This approach provides:
 - **Optimal data placement**: New records are written to geographically optimal shards using `location` strategy
 - **Optimal read performance**: Queries use `hash` strategy for consistent, high-performance routing
 - **Flexibility**: Each operation type can use the most appropriate routing strategy
+
+### Auto-Generated Primary Keys
+
+When your table assigns the primary key during insert, use `insert()` for the automatic shard-allocation path or `insertShard()` when you already know the target shard. Both helpers capture the generated id from provider metadata or `RETURNING` rows, then store the generated-id mapping so the normal routed `first()` / `all()` helpers can read the row back.
+
+```typescript
+import { first, insert, insertShard } from '@earth-app/collegedb';
+
+// SQLite / D1
+await createSchema(
+	env['db-east'],
+	`
+	CREATE TABLE IF NOT EXISTS auto_users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE,
+		created_at INTEGER
+	)
+`
+);
+
+const created = await insert('INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)', ['Ada', 'ada@example.com', Date.now()]);
+
+const row = await first(String(created.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [created.generatedId]);
+```
+
+```typescript
+// Direct shard insert when you want to pin the write to a specific shard
+const directCreated = await insertShard('db-east', 'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)', [
+	'Ada',
+	'ada@example.com',
+	Date.now()
+]);
+
+console.log(directCreated.generatedId);
+```
+
+```typescript
+// PostgreSQL / MySQL 8.0.19+ RETURNING path
+await createSchema(
+	env['db-east'],
+	`
+	CREATE TABLE IF NOT EXISTS auto_users (
+		id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		email VARCHAR(255) UNIQUE,
+		created_at BIGINT
+	)
+`
+);
+
+const created = await insert('INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?) RETURNING id', [
+	'Ada',
+	'ada@example.com',
+	Date.now()
+]);
+
+const row = await first(String(created.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [created.generatedId]);
+```
+
+If your SQL dialect uses `RETURNING`, include it in the insert statement. The helper will use the returned row instead of provider metadata when present.
 
 ## Multi-Key Shard Mappings
 
@@ -1022,42 +1086,44 @@ await first('user-123', 'SELECT * FROM users WHERE email = ?', [email]);
 
 ## API Reference
 
-| Function                                          | Description                                                    | Parameters                                                         |
-| ------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `collegedb(config, callback)`                     | Initialize CollegeDB, then run a callback                      | `CollegeDBConfig, () => T`                                         |
-| `initialize(config)`                              | Initialize CollegeDB with configuration                        | `CollegeDBConfig`                                                  |
-| `createSchema(db, schema)`                        | Create schema on a shard database                              | `SQLDatabase, string`                                              |
-| `prepare(key, sql)`                               | Prepare a SQL statement for execution                          | `string, string`                                                   |
-| `run(key, sql, bindings)`                         | Execute a SQL query with primary key routing                   | `string, string, any[]`                                            |
-| `first(key, sql, bindings)`                       | Execute a SQL query and return first result                    | `string, string, any[]`                                            |
-| `all(key, sql, bindings)`                         | Execute a SQL query and return all results                     | `string, string, any[]`                                            |
-| `index(key, table, columns, options)`             | Create an index on routed shard                                | `string, string, string or index-column array, CreateIndexOptions` |
-| `indexShard(shard, table, columns, options)`      | Create an index on one shard                                   | `string, string, string or index-column array, CreateIndexOptions` |
-| `indexAllShards(table, columns, options)`         | Create an index on all shards                                  | `string, string or index-column array, CreateIndexOptions`         |
-| `firstByLookupKey(key, sql, bindings, batchSize)` | Resolve secondary-key mapping, fallback to fanout              | `string, string, any[], number`                                    |
-| `allByLookupKey(key, sql, bindings, batchSize)`   | Resolve secondary-key mapping, fallback to fanout              | `string, string, any[], number`                                    |
-| `runShard(shard, sql, bindings)`                  | Execute a query directly on a specific shard                   | `string, string, any[]`                                            |
-| `allShard(shard, sql, bindings)`                  | Execute a query on specific shard, return all results          | `string, string, any[]`                                            |
-| `firstShard(shard, sql, bindings)`                | Execute a query on specific shard, return first result         | `string, string, any[]`                                            |
-| `explain(key, sql, bindings, options)`            | Inspect query plan on routed shard                             | `string, string, any[], ExplainOptions`                            |
-| `explainShard(shard, sql, bindings, options)`     | Inspect query plan on one shard                                | `string, string, any[], ExplainOptions`                            |
-| `explainAllShards(sql, bindings, options)`        | Inspect query plan on all shards                               | `string, any[], ExplainOptions`                                    |
-| `count(key, table)`                               | Count rows on routed shard                                     | `string, string`                                                   |
-| `countShard(shard, table)`                        | Count rows on a specific shard                                 | `string, string`                                                   |
-| `countAllShards(table, batchSize)`                | Count rows per shard and global total                          | `string, number`                                                   |
-| `runAllShards(sql, bindings, batchSize)`          | Execute query on all shards                                    | `string, any[], number`                                            |
-| `allAllShards(sql, bindings, batchSize)`          | Execute query on all shards (SQL pagination applies per shard) | `string, any[], number`                                            |
-| `firstAllShards(sql, bindings, batchSize)`        | Execute query on all shards, return first row per shard        | `string, any[], number`                                            |
-| `allAllShardsGlobal(sql, bindings, options)`      | Execute query on all shards, then globally merge/sort/paginate | `string, any[], GlobalAllShardsOptions`                            |
-| `firstAllShardsGlobal(sql, bindings, options)`    | Return first row after global merge/sort/paginate              | `string, any[], GlobalAllShardsOptions`                            |
-| `reassignShard(key, newShard)`                    | Move primary key to different shard                            | `string, string`                                                   |
-| `listKnownShards()`                               | Get list of available shards                                   | `void`                                                             |
-| `getShardStats()`                                 | Get statistics for all shards                                  | `void`                                                             |
-| `getDatabaseSizeForKey(key)`                      | Get size of key-routed shard in bytes                          | `string`                                                           |
-| `getDatabaseSizeForShard(shard)`                  | Get size of a specific shard in bytes                          | `string`                                                           |
-| `getDatabaseSizesAllShards(batchSize)`            | Get per-shard size data                                        | `number`                                                           |
-| `getTotalDatabaseSize(batchSize)`                 | Get total size across all shards                               | `number`                                                           |
-| `flush()`                                         | Clear all shard mappings (development only)                    | `void`                                                             |
+| Function                                          | Description                                                            | Parameters                                                         |
+| ------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `collegedb(config, callback)`                     | Initialize CollegeDB, then run a callback                              | `CollegeDBConfig, () => T`                                         |
+| `initialize(config)`                              | Initialize CollegeDB with configuration                                | `CollegeDBConfig`                                                  |
+| `createSchema(db, schema)`                        | Create schema on a shard database                                      | `SQLDatabase, string`                                              |
+| `prepare(key, sql)`                               | Prepare a SQL statement for execution                                  | `string, string`                                                   |
+| `run(key, sql, bindings)`                         | Execute a SQL query with primary key routing                           | `string, string, any[]`                                            |
+| `insert(sql, bindings)`                           | Insert on an automatically selected shard and capture the generated id | `string, any[]`                                                    |
+| `insertShard(shard, sql, bindings)`               | Insert directly on a specific shard and capture the generated id       | `string, string, any[]`                                            |
+| `first(key, sql, bindings)`                       | Execute a SQL query and return first result                            | `string, string, any[]`                                            |
+| `all(key, sql, bindings)`                         | Execute a SQL query and return all results                             | `string, string, any[]`                                            |
+| `index(key, table, columns, options)`             | Create an index on routed shard                                        | `string, string, string or index-column array, CreateIndexOptions` |
+| `indexShard(shard, table, columns, options)`      | Create an index on one shard                                           | `string, string, string or index-column array, CreateIndexOptions` |
+| `indexAllShards(table, columns, options)`         | Create an index on all shards                                          | `string, string or index-column array, CreateIndexOptions`         |
+| `firstByLookupKey(key, sql, bindings, batchSize)` | Resolve secondary-key mapping, fallback to fanout                      | `string, string, any[], number`                                    |
+| `allByLookupKey(key, sql, bindings, batchSize)`   | Resolve secondary-key mapping, fallback to fanout                      | `string, string, any[], number`                                    |
+| `runShard(shard, sql, bindings)`                  | Execute a query directly on a specific shard                           | `string, string, any[]`                                            |
+| `allShard(shard, sql, bindings)`                  | Execute a query on specific shard, return all results                  | `string, string, any[]`                                            |
+| `firstShard(shard, sql, bindings)`                | Execute a query on specific shard, return first result                 | `string, string, any[]`                                            |
+| `explain(key, sql, bindings, options)`            | Inspect query plan on routed shard                                     | `string, string, any[], ExplainOptions`                            |
+| `explainShard(shard, sql, bindings, options)`     | Inspect query plan on one shard                                        | `string, string, any[], ExplainOptions`                            |
+| `explainAllShards(sql, bindings, options)`        | Inspect query plan on all shards                                       | `string, any[], ExplainOptions`                                    |
+| `count(key, table)`                               | Count rows on routed shard                                             | `string, string`                                                   |
+| `countShard(shard, table)`                        | Count rows on a specific shard                                         | `string, string`                                                   |
+| `countAllShards(table, batchSize)`                | Count rows per shard and global total                                  | `string, number`                                                   |
+| `runAllShards(sql, bindings, batchSize)`          | Execute query on all shards                                            | `string, any[], number`                                            |
+| `allAllShards(sql, bindings, batchSize)`          | Execute query on all shards (SQL pagination applies per shard)         | `string, any[], number`                                            |
+| `firstAllShards(sql, bindings, batchSize)`        | Execute query on all shards, return first row per shard                | `string, any[], number`                                            |
+| `allAllShardsGlobal(sql, bindings, options)`      | Execute query on all shards, then globally merge/sort/paginate         | `string, any[], GlobalAllShardsOptions`                            |
+| `firstAllShardsGlobal(sql, bindings, options)`    | Return first row after global merge/sort/paginate                      | `string, any[], GlobalAllShardsOptions`                            |
+| `reassignShard(key, newShard)`                    | Move primary key to different shard                                    | `string, string`                                                   |
+| `listKnownShards()`                               | Get list of available shards                                           | `void`                                                             |
+| `getShardStats()`                                 | Get statistics for all shards                                          | `void`                                                             |
+| `getDatabaseSizeForKey(key)`                      | Get size of key-routed shard in bytes                                  | `string`                                                           |
+| `getDatabaseSizeForShard(shard)`                  | Get size of a specific shard in bytes                                  | `string`                                                           |
+| `getDatabaseSizesAllShards(batchSize)`            | Get per-shard size data                                                | `number`                                                           |
+| `getTotalDatabaseSize(batchSize)`                 | Get total size across all shards                                       | `number`                                                           |
+| `flush()`                                         | Clear all shard mappings (development only)                            | `void`                                                             |
 
 ### Provider Adapter Functions
 
