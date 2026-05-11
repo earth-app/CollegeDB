@@ -995,37 +995,73 @@ function splitQuestionPlaceholders(sql: string): string[] {
 }
 
 function extractRowsFromDrizzleExecute<T>(result: unknown): T[] {
-	if (Array.isArray(result)) {
-		if (result.length === 2 && Array.isArray(result[0])) {
-			return result[0] as T[];
+	const extractRowsFromObject = (value: unknown): T[] | undefined => {
+		if (!value || typeof value !== 'object' || Array.isArray(value)) {
+			return undefined;
 		}
 
-		if (
-			result.length === 2 &&
-			result[0] &&
-			typeof result[0] === 'object' &&
-			!Array.isArray(result[0]) &&
-			(Array.isArray(result[1]) || result[1] === null || result[1] === undefined)
-		) {
-			return [];
+		const objectValue = value as Record<string, unknown>;
+		if (Array.isArray(objectValue.rows)) {
+			return objectValue.rows as T[];
+		}
+
+		if (Array.isArray(objectValue.results)) {
+			return objectValue.results as T[];
+		}
+
+		if (Array.isArray(objectValue.data)) {
+			return objectValue.data as T[];
+		}
+
+		return undefined;
+	};
+
+	const looksLikeRowObject = (value: unknown): value is Record<string, unknown> => {
+		if (!value || typeof value !== 'object' || Array.isArray(value)) {
+			return false;
+		}
+
+		return Object.keys(value).length > 0;
+	};
+
+	if (Array.isArray(result)) {
+		if (result.length === 2) {
+			const firstObjectRows = extractRowsFromObject(result[0]);
+			if (firstObjectRows) {
+				return firstObjectRows;
+			}
+
+			const secondObjectRows = extractRowsFromObject(result[1]);
+			if (secondObjectRows) {
+				return secondObjectRows;
+			}
+
+			if (!Array.isArray(result[0]) && !Array.isArray(result[1])) {
+				if (looksLikeRowObject(result[0])) {
+					return [result[0] as T];
+				}
+
+				if (looksLikeRowObject(result[1])) {
+					return [result[1] as T];
+				}
+			}
+
+			if (Array.isArray(result[0])) {
+				return result[0] as T[];
+			}
+
+			if (Array.isArray(result[1])) {
+				return result[1] as T[];
+			}
 		}
 
 		return result as T[];
 	}
 
 	if (result && typeof result === 'object') {
-		const objectResult = result as Record<string, unknown>;
-
-		if (Array.isArray(objectResult.rows)) {
-			return objectResult.rows as T[];
-		}
-
-		if (Array.isArray(objectResult.results)) {
-			return objectResult.results as T[];
-		}
-
-		if (Array.isArray(objectResult.data)) {
-			return objectResult.data as T[];
+		const objectRows = extractRowsFromObject(result);
+		if (objectRows) {
+			return objectRows;
 		}
 	}
 
@@ -1039,8 +1075,17 @@ function extractMetaFromDrizzleExecute(result: unknown): Record<string, unknown>
 
 	let objectResult: Record<string, unknown> | undefined;
 
-	if (Array.isArray(result) && result.length === 2 && result[0] && typeof result[0] === 'object' && !Array.isArray(result[0])) {
-		objectResult = result[0] as Record<string, unknown>;
+	if (Array.isArray(result)) {
+		if (result.length === 2) {
+			// Try result[0] first (metadata-first format like [metadata, rows])
+			if (result[0] && typeof result[0] === 'object' && !Array.isArray(result[0])) {
+				objectResult = result[0] as Record<string, unknown>;
+			}
+			// Try result[1] if result[0] is not metadata (metadata-second format like [rows, metadata])
+			else if (result[1] && typeof result[1] === 'object' && !Array.isArray(result[1])) {
+				objectResult = result[1] as Record<string, unknown>;
+			}
+		}
 	} else if (typeof result === 'object' && !Array.isArray(result)) {
 		objectResult = result as Record<string, unknown>;
 	}
@@ -1056,7 +1101,13 @@ function extractMetaFromDrizzleExecute(result: unknown): Record<string, unknown>
 		meta.changes = changes;
 	}
 
-	const lastRowId = objectResult.lastInsertRowid ?? objectResult.lastInsertId ?? objectResult.insertId;
+	const lastRowId =
+		objectResult.lastInsertRowid ??
+		objectResult.lastInsertId ??
+		objectResult.lastID ??
+		objectResult.lastRowID ??
+		objectResult.insertId ??
+		objectResult.insertID;
 	if (typeof lastRowId === 'number' || typeof lastRowId === 'string') {
 		meta.last_row_id = lastRowId;
 	}

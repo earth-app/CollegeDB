@@ -82,6 +82,8 @@ let globalMapper: KVShardMapper | null = null;
  */
 const shardSizeCache = new Map<string, { size: number; expiresAt: number }>();
 
+let generatedInsertRoundRobinIndex = 0;
+
 /**
  * Gets the shared mapper for the active configuration.
  * @private
@@ -143,6 +145,7 @@ export function initialize(config: CollegeDBConfig) {
 		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
 	});
 	shardSizeCache.clear();
+	generatedInsertRoundRobinIndex = 0;
 
 	// Background: sync KV known shards with configured shards
 	try {
@@ -211,6 +214,7 @@ export async function initializeAsync(config: CollegeDBConfig) {
 		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
 	});
 	shardSizeCache.clear();
+	generatedInsertRoundRobinIndex = 0;
 
 	// Sync KV known shards with configured shards (awaited in async init)
 	try {
@@ -326,6 +330,7 @@ export function resetConfig(): void {
 	globalConfig = null;
 	globalMapper = null;
 	shardSizeCache.clear();
+	generatedInsertRoundRobinIndex = 0;
 }
 
 /**
@@ -963,6 +968,10 @@ export async function prepare(key: string, sql: string): Promise<PreparedStateme
  * The primary key is used to determine which shard should store the record,
  * ensuring consistent routing for future queries.
  *
+ * Use this helper when your application already knows the routing key before
+ * issuing the write. For database-generated primary keys, use {@link insert}
+ * so the returned generated id can be captured and reused for follow-up reads.
+ *
  * @template T - Type of the result records
  * @param key - Primary key to route the query (should match the record's primary key)
  * @param sql - SQL statement with parameter placeholders
@@ -1029,6 +1038,203 @@ export async function run<T = Record<string, unknown>>(key: string, sql: string,
 	}
 
 	return result;
+}
+
+/**
+ * Result returned by {@link insert} and {@link insertShard}.
+ *
+ * The helper keeps the normal query payload but also exposes the generated
+ * primary key when the backend returns one through `RETURNING` rows or
+ * provider metadata.
+ *
+ * @since 1.1.4
+ */
+export interface InsertResult<T = Record<string, unknown>> extends QueryResult<T> {
+	/** Generated primary key returned by the database or driver. */
+	generatedId: number | string;
+}
+
+function extractGeneratedId<T = Record<string, unknown>>(result: QueryResult<T>): number | string | undefined {
+	const firstRow = result.results[0] as Record<string, unknown> | undefined;
+	if (firstRow && typeof firstRow === 'object') {
+		// Prefer explicit RETURNING rows over provider metadata when available.
+		for (const key of ['id', 'ID', 'Id', 'rowid', 'ROWID', 'RowId', 'last_row_id', 'lastInsertId', 'insertId']) {
+			const value = firstRow[key];
+			if (value !== undefined && value !== null) {
+				return value as number | string;
+			}
+		}
+
+		for (const [key, value] of Object.entries(firstRow)) {
+			const lowerKey = key.toLowerCase();
+			if ((lowerKey === 'id' || lowerKey === 'rowid') && (typeof value === 'number' || typeof value === 'string')) {
+				return value as number | string;
+			}
+		}
+
+		for (const value of Object.values(firstRow)) {
+			if (typeof value === 'number' || typeof value === 'string') {
+				return value;
+			}
+		}
+	}
+
+	const metaId = result.meta.last_row_id;
+	if (metaId !== undefined && metaId !== null) {
+		return metaId;
+	}
+
+	return undefined;
+}
+
+function createInsertAllocatorKey(): string {
+	return `insert:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
+
+async function allocateInsertShard(): Promise<string> {
+	const config = getConfig();
+	const availableShards = Object.keys(config.shards);
+
+	if (availableShards.length === 0) {
+		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
+	}
+
+	const eligibleShards = await filterShardsBySize(availableShards, config);
+	if (eligibleShards.length === 0) {
+		throw new CollegeDBError('No shards available for insert', 'NO_SHARDS');
+	}
+
+	const effectiveStrategy = resolveStrategy(config, 'write');
+	const allocatorKey = createInsertAllocatorKey();
+
+	if (config.coordinator) {
+		try {
+			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinator = config.coordinator.get(coordinatorId);
+
+			const response = await coordinator.fetch('http://coordinator/allocate', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					primaryKey: allocatorKey,
+					strategy: effectiveStrategy,
+					operationType: 'write',
+					targetRegion: config.targetRegion,
+					shardLocations: config.shardLocations,
+					availableShards: eligibleShards
+				})
+			});
+
+			if (response.ok) {
+				const result = (await response.json()) as { shard: string };
+				return result.shard;
+			}
+		} catch (error) {
+			console.warn('Coordinator allocation for insert failed, falling back to local strategy:', error);
+		}
+	}
+
+	if (effectiveStrategy === 'round-robin') {
+		const shard = eligibleShards[generatedInsertRoundRobinIndex % eligibleShards.length]!;
+		generatedInsertRoundRobinIndex = (generatedInsertRoundRobinIndex + 1) % eligibleShards.length;
+		return shard;
+	}
+
+	return selectShardByStrategy(effectiveStrategy, allocatorKey, eligibleShards, config);
+}
+
+async function executeInsertOnShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = []
+): Promise<InsertResult<T>> {
+	const config = getConfig();
+	if (!config.shards[shardBinding]) {
+		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
+	}
+
+	const returning = /\breturning\b/i.test(sql);
+	const result = returning ? await allShard<T>(shardBinding, sql, bindings) : await runShard<T>(shardBinding, sql, bindings);
+	const generatedId = extractGeneratedId(result);
+
+	if (generatedId === undefined) {
+		throw new CollegeDBError('Insert did not return a generated primary key', 'GENERATED_KEY_UNAVAILABLE');
+	}
+
+	const mapper = getMapper(config);
+	await mapper.setShardMapping(String(generatedId), shardBinding);
+
+	return {
+		...result,
+		generatedId
+	};
+}
+
+/**
+ * Executes an insert on an automatically selected shard and returns the generated primary key.
+ *
+ * This is the default helper for generated-key tables. CollegeDB picks a shard
+ * using the configured allocation strategy, then stores the generated primary
+ * key -> shard mapping so routed reads can find the row later.
+ *
+ * @template T - Type of returned rows when the insert uses `RETURNING`
+ * @param sql - The INSERT statement to execute
+ * @param bindings - Parameter values to bind to the statement
+ * @returns Promise resolving to the write result plus the generated id
+ * @throws {CollegeDBError} If the insert succeeds but no generated id can be determined
+ * @since 1.1.4
+ * @example
+ * ```typescript
+ * const created = await insert(
+ *   'INSERT INTO auto_users (name, email) VALUES (?, ?)',
+ *   ['Ada', 'ada@example.com']
+ * );
+ *
+ * const row = await first(String(created.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [created.generatedId]);
+ * ```
+ */
+export async function insert<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<InsertResult<T>> {
+	const shardBinding = await allocateInsertShard();
+	return await executeInsertOnShard<T>(shardBinding, sql, bindings);
+}
+
+/**
+ * Executes an insert directly on a named shard and returns the generated primary key.
+ *
+ * Use this helper when you already know the shard you want to target.
+ * The helper still captures the generated id and stores the mapping so routed
+ * reads can find the new row later.
+ *
+ * @template T - Type of returned rows when the insert uses `RETURNING`
+ * @param shardBinding - The shard binding to execute the insert on
+ * @param sql - The INSERT statement to execute
+ * @param bindings - Parameter values to bind to the statement
+ * @returns Promise resolving to the write result plus the generated id
+ * @throws {CollegeDBError} If the insert succeeds but no generated id can be determined
+ * @since 1.1.4
+ * @example
+ * ```typescript
+ * const created = await insertShard('db-east',
+ *   'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)',
+ *   ['Ada', 'ada@example.com', Date.now()]
+ * );
+ *
+ * console.log(created.generatedId);
+ * ```
+ * @example
+ * ```typescript
+ * const created = await insertShard('db-east',
+ *   'INSERT INTO auto_users (name, email) VALUES (?, ?) RETURNING id',
+ *   ['Ada', 'ada@example.com']
+ * );
+ * ```
+ */
+export async function insertShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = []
+): Promise<InsertResult<T>> {
+	return await executeInsertOnShard<T>(shardBinding, sql, bindings);
 }
 
 /**

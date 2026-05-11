@@ -41,6 +41,8 @@ export {
 	indexShard,
 	initialize,
 	initializeAsync,
+	insert,
+	insertShard,
 	listKnownShards,
 	prepare,
 	reassignShard,
@@ -55,6 +57,7 @@ export type {
 	ExplainOptions,
 	GlobalAllShardsOptions,
 	IndexColumnDefinition,
+	InsertResult,
 	ShardSizeResult,
 	ShardTableCount
 } from './router';
