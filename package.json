@@ -66,7 +66,7 @@
     "wrangler": "^4.90.0"
   },
   "peerDependencies": {
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3 || ^6.0.0"
   },
   "lint-staged": {
     "*.{js,ts,css,md,json,yml,jsonc}": "prettier --write"
