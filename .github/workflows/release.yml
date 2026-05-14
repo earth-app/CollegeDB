@@ -59,7 +59,7 @@ jobs:
           fromTag: "${{ env.LATEST_TAG }}"
           toTag: "master"
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ env.VERSION }}
           name: CollegeDB v${{ env.VERSION }}
