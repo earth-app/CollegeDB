@@ -28,6 +28,45 @@ interface ColumnInfo {
 	isAutoIncrement: boolean;
 }
 
+type InMemoryDrizzleQuery = {
+	toQuery?: (config: Record<string, unknown>) => { sql?: string; params?: unknown[] };
+	sql?: string;
+	params?: unknown[];
+	text?: string;
+};
+
+const IN_MEMORY_DRIZZLE_QUERY_CONFIG = {
+	casing: {
+		getColumnCasing(column: { name?: string }): string {
+			return column?.name ?? '';
+		}
+	},
+	escapeName(name: string): string {
+		return name;
+	},
+	escapeParam(): string {
+		return '?';
+	},
+	escapeString(str: string): string {
+		return str.replace(/'/g, "''");
+	}
+} as const;
+
+function normalizeSqlIdentifier(identifier: string): string {
+	return (
+		identifier
+			.trim()
+			.replace(/^[`"\[]+|[`"\]]+$/g, '')
+			.split('.')
+			.pop()
+			?.trim() ?? identifier.trim()
+	);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Simple in-memory SQL query result parser for common patterns.
  * Not a full SQL parser - handles the most common CRUD operations.
@@ -73,15 +112,64 @@ class SimpleQueryParser {
 		const updateIdx = tokens.indexOf('update');
 
 		if (fromIdx >= 0 && fromIdx + 1 < tokens.length) {
-			return tokens[fromIdx + 1] ?? null;
+			return normalizeSqlIdentifier(tokens[fromIdx + 1] ?? '');
 		}
 		if (intoIdx >= 0 && intoIdx + 1 < tokens.length) {
-			return tokens[intoIdx + 1] ?? null;
+			return normalizeSqlIdentifier(tokens[intoIdx + 1] ?? '');
 		}
 		if (updateIdx >= 0 && updateIdx + 1 < tokens.length) {
-			return tokens[updateIdx + 1] ?? null;
+			return normalizeSqlIdentifier(tokens[updateIdx + 1] ?? '');
 		}
 		return null;
+	}
+
+	static extractInsertColumns(sql: string): string[] | null {
+		const match = sql.match(/insert\s+into\s+[^()]+\(([^)]+)\)/i);
+		if (!match || !match[1]) {
+			return null;
+		}
+
+		return match[1]
+			.split(',')
+			.map((column) => normalizeSqlIdentifier(column))
+			.filter((column) => column.length > 0);
+	}
+
+	static extractWhereClause(sql: string): { column: string; operator: '=' | 'like' } | null {
+		const match = sql.match(/where\s+([`"\w.]+)\s*(=|like)\s*\?/i);
+		if (!match || !match[1] || !match[2]) {
+			return null;
+		}
+
+		const operator = match[2].toLowerCase() === 'like' ? 'like' : '=';
+		return {
+			column: normalizeSqlIdentifier(match[1]),
+			operator
+		};
+	}
+
+	static extractOrderByClause(sql: string): { column: string; direction: 'asc' | 'desc' } | null {
+		const match = sql.match(/order\s+by\s+([`"\w.]+)(?:\s+(asc|desc))?/i);
+		if (!match || !match[1]) {
+			return null;
+		}
+
+		return {
+			column: normalizeSqlIdentifier(match[1]),
+			direction: match[2]?.toLowerCase() === 'desc' ? 'desc' : 'asc'
+		};
+	}
+
+	static matchesWhereClause(record: Record<string, any>, clause: { column: string; operator: '=' | 'like' }, value: unknown): boolean {
+		const fieldValue = record[clause.column];
+
+		if (clause.operator === 'like') {
+			const pattern = String(value ?? '');
+			const regex = new RegExp(`^${escapeRegExp(pattern).replace(/%/g, '.*').replace(/_/g, '.')}$`, 'i');
+			return regex.test(String(fieldValue ?? ''));
+		}
+
+		return String(fieldValue ?? '') === String(value ?? '');
 	}
 
 	/**
@@ -150,6 +238,42 @@ class SimpleQueryParser {
 	}
 }
 
+function normalizeInMemoryDrizzleQuery(query: string | InMemoryDrizzleQuery, bindings: any[] = []): { sql: string; bindings: any[] } {
+	if (typeof query === 'string') {
+		return { sql: query, bindings };
+	}
+
+	if (!query || typeof query !== 'object') {
+		throw new CollegeDBError('Unsupported query input', 'INVALID_QUERY_INPUT');
+	}
+
+	if (typeof query.toQuery === 'function') {
+		const built = query.toQuery(IN_MEMORY_DRIZZLE_QUERY_CONFIG as Record<string, unknown>);
+		if (built && typeof built.sql === 'string') {
+			return {
+				sql: built.sql,
+				bindings: Array.isArray(built.params) ? [...built.params] : bindings
+			};
+		}
+	}
+
+	if (typeof query.sql === 'string') {
+		return {
+			sql: query.sql,
+			bindings: Array.isArray(query.params) ? [...query.params] : bindings
+		};
+	}
+
+	if (typeof query.text === 'string') {
+		return {
+			sql: query.text,
+			bindings: Array.isArray(query.params) ? [...query.params] : bindings
+		};
+	}
+
+	throw new CollegeDBError('Unsupported Drizzle-style query object', 'INVALID_QUERY_INPUT');
+}
+
 /**
  * In-memory implementation of SQLDatabase for testing.
  *
@@ -164,6 +288,27 @@ export class InMemorySQLDatabase implements SQLDatabase {
 
 	prepare(sql: string): PreparedStatement {
 		return new InMemoryPreparedStatement(this, sql);
+	}
+
+	async execute(query: string | InMemoryDrizzleQuery, bindings: any[] = []): Promise<QueryResult<Record<string, any>>> {
+		return await this.executeClientQuery(query, bindings);
+	}
+
+	async run(query: string | InMemoryDrizzleQuery, bindings: any[] = []): Promise<QueryResult<Record<string, any>>> {
+		return await this.executeClientQuery(query, bindings);
+	}
+
+	async all(query: string | InMemoryDrizzleQuery, bindings: any[] = []): Promise<QueryResult<Record<string, any>>> {
+		return await this.executeClientQuery(query, bindings);
+	}
+
+	async get(query: string | InMemoryDrizzleQuery, bindings: any[] = []): Promise<QueryResult<Record<string, any>>> {
+		return await this.executeClientQuery(query, bindings);
+	}
+
+	private async executeClientQuery(query: string | InMemoryDrizzleQuery, bindings: any[]): Promise<QueryResult<Record<string, any>>> {
+		const normalized = normalizeInMemoryDrizzleQuery(query, bindings);
+		return await this.executeStatement(normalized.sql, normalized.bindings);
 	}
 
 	/**
@@ -348,12 +493,52 @@ export class InMemorySQLDatabase implements SQLDatabase {
 
 		const table = this.tables.get(tableName)!;
 		const schema = this.schemas.get(tableName);
+		const schemaEntries = schema ? Array.from(schema.values()) : [];
+		const primaryKeyInfo = schemaEntries.find((column) => column.isPrimaryKey);
+		const autoIncrementInfo = schemaEntries.find((column) => column.isAutoIncrement);
+		const insertColumns = SimpleQueryParser.extractInsertColumns(sql);
+		const record: Record<string, any> = {};
 
-		// For now, assume first binding is the primary key (for simple inserts)
-		// This is a simplification - real SQL parsing would be more complex
-		const primaryKeyValue = bindings[0];
+		// Build record from the explicit INSERT column order when available.
+		// Otherwise fall back to schema order for simple legacy statements.
+		if (insertColumns && insertColumns.length > 0) {
+			insertColumns.forEach((columnName, index) => {
+				if (index < bindings.length) {
+					record[columnName] = bindings[index];
+				}
+			});
+		} else if (schema) {
+			let bindingIdx = 0;
+			for (const [colName] of schema) {
+				if (bindingIdx < bindings.length) {
+					record[colName] = bindings[bindingIdx];
+					bindingIdx++;
+				}
+			}
+		} else {
+			for (let i = 0; i < bindings.length; i++) {
+				if (i === 0) {
+					record.id = bindings[i];
+				} else {
+					record[`column_${i}`] = bindings[i];
+				}
+			}
+		}
 
-		if (!primaryKeyValue) {
+		const primaryKeyColumn = primaryKeyInfo?.name ?? 'id';
+		let primaryKeyValue = record[primaryKeyColumn];
+
+		if ((primaryKeyValue === undefined || primaryKeyValue === null || primaryKeyValue === '') && autoIncrementInfo) {
+			const nextValue = (this.autoIncrementCounters.get(tableName) ?? 0) + 1;
+			this.autoIncrementCounters.set(tableName, nextValue);
+			record[autoIncrementInfo.name] = nextValue;
+			if (primaryKeyColumn !== autoIncrementInfo.name) {
+				record[primaryKeyColumn] = nextValue;
+			}
+			primaryKeyValue = nextValue;
+		}
+
+		if (primaryKeyValue === undefined || primaryKeyValue === null || primaryKeyValue === '') {
 			return {
 				success: false,
 				results: [],
@@ -362,27 +547,10 @@ export class InMemorySQLDatabase implements SQLDatabase {
 			};
 		}
 
-		// Build record from bindings
-		// Assume column order matches binding order
-		const record: Record<string, any> = {};
-
-		// Try to get column names from schema
-		if (schema) {
-			let bindingIdx = 0;
-			for (const [colName, colInfo] of schema) {
-				if (bindingIdx < bindings.length) {
-					record[colName] = bindings[bindingIdx];
-					bindingIdx++;
-				}
-			}
-		} else {
-			// Fallback: generic column naming
-			for (let i = 0; i < bindings.length; i++) {
-				if (i === 0) {
-					record['id'] = bindings[i];
-				} else {
-					record[`column_${i}`] = bindings[i];
-				}
+		if (autoIncrementInfo) {
+			const numericPrimaryKey = typeof primaryKeyValue === 'number' ? primaryKeyValue : Number(primaryKeyValue);
+			if (Number.isFinite(numericPrimaryKey)) {
+				this.autoIncrementCounters.set(tableName, Math.max(this.autoIncrementCounters.get(tableName) ?? 0, numericPrimaryKey));
 			}
 		}
 
@@ -426,9 +594,8 @@ export class InMemorySQLDatabase implements SQLDatabase {
 		}
 
 		const table = this.tables.get(tableName)!;
-
-		if (!SimpleQueryParser.hasIdWhereClause(sql)) {
-			// Generic update without WHERE id - skip
+		const whereClause = SimpleQueryParser.extractWhereClause(sql);
+		if (!whereClause || bindings.length === 0) {
 			return {
 				success: true,
 				results: [],
@@ -436,11 +603,12 @@ export class InMemorySQLDatabase implements SQLDatabase {
 			};
 		}
 
-		// Assume last binding is the id in WHERE clause
-		const primaryKeyValue = bindings[bindings.length - 1];
-		const record = table.get(String(primaryKeyValue));
+		const whereValue = bindings[bindings.length - 1];
+		const records = Array.from(table.entries()).filter(([, record]) =>
+			SimpleQueryParser.matchesWhereClause(record, whereClause, whereValue)
+		);
 
-		if (!record) {
+		if (records.length === 0) {
 			return {
 				success: true,
 				results: [],
@@ -448,19 +616,21 @@ export class InMemorySQLDatabase implements SQLDatabase {
 			};
 		}
 
-		// Apply updates to the record
-		// Assume bindings before the last one are the updated values in SET order
-		for (let i = 0; i < bindings.length - 1; i++) {
-			const colName = this.extractSetColumnName(sql, i);
-			if (colName) {
-				record[colName] = bindings[i];
+		// Apply updates to each matched record.
+		// Assume bindings before the last one are the updated values in SET order.
+		for (const [, record] of records) {
+			for (let i = 0; i < bindings.length - 1; i++) {
+				const colName = this.extractSetColumnName(sql, i);
+				if (colName) {
+					record[colName] = bindings[i];
+				}
 			}
 		}
 
 		return {
 			success: true,
 			results: [],
-			meta: { duration: Date.now() - startTime, changes: 1 }
+			meta: { duration: Date.now() - startTime, changes: records.length }
 		};
 	}
 
@@ -501,8 +671,9 @@ export class InMemorySQLDatabase implements SQLDatabase {
 
 		const table = this.tables.get(tableName)!;
 
-		if (!SimpleQueryParser.hasIdWhereClause(sql)) {
-			// DELETE without WHERE id - delete all
+		const whereClause = SimpleQueryParser.extractWhereClause(sql);
+		if (!whereClause) {
+			// DELETE without a WHERE clause - delete all
 			const size = table.size;
 			table.clear();
 			return {
@@ -512,17 +683,19 @@ export class InMemorySQLDatabase implements SQLDatabase {
 			};
 		}
 
-		const primaryKeyValue = bindings[0];
-		const hadRecord = table.has(String(primaryKeyValue));
+		const whereValue = bindings[0];
+		const matchingKeys = Array.from(table.entries())
+			.filter(([, record]) => SimpleQueryParser.matchesWhereClause(record, whereClause, whereValue))
+			.map(([key]) => key);
 
-		if (hadRecord) {
-			table.delete(String(primaryKeyValue));
+		for (const key of matchingKeys) {
+			table.delete(key);
 		}
 
 		return {
 			success: true,
 			results: [],
-			meta: { duration: Date.now() - startTime, changes: hadRecord ? 1 : 0 }
+			meta: { duration: Date.now() - startTime, changes: matchingKeys.length }
 		};
 	}
 
@@ -548,28 +721,47 @@ export class InMemorySQLDatabase implements SQLDatabase {
 		}
 
 		const table = this.tables.get(tableName)!;
+		let results = Array.from(table.values());
 
-		// Handle COUNT queries
+		const whereClause = SimpleQueryParser.extractWhereClause(sql);
+		if (whereClause && bindings.length > 0) {
+			results = results.filter((record) => SimpleQueryParser.matchesWhereClause(record, whereClause, bindings[0]));
+		}
+
+		const orderByClause = SimpleQueryParser.extractOrderByClause(sql);
+		if (orderByClause) {
+			results = [...results].sort((left, right) => {
+				const leftValue = left[orderByClause.column];
+				const rightValue = right[orderByClause.column];
+
+				if (leftValue === rightValue) {
+					return 0;
+				}
+
+				if (leftValue === undefined || leftValue === null) {
+					return orderByClause.direction === 'desc' ? 1 : -1;
+				}
+
+				if (rightValue === undefined || rightValue === null) {
+					return orderByClause.direction === 'desc' ? -1 : 1;
+				}
+
+				const comparison = String(leftValue).localeCompare(String(rightValue));
+				return orderByClause.direction === 'desc' ? -comparison : comparison;
+			});
+		}
+
+		// Handle COUNT queries after filters are applied.
 		if (sql.includes('COUNT(*)')) {
-			// Extract alias if present (e.g., "COUNT(*) as count")
 			const aliasMatch = sql.match(/COUNT\(\*\)\s+as\s+(\w+)/i);
 			const countKey = aliasMatch?.[1] ?? 'COUNT(*)';
 			const result: Record<string, number> = {};
-			result[countKey] = table.size;
+			result[countKey] = results.length;
 			return {
 				success: true,
 				results: [result],
 				meta: { duration: Date.now() - startTime }
 			};
-		}
-
-		let results = Array.from(table.values());
-
-		// Handle WHERE id = ? clause
-		if (SimpleQueryParser.hasIdWhereClause(sql) && bindings.length > 0) {
-			const primaryKeyValue = bindings[0];
-			const record = table.get(String(primaryKeyValue));
-			results = record ? [record] : [];
 		}
 
 		return {
@@ -620,7 +812,13 @@ export class InMemoryKVStorage implements KVStorage {
 	private store = new Map<string, string>();
 	private expirations = new Map<string, number>();
 
-	async get<T = unknown>(key: string, type: 'text' | 'json' = 'text'): Promise<T | string | null> {
+	private normalizeValue(value: unknown): string {
+		return typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
+	}
+
+	async get<T = unknown>(key: string, type: 'json'): Promise<T | null>;
+	async get(key: string, type?: 'text'): Promise<string | null>;
+	async get<T = unknown>(key: string, type: 'text' | 'json' = 'text'): Promise<any> {
 		// Check expiration
 		const expiration = this.expirations.get(key);
 		if (expiration && expiration < Date.now()) {
@@ -656,6 +854,42 @@ export class InMemoryKVStorage implements KVStorage {
 		} else {
 			this.expirations.delete(key);
 		}
+	}
+
+	async set(key: string, value: unknown, options?: { ttl?: number }): Promise<void> {
+		this.store.set(key, this.normalizeValue(value));
+
+		if (options?.ttl) {
+			this.expirations.set(key, Date.now() + options.ttl * 1000);
+		} else {
+			this.expirations.delete(key);
+		}
+	}
+
+	async del(key: string): Promise<void> {
+		await this.delete(key);
+	}
+
+	async keys(prefix: string = ''): Promise<string[]> {
+		const listed = await this.list({ prefix });
+		return listed.keys.map((key) => key.name);
+	}
+
+	async getItem<T = unknown>(key: string): Promise<T | null> {
+		const value = await this.get(key, 'text');
+		return (value as T | null) ?? null;
+	}
+
+	async setItem(key: string, value: unknown): Promise<void> {
+		await this.set(key, value);
+	}
+
+	async removeItem(key: string): Promise<void> {
+		await this.delete(key);
+	}
+
+	async getKeys(prefix: string = ''): Promise<string[]> {
+		return await this.keys(prefix);
 	}
 
 	async delete(key: string): Promise<void> {
@@ -727,7 +961,7 @@ export class InMemoryKVStorage implements KVStorage {
  * });
  * ```
  */
-export function createInMemorySQLProvider(): SQLDatabase {
+export function createInMemorySQLProvider(): InMemorySQLDatabase {
 	return new InMemorySQLDatabase();
 }
 
@@ -747,6 +981,6 @@ export function createInMemorySQLProvider(): SQLDatabase {
  * });
  * ```
  */
-export function createInMemoryKVProvider(): KVStorage {
+export function createInMemoryKVProvider(): InMemoryKVStorage {
 	return new InMemoryKVStorage();
 }

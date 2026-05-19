@@ -1,11 +1,14 @@
+import { sql as drizzleSql } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	allAllShards,
 	allShard,
 	clearMigrationCache,
 	clearShardMigrationCache,
+	createDrizzleSQLProvider,
 	createInMemoryKVProvider,
 	createInMemorySQLProvider,
+	createNuxtHubKVProvider,
 	first,
 	firstShard,
 	initialize,
@@ -315,5 +318,49 @@ describe('InMemory Providers - Integration Testing Patterns', () => {
 
 		const post = await first('post-1', 'SELECT title FROM posts WHERE id = ?', ['post-1']);
 		expect(post?.title).toBe('My Post');
+	});
+});
+
+describe('InMemory Providers - Adapter Interop', () => {
+	it('supports Drizzle ORM through the in-memory SQL provider', async () => {
+		const database = createInMemorySQLProvider();
+		const provider = createDrizzleSQLProvider(database, drizzleSql as any);
+
+		await provider.prepare('CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL)').run();
+
+		const created = await provider
+			.prepare('INSERT INTO tickets (title) VALUES (?) RETURNING id, title')
+			.bind('First Ticket')
+			.run<{ id: number; title: string }>();
+
+		expect(created.success).toBe(true);
+		expect(created.results[0]?.id).toBe(1);
+		expect(created.results[0]?.title).toBe('First Ticket');
+		expect(created.meta.last_row_id).toBe(1);
+
+		const ticket = await provider
+			.prepare('SELECT id, title FROM tickets WHERE title = ?')
+			.bind('First Ticket')
+			.first<{ id: number; title: string }>();
+
+		expect(ticket).toEqual({ id: 1, title: 'First Ticket' });
+	});
+
+	it('supports NuxtHub KV through the in-memory KV provider', async () => {
+		const storage = createInMemoryKVProvider();
+		const kv = createNuxtHubKVProvider(storage);
+
+		await storage.set('known_shards', ['db-east', 'db-west']);
+		expect(await storage.keys('known_')).toEqual(['known_shards']);
+
+		const knownShards = await kv.get<string[]>('known_shards', 'json');
+		expect(knownShards).toEqual(['db-east', 'db-west']);
+
+		await kv.put('shard:user:1', JSON.stringify({ shard: 'db-east' }));
+		const listed = await kv.list({ prefix: 'shard:user:' });
+		expect(listed.keys.map((key) => key.name)).toEqual(['shard:user:1']);
+
+		await kv.delete('shard:user:1');
+		expect(await storage.get('shard:user:1')).toBeNull();
 	});
 });
