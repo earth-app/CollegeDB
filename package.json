@@ -41,6 +41,7 @@
     "test:sandbox:mariadb+valkey": "bun scripts/sandbox/run.ts --db=mariadb --kv=valkey",
     "test:sandbox:sqlite+redis": "bun scripts/sandbox/run.ts --db=sqlite --kv=redis",
     "test:sandbox:sqlite+valkey": "bun scripts/sandbox/run.ts --db=sqlite --kv=valkey",
+    "test:memory": "bun sandbox/memory-example.ts",
     "prepare": "husky install"
   },
   "devDependencies": {

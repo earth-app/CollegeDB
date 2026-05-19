@@ -73,6 +73,8 @@ jobs:
         docker --version
         docker compose version
         docker info >/dev/null
+    - name: Run In-Memory Benchmarks
+      run: bun run test:memory
     - name: Run Sandbox Benchmarks
       run: bun run test:sandbox
     - name: Add Sandbox Report to Job Summary
