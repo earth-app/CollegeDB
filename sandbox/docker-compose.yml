@@ -14,7 +14,7 @@ services:
       retries: 20
 
   mysql:
-    image: mysql:8.4
+    image: mysql:9.7
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: collegedb
