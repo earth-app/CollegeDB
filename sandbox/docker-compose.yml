@@ -29,7 +29,7 @@ services:
       retries: 30
 
   mariadb:
-    image: mariadb:11
+    image: mariadb:12
     environment:
       MARIADB_ROOT_PASSWORD: root
       MARIADB_DATABASE: collegedb
