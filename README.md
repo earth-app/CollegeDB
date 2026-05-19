@@ -19,6 +19,7 @@ A TypeScript library for **true horizontal scaling** of SQLite-style databases p
 - [Provider Adapters](#provider-adapters)
 - [NuxtHub + Drizzle Recipes](#nuxthub--drizzle-recipes)
 - [Sandbox Benchmarks (Docker Compose)](#sandbox-benchmarks-docker-compose)
+- [In-Memory Providers for Testing & Development](#in-memory-providers-for-testing--development)
 - [Basic Usage](#basic-usage)
 - [Multi-Key Shard Mappings](#multi-key-shard-mappings)
 - [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
@@ -455,6 +456,264 @@ How to read benchmark rows:
 - `FAILED` means the scenario returned an error.
 - `N/A` means the scenario was intentionally skipped in that environment.
 - Use the detailed section for full `avg`, `p50`, `p95`, `min`, `max`, and sample count (`n`).
+
+## In-Memory Providers for Testing & Development
+
+CollegeDB includes lightweight, zero-dependency in-memory mock implementations of the `KVStorage` and `SQLDatabase` interfaces. These are ideal for:
+
+- **Unit testing** without external dependencies
+- **Integration testing** with multiple shard combinations
+- **Local development** and rapid iteration
+- **Sandboxed playtesting** of routing logic
+
+The in-memory providers work in Cloudflare Workers, Node.js, and Deno environments.
+
+### Quick Start with In-Memory Providers
+
+```typescript
+import { createInMemoryKVProvider, createInMemorySQLProvider, initialize, run, first } from '@earth-app/collegedb';
+
+// Create fresh in-memory providers for each test
+const config = {
+	kv: createInMemoryKVProvider(),
+	shards: {
+		'shard-1': createInMemorySQLProvider(),
+		'shard-2': createInMemorySQLProvider(),
+		'shard-3': createInMemorySQLProvider()
+	},
+	strategy: 'hash'
+};
+
+initialize(config);
+
+// Use as normal - all operations happen in-memory
+await run('user-1', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-1', 'Alice', 'alice@example.com']);
+
+const user = await first<{ id: string; name: string }>('user-1', 'SELECT id, name FROM users WHERE id = ?', ['user-1']);
+console.log(user); // { id: 'user-1', name: 'Alice' }
+```
+
+### Unit Testing Example
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createInMemoryKVProvider, createInMemorySQLProvider, initialize, resetConfig, run, first } from '@earth-app/collegedb';
+
+describe('User Shard Routing', () => {
+	beforeEach(() => {
+		// Fresh providers for each test
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: {
+				'shard-1': createInMemorySQLProvider(),
+				'shard-2': createInMemorySQLProvider(),
+				'shard-3': createInMemorySQLProvider()
+			},
+			strategy: 'hash'
+		});
+	});
+
+	afterEach(() => {
+		resetConfig();
+	});
+
+	it('should insert and retrieve a user', async () => {
+		await run('user-1', 'INSERT INTO users (id, name, email) VALUES (?, ?, ?)', ['user-1', 'Alice', 'alice@example.com']);
+
+		const user = await first<{ name: string }>('user-1', 'SELECT name FROM users WHERE id = ?', ['user-1']);
+
+		expect(user?.name).toBe('Alice');
+	});
+
+	it('should distribute users across shards', async () => {
+		// Insert multiple users
+		for (let i = 0; i < 9; i++) {
+			await run(`user-${i}`, 'INSERT INTO users (id, name) VALUES (?, ?)', [`user-${i}`, `User ${i}`]);
+		}
+
+		// Verify each can be retrieved
+		for (let i = 0; i < 9; i++) {
+			const user = await first(`user-${i}`, 'SELECT id FROM users WHERE id = ?', [`user-${i}`]);
+			expect(user).toBeDefined();
+		}
+	});
+
+	it('should handle updates correctly', async () => {
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Alice']);
+
+		await run('user-1', 'UPDATE users SET name = ? WHERE id = ?', ['Alice Updated', 'user-1']);
+
+		const user = await first<{ name: string }>('user-1', 'SELECT name FROM users WHERE id = ?', ['user-1']);
+
+		expect(user?.name).toBe('Alice Updated');
+	});
+});
+```
+
+### Integration Testing with Multiple Providers
+
+Test different combinations without Docker or external services:
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+	createInMemoryKVProvider,
+	createInMemorySQLProvider,
+	initialize,
+	resetConfig,
+	run,
+	first,
+	KVShardMapper
+} from '@earth-app/collegedb';
+
+describe('Multi-Provider Integration', () => {
+	it('should work with different KV/SQL combinations', async () => {
+		const combinations = [{ kvName: 'memory', sqlName: 'memory' }];
+
+		for (const combo of combinations) {
+			resetConfig();
+
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: {
+					'shard-1': createInMemorySQLProvider(),
+					'shard-2': createInMemorySQLProvider()
+				},
+				strategy: 'hash'
+			});
+
+			// Test basic operations
+			await run('key-1', 'INSERT INTO data (id, value) VALUES (?, ?)', ['key-1', 'test-value']);
+
+			const row = await first('key-1', 'SELECT value FROM data WHERE id = ?', ['key-1']);
+
+			expect(row?.value).toBe('test-value');
+		}
+	});
+
+	it('should support lookup key mapping', async () => {
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'shard-1': createInMemorySQLProvider() },
+			strategy: 'hash'
+		});
+
+		const mapper = new KVShardMapper(createInMemoryKVProvider());
+
+		// Add lookup keys
+		await mapper.addLookupKeys('user-123', ['email:alice@example.com', 'username:alice']);
+
+		// Retrieve via lookup key
+		const mapping = await mapper.getShardMapping('email:alice@example.com');
+		expect(mapping?.shard).toBeDefined();
+	});
+});
+```
+
+### Performance Testing with In-Memory Providers
+
+Run quick performance tests locally without external dependencies:
+
+```typescript
+import { createInMemoryKVProvider, createInMemorySQLProvider, initialize, run } from '@earth-app/collegedb';
+
+async function benchmarkInserts(iterations: number): Promise<number> {
+	initialize({
+		kv: createInMemoryKVProvider(),
+		shards: {
+			'shard-1': createInMemorySQLProvider(),
+			'shard-2': createInMemorySQLProvider(),
+			'shard-3': createInMemorySQLProvider()
+		},
+		strategy: 'hash'
+	});
+
+	const startTime = performance.now();
+
+	for (let i = 0; i < iterations; i++) {
+		const id = `perf-user-${i}`;
+		await run(id, 'INSERT INTO users (id, name) VALUES (?, ?)', [id, `User ${i}`]);
+	}
+
+	return performance.now() - startTime;
+}
+
+const duration = await benchmarkInserts(1000);
+console.log(`1000 inserts: ${duration.toFixed(2)}ms (${((1000 / duration) * 1000).toFixed(0)} ops/sec)`);
+```
+
+### Running the Memory Provider Sandbox
+
+CollegeDB includes a ready-made sandbox example demonstrating multiple scenarios:
+
+```bash
+bun run test:memory
+```
+
+This runs comprehensive benchmarks including:
+
+- Basic CRUD operations
+- Multi-shard data distribution
+- KV storage operations
+- Round-robin strategy testing
+- JOIN query performance
+
+### Supported Operations
+
+Both in-memory providers support the complete CollegeDB API:
+
+**SQLDatabase features:**
+
+- CREATE TABLE / DROP TABLE
+- INSERT / UPDATE / DELETE
+- SELECT with WHERE clauses
+- COUNT(\*) queries
+- JOIN queries
+- PRAGMA queries (basic support)
+
+**KVStorage features:**
+
+- `get()` / `put()` / `delete()`
+- `list()` with prefix filtering and cursor-based pagination
+- TTL/expiration support
+
+### Limitations
+
+The in-memory providers are intentionally simple to avoid dependencies:
+
+- **SQL Parser**: Basic pattern matching instead of full SQL parsing; works well for standard CollegeDB patterns but may not handle complex SQL edge cases
+- **Joins**: Supported at application level; cross-shard joins work via multiple routed queries
+- **Transactions**: Not supported; operations are atomic per-statement
+- **Indexes**: Created but not actually used for query optimization
+- **Schema**: Inferred from CREATE TABLE statements; dynamic column detection based on binding order
+
+For production use, migrate to appropriate providers (D1, Redis, PostgreSQL, etc.). For testing/development, these limitations are intentional to keep the implementation lightweight and zero-dependency.
+
+### Migrating from In-Memory to Production Providers
+
+When ready to migrate from testing to production:
+
+```typescript
+// Before (testing)
+import { createInMemoryKVProvider, createInMemorySQLProvider } from '@earth-app/collegedb';
+
+const config = {
+	kv: createInMemoryKVProvider(),
+	shards: { 'shard-1': createInMemorySQLProvider() }
+};
+
+// After (production)
+import { createRedisKVProvider, createPostgreSQLProvider } from '@earth-app/collegedb';
+
+const config = {
+	kv: createRedisKVProvider(redisClient),
+	shards: { 'shard-1': createPostgreSQLProvider(pgPool) }
+};
+
+// Rest of configuration stays the same!
+```
+
+The API remains identical - only the provider initialization changes.
 
 ## Basic Usage
 
