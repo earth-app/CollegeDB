@@ -93,6 +93,9 @@ export {
 	type SQLiteClientLike
 } from './providers';
 
+// Export in-memory mock providers for testing
+export { InMemoryKVStorage, InMemorySQLDatabase, createInMemoryKVProvider, createInMemorySQLProvider } from './providers-memory';
+
 // Export migration functions
 export {
 	autoDetectAndMigrate,
