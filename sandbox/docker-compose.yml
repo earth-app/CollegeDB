@@ -54,7 +54,7 @@ services:
       retries: 20
 
   valkey:
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:9-alpine
     ports:
       - '6380:6379'
     healthcheck:
