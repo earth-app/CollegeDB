@@ -84,6 +84,40 @@ const DEFAULT_MAPPING_CACHE_TTL_MS = 30_000;
 const DEFAULT_KNOWN_SHARDS_CACHE_TTL_MS = 10_000;
 
 /**
+ * Default concurrency for KV fanout reads/deletes used in maintenance methods
+ * (`getKeysForShard`, `getShardKeyCounts`, `clearAllMappings`). Keeps batched
+ * KV requests bounded so a single call cannot saturate the runtime's request
+ * limit on large keyspaces.
+ * @private
+ */
+const DEFAULT_KV_FANOUT_CONCURRENCY = 32;
+
+/**
+ * Runs async work with a bounded concurrency limit. Defined locally to avoid
+ * a cross-module import cycle with `migrations.ts`.
+ * @private
+ */
+async function runWithConcurrency<T>(items: T[], concurrency: number, work: (item: T) => Promise<void>): Promise<void> {
+	if (items.length === 0) {
+		return;
+	}
+
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
+	let cursor = 0;
+
+	const workers = new Array(workerCount).fill(null).map(async () => {
+		while (cursor < items.length) {
+			const index = cursor++;
+			const item = items[index];
+			if (item === undefined) continue;
+			await work(item);
+		}
+	});
+
+	await Promise.all(workers);
+}
+
+/**
  * The KVShardMapper class provides a persistent storage layer for mapping
  * primary keys to their assigned D1 database shards. It uses Cloudflare KV
  * for global, eventually consistent storage with low latency reads.
@@ -452,9 +486,9 @@ export class KVShardMapper {
 			};
 			await this.kv.put(multiKeyMappingKey, JSON.stringify(updatedMultiKeyMapping));
 
-			// Update all lookup entries. Keys are stored hashed when hashing is enabled.
-			const keysToUpdate =
-				multiKeyMapping.keys.length > 0 ? (this.hashKeys ? multiKeyMapping.keys : multiKeyMapping.keys) : [await this.hashKey(primaryKey)]; // Fallback for legacy empty key lists
+			// Update all lookup entries. Keys stored in the multi-key payload are
+			// already hashed when hashing is enabled.
+			const keysToUpdate = multiKeyMapping.keys.length > 0 ? multiKeyMapping.keys : [await this.hashKey(primaryKey)];
 
 			const lookupPromises = keysToUpdate.map(async (keyId) => {
 				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${keyId}`;
@@ -474,9 +508,14 @@ export class KVShardMapper {
 				updatedAt: timestamp
 			};
 
-			if (this.hashKeys) {
-				for (const keyId of keysToUpdate) {
+			// Refresh every cached sibling entry. When hashing is enabled the
+			// keys are already hashed; otherwise we hash them now so the cache
+			// keys line up with what `getShardMapping` writes.
+			for (const keyId of keysToUpdate) {
+				if (this.hashKeys) {
 					this.setCachedMapping(keyId, updatedMapping);
+				} else {
+					this.setCachedMapping(await this.hashKey(keyId), updatedMapping);
 				}
 			}
 
@@ -523,9 +562,10 @@ export class KVShardMapper {
 			// Delete multi-key mapping
 			await this.kv.delete(multiKeyMappingKey);
 
-			// Delete all lookup entries. Keys are stored hashed when hashing is enabled.
-			const keysToDelete =
-				multiKeyMapping.keys.length > 0 ? (this.hashKeys ? multiKeyMapping.keys : multiKeyMapping.keys) : [await this.hashKey(primaryKey)]; // Fallback for legacy empty key lists
+			// Delete all lookup entries. Keys stored in the multi-key payload are
+			// already hashed when hashing is enabled, so they can be used as-is
+			// for both the KV delete and the cache invalidation below.
+			const keysToDelete = multiKeyMapping.keys.length > 0 ? multiKeyMapping.keys : [await this.hashKey(primaryKey)];
 
 			const deletePromises = keysToDelete.map(async (keyId) => {
 				const lookupMappingKey = `${SHARD_MAPPING_PREFIX}${keyId}`;
@@ -534,9 +574,15 @@ export class KVShardMapper {
 
 			await Promise.all(deletePromises);
 
-			if (this.hashKeys) {
-				for (const keyId of keysToDelete) {
+			// Invalidate every cached entry that pointed at this mapping. When
+			// hashing is enabled the keys are already hashed (so we cache them
+			// directly); otherwise we still hash them on cache write so the
+			// invalidation matches the cache layout used by other paths.
+			for (const keyId of keysToDelete) {
+				if (this.hashKeys) {
 					this.setCachedMapping(keyId, null);
+				} else {
+					this.setCachedMapping(await this.hashKey(keyId), null);
 				}
 			}
 			this.setCachedMapping(hashedKey, null);
@@ -639,33 +685,41 @@ export class KVShardMapper {
 	 */
 	async getKeysForShard(shard: string): Promise<string[]> {
 		const keys: string[] = [];
+		const seen = new Set<string>();
 
-		// Scan single-key mappings
-		const singleKeyList = await this.kv.list({ prefix: SHARD_MAPPING_PREFIX });
-		for (const kvKey of singleKeyList.keys) {
-			const mapping = await this.kv.get<ShardMapping>(kvKey.name, 'json');
-			if (mapping?.shard === shard) {
-				const originalKey = kvKey.name.replace(SHARD_MAPPING_PREFIX, '');
-				// If hashing is enabled, we can't recover the original key
-				if (mapping.originalKey) {
-					keys.push(mapping.originalKey);
-				} else if (!this.hashKeys) {
-					keys.push(originalKey);
-				}
+		const pushKey = (key: string) => {
+			if (!seen.has(key)) {
+				seen.add(key);
+				keys.push(key);
 			}
-		}
+		};
 
-		// Scan multi-key mappings
+		// Bounded fanout over single-key mappings. Reading values one at a time
+		// is fine for small KV namespaces but becomes a hot loop once there are
+		// thousands of keys; concurrent reads keep this within Workers' KV
+		// request budget while still finishing in O(n / concurrency) wall time.
+		const singleKeyList = await this.kv.list({ prefix: SHARD_MAPPING_PREFIX });
+		await runWithConcurrency(singleKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
+			const mapping = await this.kv.get<ShardMapping>(kvKey.name, 'json');
+			if (mapping?.shard !== shard) return;
+			if (mapping.originalKey) {
+				pushKey(mapping.originalKey);
+			} else if (!this.hashKeys) {
+				pushKey(kvKey.name.replace(SHARD_MAPPING_PREFIX, ''));
+			}
+		});
+
 		const multiKeyList = await this.kv.list({ prefix: MULTI_KEY_MAPPING_PREFIX });
-		for (const kvKey of multiKeyList.keys) {
+		await runWithConcurrency(multiKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
 			const mapping = await this.kv.get<MultiKeyShardMapping>(kvKey.name, 'json');
 			if (mapping?.shard === shard) {
-				// Add all keys from this multi-key mapping
-				keys.push(...mapping.keys);
+				for (const key of mapping.keys) {
+					pushKey(key);
+				}
 			}
-		}
+		});
 
-		return [...new Set(keys)]; // Remove duplicates
+		return keys;
 	}
 
 	/**
@@ -694,24 +748,22 @@ export class KVShardMapper {
 	async getShardKeyCounts(): Promise<Record<string, number>> {
 		const counts: Record<string, number> = {};
 
-		// Count single-key mappings
 		const singleKeyList = await this.kv.list({ prefix: SHARD_MAPPING_PREFIX });
-		for (const kvKey of singleKeyList.keys) {
+		await runWithConcurrency(singleKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
 			const mapping = await this.kv.get<ShardMapping>(kvKey.name, 'json');
 			if (mapping) {
 				counts[mapping.shard] = (counts[mapping.shard] || 0) + 1;
 			}
-		}
+		});
 
-		// Count multi-key mappings
 		const multiKeyList = await this.kv.list({ prefix: MULTI_KEY_MAPPING_PREFIX });
-		for (const kvKey of multiKeyList.keys) {
+		await runWithConcurrency(multiKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
 			const mapping = await this.kv.get<MultiKeyShardMapping>(kvKey.name, 'json');
 			if (mapping) {
 				// Each multi-key mapping represents multiple keys, so count them all
 				counts[mapping.shard] = (counts[mapping.shard] || 0) + mapping.keys.length;
 			}
-		}
+		});
 
 		return counts;
 	}
@@ -737,16 +789,28 @@ export class KVShardMapper {
 	 * ```
 	 */
 	async clearAllMappings(): Promise<void> {
-		// Clear single-key mappings
-		const singleKeyList = await this.kv.list({ prefix: SHARD_MAPPING_PREFIX });
-		const singleKeyPromises = singleKeyList.keys.map((key) => this.kv.delete(key.name));
+		// Issuing every delete in a single `Promise.all` floods the runtime when
+		// there are thousands of mappings. Stage the deletes through the bounded
+		// fanout helper so each batch stays well under the Workers KV request
+		// limit and the operation cannot be cancelled mid-flight by the runtime.
+		const [singleKeyList, multiKeyList] = await Promise.all([
+			this.kv.list({ prefix: SHARD_MAPPING_PREFIX }),
+			this.kv.list({ prefix: MULTI_KEY_MAPPING_PREFIX })
+		]);
 
-		// Clear multi-key mappings
-		const multiKeyList = await this.kv.list({ prefix: MULTI_KEY_MAPPING_PREFIX });
-		const multiKeyPromises = multiKeyList.keys.map((key) => this.kv.delete(key.name));
+		await Promise.all([
+			runWithConcurrency(singleKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
+				await this.kv.delete(kvKey.name);
+			}),
+			runWithConcurrency(multiKeyList.keys, DEFAULT_KV_FANOUT_CONCURRENCY, async (kvKey) => {
+				await this.kv.delete(kvKey.name);
+			})
+		]);
 
-		await Promise.all([...singleKeyPromises, ...multiKeyPromises]);
 		this.mappingCache.clear();
+		this.hashCache.clear();
+		this.knownShardsCache.shards = null;
+		this.knownShardsCache.expiresAt = 0;
 	}
 
 	/**
