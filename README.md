@@ -689,6 +689,117 @@ The in-memory providers are intentionally simple to avoid dependencies:
 
 For production use, migrate to appropriate providers (D1, Redis, PostgreSQL, etc.). For testing/development, these limitations are intentional to keep the implementation lightweight and zero-dependency.
 
+### Advanced In-Memory Example: `run`, `all`, `insert`, and Aggregates
+
+The in-memory SQL emulator supports a useful subset of SQLite syntax — enough to drive routing tests for real-world ORM-style code. The example below exercises the full routing stack (`run`, `all`, `first`, `insert`, `insertShard`, `runShard`, `countAllShards`, `allAllShardsGlobal`) entirely in-process without spinning up a database container.
+
+```typescript
+import {
+	allAllShardsGlobal,
+	countAllShards,
+	createInMemoryKVProvider,
+	createInMemorySQLProvider,
+	first,
+	initialize,
+	insert,
+	insertShard,
+	resetConfig,
+	run,
+	runShard
+} from '@earth-app/collegedb';
+
+resetConfig();
+
+initialize({
+	kv: createInMemoryKVProvider(),
+	shards: {
+		'db-east': createInMemorySQLProvider(),
+		'db-west': createInMemorySQLProvider(),
+		'db-central': createInMemorySQLProvider()
+	},
+	strategy: 'hash',
+	hashShardMappings: false,
+	disableAutoMigration: true
+});
+
+// 1. Schema setup: replicate the same DDL on every shard.
+for (const shard of ['db-east', 'db-west', 'db-central']) {
+	await runShard(
+		shard,
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT UNIQUE,
+			created_at INTEGER
+		)`
+	);
+	await runShard(
+		shard,
+		`CREATE TABLE IF NOT EXISTS tickets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			created_at INTEGER
+		)`
+	);
+}
+
+// 2. Routed inserts: CollegeDB picks the shard from a stable hash of the
+//    primary key, then records the mapping in KV.
+await run('user-1', 'INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)', [
+	'user-1',
+	'Alice',
+	'alice@example.com',
+	Date.now()
+]);
+
+// 3. AUTOINCREMENT inserts: `insert()` allocates the shard and captures the
+//    generated id, storing it as a mapping so routed reads find the row.
+const ticketA = await insert('INSERT INTO tickets (user_id, subject, created_at) VALUES (?, ?, ?)', [
+	'user-1',
+	'Cannot log in',
+	Date.now()
+]);
+
+// 4. Pinned inserts: `insertShard()` writes to a specific shard, still
+//    capturing the generated id mapping.
+const ticketB = await insertShard('db-west', 'INSERT INTO tickets (user_id, subject, created_at) VALUES (?, ?, ?) RETURNING id', [
+	'user-1',
+	'Mobile sync is slow',
+	Date.now()
+]);
+
+// 5. Routed reads: `first` and `all` resolve the shard from the mapping.
+const user = await first<{ id: string; name: string; email: string }>('user-1', 'SELECT id, name, email FROM users WHERE id = ?', [
+	'user-1'
+]);
+
+const ticket = await first<{ id: number; subject: string }>(String(ticketA.generatedId), 'SELECT id, subject FROM tickets WHERE id = ?', [
+	ticketA.generatedId
+]);
+
+// 6. Cross-shard aggregates: the emulator evaluates COUNT/MAX/MIN/SUM/AVG and
+//    COALESCE during SELECT, so utility queries like `SELECT COALESCE(MAX(id),
+//    0) + 1 AS next FROM tickets` work the same way they do in production.
+const totals = await countAllShards('tickets');
+
+const recentTickets = await allAllShardsGlobal<{ id: number; subject: string; created_at: number }>(
+	'SELECT id, subject, created_at FROM tickets WHERE user_id = ?',
+	['user-1'],
+	{ sortBy: 'created_at', sortDirection: 'desc', limit: 10 }
+);
+
+console.log({ user, ticket, ticketB: ticketB.generatedId, totals, recent: recentTickets.results });
+```
+
+What this example demonstrates:
+
+- **Routing through `run`, `first`, `all`, and `insert` works end-to-end** without a real database. The hash strategy assigns each new primary key to a shard the same way it would in production.
+- **Auto-increment + RETURNING** are honored. `insert()` captures the generated id from either provider metadata or `RETURNING id` rows.
+- **Aggregate SQL is evaluated** (`COUNT(*)`, `MIN`, `MAX`, `SUM`, `AVG`, `COALESCE`, simple arithmetic), and **compound `WHERE`** with `AND` / `OR` / parens / `LIKE` / `IS NULL` is honored on UPDATE, DELETE, and SELECT.
+- **Cross-shard fanout helpers** (`countAllShards`, `allAllShardsGlobal`) operate over the in-memory store exactly as they would over D1/Postgres/MySQL.
+- **No data leaks between tests**: call `resetConfig()` (and instantiate fresh providers) to start each test with a clean state.
+
 ### Migrating from In-Memory to Production Providers
 
 When ready to migrate from testing to production:
