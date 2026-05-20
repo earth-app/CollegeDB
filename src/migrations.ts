@@ -307,30 +307,41 @@ export async function listTables(d1: SQLDatabase): Promise<string[]> {
  * ```
  */
 export async function migrateRecord(source: SQLDatabase, target: SQLDatabase, primaryKey: string, tableName: string): Promise<void> {
+	// Validate the table name to avoid injection through callers that may pass
+	// untrusted strings. Identifier rules match SQLite's unquoted identifier
+	// grammar (alphanumeric + underscore, no leading digit).
+	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {
+		throw new CollegeDBError(`Invalid table name for migration: ${tableName}`, 'INVALID_TABLE_NAME');
+	}
+
 	const sourceRecord = await source.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).bind(primaryKey).first();
 
 	if (!sourceRecord) {
 		throw new CollegeDBError(`Record with primary key ${primaryKey} not found in source database`, 'RECORD_NOT_FOUND');
 	}
 
-	// Create schema if it doesn't exist in target
-	if (!(await schemaExists(target, tableName))) {
-		await createSchema(target, tableName);
+	// Previous versions called `createSchema(target, tableName)` here, passing
+	// the bare table name as a SQL string. That branch silently failed because
+	// `<tableName>` is not valid SQL, leaving target shards without the table
+	// they were supposed to receive. Schema preparation now belongs to the
+	// caller — if the table is missing on the target the INSERT below will
+	// surface the real SQL error from the underlying engine.
+
+	// Build the INSERT statement using the discovered column ordering.
+	const columns = Object.keys(sourceRecord);
+	if (columns.length === 0) {
+		throw new CollegeDBError(`Source record for ${primaryKey} has no columns`, 'EMPTY_SOURCE_RECORD');
 	}
 
-	// Get column names
-	const columns = Object.keys(sourceRecord);
 	const placeholders = columns.map(() => '?').join(', ');
 	const values = columns.map((col) => sourceRecord[col as keyof typeof sourceRecord]);
 
-	// Insert into target database
 	const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
 	await target
 		.prepare(insertSQL)
 		.bind(...values)
 		.run();
 
-	// Delete from source database
 	await source.prepare(`DELETE FROM ${tableName} WHERE id = ?`).bind(primaryKey).run();
 }
 
