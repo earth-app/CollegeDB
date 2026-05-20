@@ -4,6 +4,8 @@ import {
 	allByLookupKey,
 	count,
 	countAllShards,
+	createInMemoryKVProvider,
+	createInMemorySQLProvider,
 	explain,
 	first,
 	firstAllShardsGlobal,
@@ -236,7 +238,7 @@ class GeneratedIdMockDatabase {
 	}
 }
 
-describe('router helper APIs', () => {
+describe('Router Helper APIs', () => {
 	let kv: MockKVNamespace;
 	let east: MockDatabase;
 	let west: MockDatabase;
@@ -505,5 +507,45 @@ describe('router helper APIs', () => {
 
 		const total = await getTotalDatabaseSize();
 		expect(total).toBe(30720);
+	});
+
+	it('allByLookupKey returns mapped-shard rows when present', async () => {
+		const kv = createInMemoryKVProvider();
+		const a = createInMemorySQLProvider();
+		const b = createInMemorySQLProvider();
+		await a.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, email TEXT)').run();
+		await b.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, email TEXT)').run();
+		await a.prepare('INSERT INTO u (id, email) VALUES (?, ?)').bind('1', 'mapped@x').run();
+
+		initialize({
+			kv,
+			shards: { a, b },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+		await mapper.setShardMapping('email:mapped@x', 'a');
+
+		const rows = await allByLookupKey<{ id: string }>('email:mapped@x', 'SELECT id FROM u WHERE email = ?', ['mapped@x']);
+		expect(rows.results).toEqual([{ id: '1' }]);
+	});
+
+	it('firstByLookupKey returns null when fanout also finds nothing', async () => {
+		const kv = createInMemoryKVProvider();
+		const a = createInMemorySQLProvider();
+		await a.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, email TEXT)').run();
+
+		initialize({
+			kv,
+			shards: { a },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		const row = await firstByLookupKey('email:missing@x', 'SELECT id FROM u WHERE email = ?', ['missing@x']);
+		expect(row).toBeNull();
 	});
 });

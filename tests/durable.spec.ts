@@ -5,7 +5,7 @@ import { ShardCoordinator } from '../src/durable';
  * Mock Durable Object Storage for testing
  */
 class MockDurableObjectStorage {
-	private data = new Map<string, any>();
+	data = new Map<string, any>();
 
 	async get<T = unknown>(key: string): Promise<T | undefined> {
 		return this.data.get(key);
@@ -45,6 +45,10 @@ class MockDurableObjectState {
 	constructor() {
 		this.storage = new MockDurableObjectStorage();
 	}
+}
+
+async function asJson<T>(response: Response): Promise<T> {
+	return JSON.parse(await response.text()) as T;
 }
 
 describe('ShardCoordinator', () => {
@@ -215,6 +219,190 @@ describe('ShardCoordinator', () => {
 
 			const updatedShard = stats.find((s) => s.binding === 'db-count-test');
 			expect(updatedShard?.count).toBe(1);
+		});
+	});
+
+	describe('Advanced usage', () => {
+		it('rejects invalid add/remove/update requests with 400 responses', async () => {
+			const addRes = await coordinator.fetch(
+				new Request('http://coordinator/shards', {
+					method: 'POST',
+					body: JSON.stringify({})
+				}) as any
+			);
+			expect(addRes.status).toBe(400);
+
+			const removeRes = await coordinator.fetch(
+				new Request('http://coordinator/shards', {
+					method: 'DELETE',
+					body: JSON.stringify({})
+				}) as any
+			);
+			expect(removeRes.status).toBe(400);
+
+			const statsRes = await coordinator.fetch(
+				new Request('http://coordinator/stats', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'a' })
+				}) as any
+			);
+			expect(statsRes.status).toBe(400);
+		});
+
+		it('add -> stats -> allocate (round-robin) -> remove flow', async () => {
+			const add = async (shard: string) =>
+				coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard }) }) as any);
+
+			await add('db-a');
+			await add('db-b');
+			await add('db-c');
+
+			const listed = await asJson<string[]>(await coordinator.fetch(new Request('http://coordinator/shards') as any));
+			expect(listed.sort()).toEqual(['db-a', 'db-b', 'db-c']);
+
+			// round-robin allocate three times and ensure each shard is touched
+			const firstAlloc = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'k1' })
+					}) as any
+				)
+			);
+			expect(['db-a', 'db-b', 'db-c']).toContain(firstAlloc.shard);
+
+			const updateStats = await coordinator.fetch(
+				new Request('http://coordinator/stats', {
+					method: 'POST',
+					body: JSON.stringify({ shard: 'db-a', count: 100 })
+				}) as any
+			);
+			expect((await asJson<{ success: boolean }>(updateStats)).success).toBe(true);
+
+			const stats = await asJson<Array<{ binding: string; count: number }>>(
+				await coordinator.fetch(new Request('http://coordinator/stats') as any)
+			);
+			expect(stats.find((s) => s.binding === 'db-a')?.count).toBe(100);
+
+			const remove = await coordinator.fetch(
+				new Request('http://coordinator/shards', {
+					method: 'DELETE',
+					body: JSON.stringify({ shard: 'db-b' })
+				}) as any
+			);
+			expect((await asJson<{ success: boolean }>(remove)).success).toBe(true);
+
+			const updatedList = await asJson<string[]>(await coordinator.fetch(new Request('http://coordinator/shards') as any));
+			expect(updatedList.sort()).toEqual(['db-a', 'db-c']);
+		});
+
+		it('allocates with hash strategy override on the request body', async () => {
+			await coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard: 'east' }) }) as any);
+			await coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard: 'west' }) }) as any);
+
+			const first = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'consistent-key', strategy: 'hash' })
+					}) as any
+				)
+			);
+			const second = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'consistent-key', strategy: 'hash' })
+					}) as any
+				)
+			);
+			expect(first.shard).toBe(second.shard);
+		});
+
+		it('allocates with random strategy', async () => {
+			await coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard: 'a' }) }) as any);
+			await coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard: 'b' }) }) as any);
+
+			const result = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'rand-key', strategy: 'random' })
+					}) as any
+				)
+			);
+			expect(['a', 'b']).toContain(result.shard);
+		});
+
+		it('falls back to hash when location strategy has no shardLocations', async () => {
+			// Seed the storage that the coordinator was already constructed with —
+			// instantiating a fresh `MockDurableObjectStorage` here would not be
+			// wired up to `coordinator`.
+			await mockState.storage.put('coordinator_state', {
+				knownShards: ['a', 'b'],
+				shardStats: { a: { binding: 'a', count: 0 }, b: { binding: 'b', count: 0 } },
+				strategy: { read: 'location', write: 'location' },
+				roundRobinIndex: 0,
+				targetRegion: 'wnam'
+			});
+
+			const result = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'loc-key' })
+					}) as any
+				)
+			);
+			expect(['a', 'b']).toContain(result.shard);
+		});
+
+		it('uses provided shardLocations + priorities for location allocation', async () => {
+			await mockState.storage.put('coordinator_state', {
+				knownShards: ['east', 'west'],
+				shardStats: { east: { binding: 'east', count: 0 }, west: { binding: 'west', count: 0 } },
+				strategy: 'location',
+				roundRobinIndex: 0,
+				targetRegion: 'wnam',
+				shardLocations: {
+					east: { region: 'enam', priority: 1 },
+					west: { region: 'wnam', priority: 2 }
+				}
+			});
+
+			const result = await asJson<{ shard: string }>(
+				await coordinator.fetch(
+					new Request('http://coordinator/allocate', {
+						method: 'POST',
+						body: JSON.stringify({ primaryKey: 'west-side', strategy: 'location', availableShards: ['east', 'west'] })
+					}) as any
+				)
+			);
+			expect(result.shard).toBe('west');
+		});
+
+		it('selectShard returns 400 when no shards are configured', async () => {
+			const result = await coordinator.fetch(
+				new Request('http://coordinator/allocate', {
+					method: 'POST',
+					body: JSON.stringify({ primaryKey: 'no-shards' })
+				}) as any
+			);
+			expect(result.status).toBe(400);
+		});
+
+		it('flush wipes state', async () => {
+			// Use the coordinator's own storage so the flush endpoint actually
+			// observes the writes that happened above.
+			await coordinator.fetch(new Request('http://coordinator/shards', { method: 'POST', body: JSON.stringify({ shard: 'a' }) }) as any);
+			expect(mockState.storage.data.size).toBeGreaterThan(0);
+			await coordinator.fetch(new Request('http://coordinator/flush', { method: 'POST' }) as any);
+			expect(mockState.storage.data.size).toBe(0);
+		});
+
+		it('responds with 404 for unknown endpoints and 200 for health', async () => {
+			expect((await coordinator.fetch(new Request('http://coordinator/health') as any)).status).toBe(200);
+			expect((await coordinator.fetch(new Request('http://coordinator/nope') as any)).status).toBe(404);
 		});
 	});
 });

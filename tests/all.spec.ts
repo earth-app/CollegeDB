@@ -2,6 +2,8 @@ import type { Request } from '@cloudflare/workers-types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	all,
+	allAllShards,
+	allByLookupKey,
 	allShard,
 	autoDetectAndMigrate,
 	checkMigrationNeeded,
@@ -9,21 +11,41 @@ import {
 	clearShardMigrationCache,
 	collegedb,
 	CollegeDBError,
+	createInMemoryKVProvider,
+	createInMemorySQLProvider,
 	first,
 	firstShard,
 	flush,
 	getClosestRegionFromIP,
+	getDatabaseSizeForKey,
+	getDatabaseSizeForShard,
+	getDatabaseSizesAllShards,
 	getShardStats,
+	getTotalDatabaseSize,
 	initialize,
+	initializeAsync,
+	insert,
 	integrateExistingDatabase,
 	KVShardMapper,
 	listKnownShards,
+	prepare,
 	reassignShard,
 	resetConfig,
 	run,
+	runAllShards,
 	runShard
 } from '../src/index';
-import { discoverExistingRecordsWithColumns } from '../src/migrations';
+import {
+	createMappingsForExistingKeys,
+	createSchemaAcrossShards,
+	discoverExistingPrimaryKeys,
+	discoverExistingRecordsWithColumns,
+	dropSchema,
+	listTables,
+	migrateRecord,
+	schemaExists,
+	validateTableForSharding
+} from '../src/migrations';
 import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy } from '../src/types';
 
 // Test schema for creating tables
@@ -1497,6 +1519,127 @@ describe('CollegeDB', () => {
 		});
 	});
 
+	describe('Migrations - integrateExistingDatabase + auto migration', () => {
+		it('integrates a database in dry-run mode and reports row counts without writing mappings', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT, username TEXT, name TEXT)').run();
+			for (let i = 0; i < 4; i++) {
+				await db
+					.prepare('INSERT INTO users (id, email, username, name) VALUES (?, ?, ?, ?)')
+					.bind(`u${i}`, `u${i}@x.io`, `user${i}`, `User ${i}`)
+					.run();
+			}
+
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+
+			const result = await integrateExistingDatabase(db, 'db-a', mapper, {
+				tables: ['users'],
+				dryRun: true,
+				migrateOtherColumns: true,
+				addShardMappingsTable: false
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.totalRecords).toBe(4);
+			expect(result.mappingsCreated).toBe(0);
+			expect(await mapper.getShardMapping('u0')).toBeNull();
+		});
+
+		it('integrates with multi-column lookup keys when requested', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT, username TEXT, name TEXT)').run();
+			await db.prepare('INSERT INTO users (id, email, username, name) VALUES (?, ?, ?, ?)').bind('u-1', 'a@x', 'a', 'A').run();
+
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+
+			const result = await integrateExistingDatabase(db, 'db-a', mapper, {
+				tables: ['users'],
+				migrateOtherColumns: true
+			});
+
+			expect(result.mappingsCreated).toBe(1);
+			expect((await mapper.getShardMapping('email:a@x'))?.shard).toBe('db-a');
+			expect((await mapper.getShardMapping('username:a'))?.shard).toBe('db-a');
+		});
+
+		it('autoDetectAndMigrate skips when no data tables are present', async () => {
+			const db = createInMemorySQLProvider();
+			const kv = createInMemoryKVProvider();
+			const result = await autoDetectAndMigrate(db, 'db-a', {
+				kv,
+				shards: { 'db-a': db },
+				hashShardMappings: false
+			});
+			expect(result.migrationNeeded).toBe(false);
+			expect(result.migrationPerformed).toBe(false);
+		});
+
+		it('checkMigrationNeeded returns false when shard_mappings table is present', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE users (id TEXT PRIMARY KEY)').run();
+			await db.prepare('CREATE TABLE shard_mappings (primary_key TEXT PRIMARY KEY, shard_name TEXT)').run();
+
+			const result = await checkMigrationNeeded(db, 'shard-with-mappings', {
+				kv: createInMemoryKVProvider(),
+				shards: { 'shard-with-mappings': db },
+				hashShardMappings: false
+			});
+			expect(result).toBe(false);
+		});
+
+		it('createSchemaAcrossShards applies the same schema everywhere', async () => {
+			const a = createInMemorySQLProvider();
+			const b = createInMemorySQLProvider();
+			await createSchemaAcrossShards({ a, b }, 'CREATE TABLE t (id TEXT PRIMARY KEY);');
+			expect(await schemaExists(a, 't')).toBe(true);
+			expect(await schemaExists(b, 't')).toBe(true);
+		});
+
+		it('listTables and dropSchema operate against the in-memory engine', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE one (id TEXT PRIMARY KEY)').run();
+			await db.prepare('CREATE TABLE two (id TEXT PRIMARY KEY)').run();
+			const initial = await listTables(db);
+			expect(initial.sort()).toEqual(['one', 'two']);
+
+			await dropSchema(db, 'one');
+			const after = await listTables(db);
+			expect(after).toEqual(['two']);
+		});
+
+		it('migrateRecord refuses suspicious table names', async () => {
+			const source = createInMemorySQLProvider();
+			const target = createInMemorySQLProvider();
+			await source.prepare('CREATE TABLE t (id TEXT PRIMARY KEY)').run();
+			await source.prepare('INSERT INTO t (id) VALUES (?)').bind('x').run();
+
+			await expect(migrateRecord(source, target, 'x', 't;DROP TABLE t')).rejects.toThrow('Invalid table name');
+		});
+
+		it('discoverExistingPrimaryKeys + validateTableForSharding flag empty tables', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+			const keys = await discoverExistingPrimaryKeys(db, 'u');
+			expect(keys).toEqual([]);
+
+			const validation = await validateTableForSharding(db, 'u', 'id');
+			expect(validation.issues).toEqual([expect.stringMatching(/empty/i)]);
+		});
+
+		it('createMappingsForExistingKeys distributes via hash strategy', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			const keys = Array.from({ length: 10 }, (_, i) => `key-${i}`);
+			await createMappingsForExistingKeys(keys, ['a', 'b'], 'hash', mapper);
+			for (const key of keys) {
+				const mapping = await mapper.getShardMapping(key);
+				expect(['a', 'b']).toContain(mapping?.shard);
+			}
+		});
+	});
+
 	describe('Location-based sharding', () => {
 		it('should allocate to closest region shard', async () => {
 			const config: CollegeDBConfig = {
@@ -2629,9 +2772,6 @@ describe('CollegeDB', () => {
 		});
 
 		it('should exclude shards that exceed maxDatabaseSize from allocation', async () => {
-			// Mock the database size function to return large sizes for db-east
-			const originalGetSize = (await import('../src/router')).getDatabaseSizeForShard;
-
 			// Initialize with a small size limit
 			initialize({
 				kv: mockKV as any,
@@ -2695,6 +2835,697 @@ describe('CollegeDB', () => {
 			const result = await first('unlimited-user', 'SELECT * FROM users WHERE id = ?', ['unlimited-user']);
 			expect(result).toBeTruthy();
 			expect((result as any).name).toBe('Unlimited User');
+		});
+	});
+
+	describe('SQL emulator', () => {
+		it('handles NOT LIKE, multiple AND clauses, and arithmetic comparisons', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT, score INTEGER)').run();
+			await db.prepare('INSERT INTO t (id, label, score) VALUES (?, ?, ?)').bind('a', 'apple', 5).run();
+			await db.prepare('INSERT INTO t (id, label, score) VALUES (?, ?, ?)').bind('b', 'banana', 10).run();
+			await db.prepare('INSERT INTO t (id, label, score) VALUES (?, ?, ?)').bind('c', 'cherry', 7).run();
+
+			const notLike = await db.prepare('SELECT id FROM t WHERE label NOT LIKE ?').bind('a%').all<{ id: string }>();
+			expect(notLike.results.map((r) => r.id).sort()).toEqual(['b', 'c']);
+
+			const tripleAnd = await db
+				.prepare('SELECT id FROM t WHERE score >= ? AND score <= ? AND label != ?')
+				.bind(5, 10, 'banana')
+				.all<{ id: string }>();
+			expect(tripleAnd.results.map((r) => r.id).sort()).toEqual(['a', 'c']);
+
+			const notEqual = await db.prepare('SELECT id FROM t WHERE score <> ?').bind(7).all<{ id: string }>();
+			expect(notEqual.results.map((r) => r.id).sort()).toEqual(['a', 'b']);
+		});
+
+		it('returns 0 results for SELECT against an unknown table', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('SELECT * FROM ghost').all();
+			expect(result.results).toEqual([]);
+			expect(result.success).toBe(true);
+		});
+
+		it('returns success with 0 changes for DELETE on unknown table', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('DELETE FROM ghost WHERE id = ?').bind('x').run();
+			expect(result.success).toBe(true);
+			expect(result.meta.changes).toBe(0);
+		});
+
+		it('reports failure for UPDATE on a missing table', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('UPDATE ghost SET a = ? WHERE id = ?').bind('1', 'x').run();
+			expect(result.success).toBe(false);
+			expect(result.error).toMatch(/not found/);
+		});
+
+		it('drops tables and returns success', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY)').run();
+			const result = await db.prepare('DROP TABLE t').run();
+			expect(result.success).toBe(true);
+
+			const second = await db.prepare('DROP TABLE IF EXISTS missing').run();
+			expect(second.success).toBe(true);
+		});
+
+		it('supports multi-row VALUES tuples in a single INSERT', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT)').run();
+			const result = await db.prepare("INSERT INTO t (id, label) VALUES (?, ?), (?, 'literal')").bind('a', 'first', 'b').run();
+			expect(result.meta.changes).toBe(2);
+
+			const rows = await db.prepare('SELECT id, label FROM t ORDER BY id ASC').all<{ id: string; label: string }>();
+			expect(rows.results).toEqual([
+				{ id: 'a', label: 'first' },
+				{ id: 'b', label: 'literal' }
+			]);
+		});
+
+		it('supports COALESCE, LOWER, UPPER, LENGTH, ABS scalar functions', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT, n INTEGER)').run();
+			await db.prepare('INSERT INTO t (id, label, n) VALUES (?, ?, ?)').bind('a', 'Hello', -5).run();
+			await db.prepare('INSERT INTO t (id, label, n) VALUES (?, ?, ?)').bind('b', null, 3).run();
+
+			const lowered = await db
+				.prepare('SELECT id, LOWER(label) AS lc, UPPER(label) AS uc, LENGTH(label) AS len, ABS(n) AS positive_n FROM t WHERE id = ?')
+				.bind('a')
+				.first<{ id: string; lc: string; uc: string; len: number; positive_n: number }>();
+			expect(lowered).toEqual({ id: 'a', lc: 'hello', uc: 'HELLO', len: 5, positive_n: 5 });
+
+			const coalesced = await db
+				.prepare("SELECT id, COALESCE(label, 'fallback') AS effective FROM t WHERE id = ?")
+				.bind('b')
+				.first<{ effective: string }>();
+			expect(coalesced?.effective).toBe('fallback');
+		});
+
+		it('selects star and column projection together', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, a TEXT, b INTEGER)').run();
+			await db.prepare('INSERT INTO t (id, a, b) VALUES (?, ?, ?)').bind('1', 'x', 2).run();
+			const row = await db.prepare('SELECT *, b * 10 AS scaled FROM t WHERE id = ?').bind('1').first<{
+				id: string;
+				a: string;
+				b: number;
+				scaled: number;
+			}>();
+			expect(row).toEqual({ id: '1', a: 'x', b: 2, scaled: 20 });
+		});
+
+		it('returns RETURNING rows for INSERT into auto-increment table without explicit id', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE auto (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)').run();
+			const result = await db.prepare('INSERT INTO auto (name) VALUES (?) RETURNING *').bind('A').all<{ id: number; name: string }>();
+			expect(result.results[0]?.id).toBe(1);
+			expect(result.results[0]?.name).toBe('A');
+		});
+
+		it('DELETE ... RETURNING surfaces removed rows', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT)').run();
+			await db.prepare('INSERT INTO t (id, label) VALUES (?, ?)').bind('a', 'first').run();
+
+			const result = await db.prepare('DELETE FROM t WHERE id = ? RETURNING id, label').bind('a').all<{ id: string; label: string }>();
+			expect(result.results[0]).toEqual({ id: 'a', label: 'first' });
+			expect(result.meta.changes).toBe(1);
+		});
+
+		it('UPDATE without WHERE applies to every row', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT)').run();
+			await db.prepare('INSERT INTO t (id, label) VALUES (?, ?)').bind('a', 'one').run();
+			await db.prepare('INSERT INTO t (id, label) VALUES (?, ?)').bind('b', 'two').run();
+
+			const result = await db.prepare('UPDATE t SET label = ?').bind('same').run();
+			expect(result.meta.changes).toBe(2);
+
+			const all = await db.prepare('SELECT id, label FROM t ORDER BY id').all<{ id: string; label: string }>();
+			expect(all.results.map((r) => r.label)).toEqual(['same', 'same']);
+		});
+
+		it('UPDATE supports col = col + 1 expression', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE counters (id TEXT PRIMARY KEY, n INTEGER)').run();
+			await db.prepare('INSERT INTO counters (id, n) VALUES (?, ?)').bind('a', 5).run();
+			await db.prepare('UPDATE counters SET n = n + 1 WHERE id = ?').bind('a').run();
+			const row = await db.prepare('SELECT n FROM counters WHERE id = ?').bind('a').first<{ n: number }>();
+			expect(row?.n).toBe(6);
+		});
+
+		it('handles missing WHERE binding gracefully', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY)').run();
+			await db.prepare('INSERT INTO t (id) VALUES (?)').bind('a').run();
+
+			// No binding supplied: the parameter cursor reads `undefined` and
+			// returns no matches, but no exception is thrown.
+			const result = await db.prepare('SELECT * FROM t WHERE id = ?').all();
+			expect(result.success).toBe(true);
+			expect(result.results).toEqual([]);
+		});
+
+		it('PRAGMA queries return empty results for unknown PRAGMA forms', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('PRAGMA cache_size').all();
+			expect(result.success).toBe(true);
+			expect(result.results).toEqual([]);
+		});
+
+		it('PRAGMA table_info returns empty when the table is unknown', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('PRAGMA table_info(missing)').all();
+			expect(result.success).toBe(true);
+			expect(result.results).toEqual([]);
+		});
+
+		it('INSERT without explicit columns falls back to schema order', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT)').run();
+			await db.prepare('INSERT INTO t VALUES (?, ?)').bind('a', 'hello').run();
+			const row = await db.prepare('SELECT id, label FROM t WHERE id = ?').bind('a').first<{ id: string; label: string }>();
+			expect(row).toEqual({ id: 'a', label: 'hello' });
+		});
+
+		it('INSERT with no schema synthesizes a rowid when no PK column maps', async () => {
+			const db = createInMemorySQLProvider();
+			const result = await db.prepare('INSERT INTO ghost (col1, col2) VALUES (?, ?)').bind('a', 'b').run();
+			expect(result.success).toBe(true);
+			expect(result.meta.changes).toBe(1);
+			expect(result.meta.last_row_id).toBeDefined();
+		});
+	});
+
+	describe('IP geolocation', () => {
+		const cases: Array<[string, string]> = [
+			['FR', 'weur'],
+			['PL', 'eeur'],
+			['JP', 'apac'],
+			['IN', 'apac'],
+			['AU', 'oc'],
+			['AE', 'me'],
+			['EG', 'af'],
+			['BR', 'enam'],
+			['KZ', 'eeur'],
+			['GT', 'enam']
+		];
+
+		for (const [country, expectedRegion] of cases) {
+			it(`returns ${expectedRegion} for country ${country}`, () => {
+				expect(getClosestRegionFromIP({ cf: { country } } as any)).toBe(expectedRegion);
+			});
+		}
+
+		it('uses continent code for African countries when country code does not match', () => {
+			expect(getClosestRegionFromIP({ cf: { country: 'XX', continent: 'AF' } } as any)).toBe('af');
+		});
+
+		it('falls back to enam for South American countries via continent code', () => {
+			expect(getClosestRegionFromIP({ cf: { country: 'XX', continent: 'SA' } } as any)).toBe('enam');
+		});
+
+		it('returns wnam for missing cf', () => {
+			expect(getClosestRegionFromIP({} as any)).toBe('wnam');
+		});
+		it('returns eeur for Russia', () => {
+			expect(getClosestRegionFromIP({ cf: { country: 'RU' } } as any)).toBe('eeur');
+		});
+		it('returns wnam for US California timezone', () => {
+			expect(
+				getClosestRegionFromIP({
+					cf: { country: 'US', region: 'CA', timezone: 'America/Los_Angeles' }
+				} as any)
+			).toBe('wnam');
+		});
+		it('falls through to wnam for unknown countries', () => {
+			expect(getClosestRegionFromIP({ cf: { country: 'XX' } } as any)).toBe('wnam');
+		});
+	});
+
+	describe('Router - Edge Cases', () => {
+		it('listKnownShards returns the configured list when no coordinator is set', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { a: createInMemorySQLProvider(), b: createInMemorySQLProvider() },
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+			const shards = await listKnownShards();
+			expect(shards.sort()).toEqual(['a', 'b']);
+		});
+
+		it('allByLookupKey runs against mapped shard but falls back to fanout when 0 results', async () => {
+			const kv = createInMemoryKVProvider();
+			const a = createInMemorySQLProvider();
+			const b = createInMemorySQLProvider();
+			await a.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, email TEXT)').run();
+			await b.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, email TEXT)').run();
+			await b.prepare('INSERT INTO t (id, email) VALUES (?, ?)').bind('1', 'b@x').run();
+
+			initialize({
+				kv,
+				shards: { a, b },
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			// Set a stale lookup pointing to `a`, but the row lives on `b`.
+			await mapper.setShardMapping('email:b@x', 'a');
+
+			const results = await allByLookupKey<{ id: string }>('email:b@x', 'SELECT id FROM t WHERE email = ?', ['b@x']);
+			expect(results.results).toEqual([{ id: '1' }]);
+		});
+
+		it('insert() throws when no shards are configured', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: {},
+				disableAutoMigration: true
+			});
+			await expect(insert('INSERT INTO t VALUES (?)', [1])).rejects.toThrow(/No shards/);
+		});
+
+		it('allShard reports the underlying error when a shard query fails', async () => {
+			const failingDb = {
+				prepare() {
+					return {
+						bind() {
+							return {
+								async all() {
+									return { success: false, results: [], meta: { duration: 0 }, error: 'forced' };
+								},
+								async first() {
+									return null;
+								},
+								async run() {
+									return { success: true, results: [], meta: { duration: 0 } };
+								}
+							};
+						},
+						async all() {
+							return { success: false, results: [], meta: { duration: 0 }, error: 'forced' };
+						}
+					};
+				}
+			};
+
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { a: failingDb as any },
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			const result = await allShard('a', 'SELECT * FROM t');
+			expect(result.success).toBe(false);
+			expect(result.error).toBe('forced');
+		});
+
+		it('migrates the underlying record and updates the mapping', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: {
+					'db-a': createInMemorySQLProvider(),
+					'db-b': createInMemorySQLProvider()
+				},
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			await runShard('db-a', 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)');
+			await runShard('db-b', 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)');
+
+			await run('alice', 'INSERT INTO users (id, name) VALUES (?, ?)', ['alice', 'Alice']);
+			// Use a transient mapper to read the current mapping. Because the global
+			// mapper has its own cache, we instantiate fresh mappers for assertions
+			// so the test never reads stale cached values.
+			const beforeMapper = new KVShardMapper(kv, { hashShardMappings: false });
+			const before = await beforeMapper.getShardMapping('alice');
+			const otherShard = before?.shard === 'db-a' ? 'db-b' : 'db-a';
+
+			await reassignShard('alice', otherShard, 'users');
+
+			const afterMapper = new KVShardMapper(kv, { hashShardMappings: false });
+			const after = await afterMapper.getShardMapping('alice');
+			expect(after?.shard).toBe(otherShard);
+
+			const row = await firstShard(otherShard, 'SELECT id FROM users WHERE id = ?', ['alice']);
+			expect(row).toEqual({ id: 'alice' });
+		});
+
+		it('rejects reassigning to the same shard with no migration', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: { 'db-a': createInMemorySQLProvider() },
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			await runShard('db-a', 'CREATE TABLE users (id TEXT PRIMARY KEY)');
+			await run('a', 'INSERT INTO users (id) VALUES (?)', ['a']);
+			await reassignShard('a', 'db-a', 'users');
+
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			expect((await mapper.getShardMapping('a'))?.shard).toBe('db-a');
+		});
+
+		it('excludes shards over maxDatabaseSize but never strands all shards', async () => {
+			const small = createInMemorySQLProvider();
+			const large = createInMemorySQLProvider();
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { small, large },
+				strategy: 'round-robin',
+				disableAutoMigration: true,
+				maxDatabaseSize: 8,
+				sizeCacheTtlMs: 0,
+				hashShardMappings: false
+			});
+
+			await runShard('small', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await runShard('large', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+
+			// Bloat the "large" shard so its page_count grows.
+			for (let i = 0; i < 5; i++) {
+				await runShard('large', 'INSERT INTO u (id) VALUES (?)', [`l${i}`]);
+			}
+
+			// Even after filtering, allocation must succeed.
+			await run('new-id', 'INSERT INTO u (id) VALUES (?)', ['new-id']);
+
+			const sizes = await getDatabaseSizesAllShards();
+			expect(sizes.every((s) => typeof s.size === 'number')).toBe(true);
+			expect(await getTotalDatabaseSize()).toBeGreaterThan(0);
+		});
+
+		it('listKnownShards merges configured shards with KV-registered ones', async () => {
+			const kv = createInMemoryKVProvider();
+			// Pre-register an extra shard via the mapper so the union path runs.
+			await new KVShardMapper(kv, { hashShardMappings: false }).setKnownShards(['db-a', 'extra-shard']);
+
+			initialize({
+				kv,
+				shards: { 'db-a': createInMemorySQLProvider() },
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			const shards = await listKnownShards();
+			expect(shards.sort()).toContain('extra-shard');
+			expect(shards).toContain('db-a');
+		});
+
+		it('flush clears KV mappings and the in-memory caches', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: { 'db-a': createInMemorySQLProvider() },
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			await runShard('db-a', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await run('row', 'INSERT INTO u (id) VALUES (?)', ['row']);
+
+			expect(kv.size()).toBeGreaterThan(0);
+			await flush();
+			// `known_shards` may still be present, but the per-key mappings should
+			// have been removed.
+			const keys = await kv.keys('shard:');
+			expect(keys).toHaveLength(0);
+		});
+
+		it('getShardStats falls back to KV counts when no coordinator is configured', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: {
+					'db-a': createInMemorySQLProvider(),
+					'db-b': createInMemorySQLProvider()
+				},
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			await runShard('db-a', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await runShard('db-b', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await run('k1', 'INSERT INTO u (id) VALUES (?)', ['k1']);
+			await run('k2', 'INSERT INTO u (id) VALUES (?)', ['k2']);
+			await run('k3', 'INSERT INTO u (id) VALUES (?)', ['k3']);
+
+			const stats = await getShardStats();
+			const totalCount = stats.reduce((sum, stat) => sum + stat.count, 0);
+			expect(totalCount).toBe(3);
+		});
+
+		it('exposes a single-shard database size via getDatabaseSizeForKey', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: { 'db-a': createInMemorySQLProvider() },
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+			await runShard('db-a', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await run('k', 'INSERT INTO u (id) VALUES (?)', ['k']);
+
+			const size = await getDatabaseSizeForKey('k');
+			expect(size).toBeGreaterThan(0);
+
+			const shardSize = await getDatabaseSizeForShard('db-a');
+			expect(shardSize).toBeGreaterThan(0);
+		});
+
+		it('throws CollegeDBError when the requested shard does not exist', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { 'db-a': createInMemorySQLProvider() },
+				disableAutoMigration: true
+			});
+			await expect(getDatabaseSizeForShard('does-not-exist')).rejects.toThrow(CollegeDBError);
+		});
+
+		it('runAllShards fans out and surfaces per-shard errors', async () => {
+			const kv = createInMemoryKVProvider();
+			const goodDb = createInMemorySQLProvider();
+			await goodDb.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+			const failingDb = {
+				prepare: () => ({
+					bind: () => ({
+						async all() {
+							throw new Error('fail');
+						},
+						async first() {
+							throw new Error('fail');
+						},
+						async run() {
+							throw new Error('fail');
+						}
+					}),
+					async run() {
+						throw new Error('fail');
+					}
+				})
+			};
+
+			initialize({
+				kv,
+				shards: { good: goodDb, bad: failingDb as any },
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+
+			const results = await runAllShards('DELETE FROM u');
+			expect(results.some((r) => r.success === false)).toBe(true);
+			expect(results.some((r) => r.success === true)).toBe(true);
+		});
+
+		it('allAllShards merges rows across shards', async () => {
+			const a = createInMemorySQLProvider();
+			const b = createInMemorySQLProvider();
+			await a.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+			await b.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+			await a.prepare('INSERT INTO u (id) VALUES (?)').bind('a').run();
+			await b.prepare('INSERT INTO u (id) VALUES (?)').bind('b').run();
+
+			initialize({ kv: createInMemoryKVProvider(), shards: { a, b }, disableAutoMigration: true });
+			const result = await allAllShards<{ id: string }>('SELECT id FROM u ORDER BY id');
+			expect(result).toHaveLength(2);
+		});
+	});
+
+	describe('Router - location and mixed strategies', () => {
+		it('routes by geographic proximity, with priority breaking near-ties', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: {
+					'db-east': createInMemorySQLProvider(),
+					'db-west': createInMemorySQLProvider(),
+					'db-eu': createInMemorySQLProvider()
+				},
+				strategy: 'location',
+				targetRegion: 'wnam',
+				shardLocations: {
+					'db-east': { region: 'enam', priority: 1 },
+					'db-west': { region: 'wnam', priority: 2 },
+					'db-eu': { region: 'weur', priority: 1 }
+				},
+				disableAutoMigration: true
+			});
+
+			await runShard('db-east', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await runShard('db-west', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+			await runShard('db-eu', 'CREATE TABLE u (id TEXT PRIMARY KEY)');
+
+			await run('user-1', 'INSERT INTO u (id) VALUES (?)', ['user-1']);
+			const westRow = await firstShard('db-west', 'SELECT id FROM u WHERE id = ?', ['user-1']);
+			expect(westRow).toEqual({ id: 'user-1' });
+		});
+
+		it('falls back to hash when no target region is set for location strategy', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: {
+					'db-a': createInMemorySQLProvider(),
+					'db-b': createInMemorySQLProvider()
+				},
+				strategy: 'location',
+				shardLocations: {
+					'db-a': { region: 'wnam' },
+					'db-b': { region: 'enam' }
+				},
+				disableAutoMigration: true
+			});
+
+			await runShard('db-a', 'CREATE TABLE t (id TEXT PRIMARY KEY)');
+			await runShard('db-b', 'CREATE TABLE t (id TEXT PRIMARY KEY)');
+
+			await run('key-1', 'INSERT INTO t (id) VALUES (?)', ['key-1']);
+			const row = await first<{ id: string }>('key-1', 'SELECT id FROM t WHERE id = ?', ['key-1']);
+			expect(row?.id).toBe('key-1');
+		});
+
+		it('mixed strategies pick different shards for read vs write', async () => {
+			const kv = createInMemoryKVProvider();
+			initialize({
+				kv,
+				shards: {
+					'db-a': createInMemorySQLProvider(),
+					'db-b': createInMemorySQLProvider()
+				},
+				strategy: { read: 'hash', write: 'random' },
+				disableAutoMigration: true
+			});
+
+			await runShard('db-a', 'CREATE TABLE t (id TEXT PRIMARY KEY)');
+			await runShard('db-b', 'CREATE TABLE t (id TEXT PRIMARY KEY)');
+
+			await run('row-1', 'INSERT INTO t (id) VALUES (?)', ['row-1']);
+
+			const mapping = await new KVShardMapper(kv).getShardMapping('row-1');
+			expect(['db-a', 'db-b']).toContain(mapping?.shard);
+		});
+	});
+
+	describe('KVShardMapper - misc behaviors', () => {
+		it('addLookupKeys converts a single-key mapping into a multi-key one', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			await mapper.setShardMapping('user-1', 'db-east');
+			await mapper.addLookupKeys('user-1', ['email:user@example.com', 'username:user']);
+
+			expect((await mapper.getShardMapping('email:user@example.com'))?.shard).toBe('db-east');
+			expect((await mapper.getShardMapping('username:user'))?.shard).toBe('db-east');
+			expect(await mapper.getAllLookupKeys('user-1')).toEqual(expect.arrayContaining(['user-1']));
+		});
+
+		it('deleteShardMapping removes multi-key entries entirely', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			await mapper.setShardMapping('user-2', 'db-east', ['email:multi@example.com']);
+			await mapper.deleteShardMapping('user-2');
+			expect(await mapper.getShardMapping('user-2')).toBeNull();
+			expect(await mapper.getShardMapping('email:multi@example.com')).toBeNull();
+		});
+
+		it('clearAllMappings clears everything when concurrency is bounded', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			for (let i = 0; i < 50; i++) {
+				await mapper.setShardMapping(`key-${i}`, 'db-east');
+			}
+			await mapper.clearAllMappings();
+			expect(await mapper.getShardMapping('key-0')).toBeNull();
+		});
+
+		it('getKeysForShard and getShardKeyCounts return expected values', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			await mapper.setShardMapping('u-1', 'db-east');
+			await mapper.setShardMapping('u-2', 'db-east');
+			await mapper.setShardMapping('u-3', 'db-west');
+
+			const keys = await mapper.getKeysForShard('db-east');
+			expect(keys.sort()).toEqual(['u-1', 'u-2']);
+
+			const counts = await mapper.getShardKeyCounts();
+			expect(counts['db-east']).toBe(2);
+			expect(counts['db-west']).toBe(1);
+		});
+
+		it('updateShardMapping migrates multi-key entries to the new shard', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+			await mapper.setShardMapping('user-3', 'db-east', ['email:upd@example.com']);
+			await mapper.updateShardMapping('user-3', 'db-west');
+			expect((await mapper.getShardMapping('email:upd@example.com'))?.shard).toBe('db-west');
+		});
+
+		it('updateShardMapping rejects unknown primary keys', async () => {
+			const kv = createInMemoryKVProvider();
+			const mapper = new KVShardMapper(kv);
+			await expect(mapper.updateShardMapping('nope', 'db-east')).rejects.toThrow('No existing mapping');
+		});
+	});
+
+	describe('Router - initializeAsync + collegedb', () => {
+		it('initializeAsync waits for the migration scan to finish', async () => {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+			await db.prepare('INSERT INTO u (id) VALUES (?)').bind('legacy').run();
+
+			await initializeAsync({
+				kv: createInMemoryKVProvider(),
+				shards: { 'db-a': db },
+				strategy: 'hash',
+				hashShardMappings: false
+			});
+
+			// After initializeAsync, the legacy row should be readable through the router.
+			const row = await first<{ id: string }>('legacy', 'SELECT id FROM u WHERE id = ?', ['legacy']);
+			expect(row?.id).toBe('legacy');
+		});
+
+		it('prepare() works with non-routing SQL like PRAGMA', async () => {
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { 'db-a': createInMemorySQLProvider() },
+				disableAutoMigration: true
+			});
+			const stmt = await prepare('anything', 'PRAGMA page_count');
+			const row = await stmt.first<{ page_count: number }>();
+			expect(row?.page_count).toBeGreaterThan(0);
 		});
 	});
 });

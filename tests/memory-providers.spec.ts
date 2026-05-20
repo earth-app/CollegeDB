@@ -12,6 +12,7 @@ import {
 	first,
 	firstShard,
 	initialize,
+	insert,
 	resetConfig,
 	run,
 	runShard
@@ -362,5 +363,402 @@ describe('InMemory Providers - Adapter Interop', () => {
 
 		await kv.delete('shard:user:1');
 		expect(await storage.get('shard:user:1')).toBeNull();
+	});
+});
+
+describe('InMemorySQLDatabase - INSERT variants', () => {
+	it('honors INSERT OR REPLACE and surfaces UNIQUE constraint errors otherwise', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE k (id TEXT PRIMARY KEY, value TEXT)').run();
+		await db.prepare('INSERT INTO k (id, value) VALUES (?, ?)').bind('1', 'first').run();
+
+		const dup = await db.prepare('INSERT INTO k (id, value) VALUES (?, ?)').bind('1', 'second').run();
+		expect(dup.success).toBe(false);
+		expect(dup.error).toMatch(/UNIQUE constraint failed/);
+
+		await db.prepare('INSERT OR REPLACE INTO k (id, value) VALUES (?, ?)').bind('1', 'replaced').run();
+		const row = await db.prepare('SELECT value FROM k WHERE id = ?').bind('1').first<{ value: string }>();
+		expect(row?.value).toBe('replaced');
+	});
+
+	it('honors INSERT OR IGNORE without failing', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE k (id TEXT PRIMARY KEY, value TEXT)').run();
+		await db.prepare('INSERT INTO k (id, value) VALUES (?, ?)').bind('1', 'first').run();
+
+		const second = await db.prepare('INSERT OR IGNORE INTO k (id, value) VALUES (?, ?)').bind('1', 'second').run();
+		expect(second.success).toBe(true);
+		expect(second.meta.changes).toBe(0);
+
+		const row = await db.prepare('SELECT value FROM k WHERE id = ?').bind('1').first<{ value: string }>();
+		expect(row?.value).toBe('first');
+	});
+
+	it('auto-assigns ids for AUTOINCREMENT columns and exposes RETURNING rows', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE auto (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)').run();
+
+		const first = await db
+			.prepare('INSERT INTO auto (label) VALUES (?) RETURNING id, label')
+			.bind('hello')
+			.all<{ id: number; label: string }>();
+		expect(first.results[0]).toEqual({ id: 1, label: 'hello' });
+
+		const second = await db.prepare('INSERT INTO auto (label) VALUES (?) RETURNING id').bind('world').all<{ id: number }>();
+		expect(second.results[0]?.id).toBe(2);
+	});
+
+	it('applies inline DEFAULT literals when columns are omitted', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare("CREATE TABLE defaults_tbl (id TEXT PRIMARY KEY, name TEXT DEFAULT 'guest', status INTEGER DEFAULT 1)").run();
+		await db.prepare('INSERT INTO defaults_tbl (id) VALUES (?)').bind('a').run();
+		const row = await db.prepare('SELECT name, status FROM defaults_tbl WHERE id = ?').bind('a').first<{ name: string; status: number }>();
+		expect(row?.name).toBe('guest');
+		expect(row?.status).toBe(1);
+	});
+
+	it('compound WHERE evaluates each clause (regression for first-clause-only bug)', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE tickets (id TEXT PRIMARY KEY, title TEXT, description TEXT, private INTEGER)').run();
+		await db.prepare('INSERT INTO tickets (id, title, description, private) VALUES (?, ?, ?, ?)').bind('a', 'hello', 'x', 0).run();
+		await db
+			.prepare('INSERT INTO tickets (id, title, description, private) VALUES (?, ?, ?, ?)')
+			.bind('b', 'world', 'hello world', 0)
+			.run();
+		await db
+			.prepare('INSERT INTO tickets (id, title, description, private) VALUES (?, ?, ?, ?)')
+			.bind('c', 'private', 'hello again', 1)
+			.run();
+
+		const result = await db
+			.prepare('SELECT id FROM tickets WHERE (title LIKE ? OR description LIKE ?) AND private = 0')
+			.bind('%hello%', '%hello%')
+			.all<{ id: string }>();
+		const ids = result.results.map((row) => row.id).sort();
+		expect(ids).toEqual(['a', 'b']);
+	});
+});
+
+describe('InMemorySQLDatabase - SELECT projection and predicates', () => {
+	it('projects only the requested columns', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, name TEXT, email TEXT)').run();
+		await db.prepare('INSERT INTO u (id, name, email) VALUES (?, ?, ?)').bind('1', 'a', 'a@x').run();
+
+		const row = await db.prepare('SELECT name FROM u WHERE id = ?').bind('1').first<{ name?: string; email?: string }>();
+		expect(row).toEqual({ name: 'a' });
+	});
+
+	it('handles ORDER BY ASC/DESC with NULL placement and LIMIT/OFFSET', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, age INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('a', 30).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('b', 20).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('c', 25).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('d', null).run();
+
+		const asc = await db.prepare('SELECT id, age FROM u ORDER BY age ASC LIMIT 2').all<{ id: string; age: number | null }>();
+		expect(asc.results.map((r) => r.id)).toEqual(['d', 'b']);
+
+		const desc = await db.prepare('SELECT id, age FROM u ORDER BY age DESC LIMIT 2 OFFSET 1').all<{ id: string }>();
+		expect(desc.results.map((r) => r.id)).toEqual(['c', 'b']);
+	});
+
+	it('supports IS NULL / IS NOT NULL predicates', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, email TEXT)').run();
+		await db.prepare('INSERT INTO u (id, email) VALUES (?, ?)').bind('a', null).run();
+		await db.prepare('INSERT INTO u (id, email) VALUES (?, ?)').bind('b', 'b@x').run();
+
+		const nullRows = await db.prepare('SELECT id FROM u WHERE email IS NULL').all<{ id: string }>();
+		expect(nullRows.results.map((r) => r.id)).toEqual(['a']);
+
+		const presentRows = await db.prepare('SELECT id FROM u WHERE email IS NOT NULL').all<{ id: string }>();
+		expect(presentRows.results.map((r) => r.id)).toEqual(['b']);
+	});
+
+	it('supports numeric comparison operators', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, age INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('a', 10).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('b', 20).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('c', 30).run();
+
+		const greater = await db.prepare('SELECT id FROM u WHERE age > ?').bind(15).all<{ id: string }>();
+		expect(greater.results.map((r) => r.id).sort()).toEqual(['b', 'c']);
+
+		const between = await db.prepare('SELECT id FROM u WHERE age >= ? AND age <= ?').bind(15, 25).all<{ id: string }>();
+		expect(between.results.map((r) => r.id)).toEqual(['b']);
+	});
+
+	it('computes COUNT(*), MIN, MAX, SUM, AVG aggregates', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, age INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('a', 10).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('b', 20).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('c', 30).run();
+
+		const result = await db
+			.prepare('SELECT COUNT(*) AS c, MIN(age) AS min_age, MAX(age) AS max_age, SUM(age) AS total, AVG(age) AS avg_age FROM u')
+			.first<{ c: number; min_age: number; max_age: number; total: number; avg_age: number }>();
+		expect(result).toEqual({ c: 3, min_age: 10, max_age: 30, total: 60, avg_age: 20 });
+	});
+
+	it('honors WHERE filters when computing aggregates', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, age INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('a', 10).run();
+		await db.prepare('INSERT INTO u (id, age) VALUES (?, ?)').bind('b', 20).run();
+
+		const result = await db.prepare('SELECT COUNT(*) AS c FROM u WHERE age > ?').bind(15).first<{ c: number }>();
+		expect(result?.c).toBe(1);
+	});
+
+	it('supports COUNT(DISTINCT col)', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, region TEXT)').run();
+		await db.prepare('INSERT INTO u (id, region) VALUES (?, ?)').bind('a', 'us').run();
+		await db.prepare('INSERT INTO u (id, region) VALUES (?, ?)').bind('b', 'us').run();
+		await db.prepare('INSERT INTO u (id, region) VALUES (?, ?)').bind('c', 'eu').run();
+
+		const result = await db.prepare('SELECT COUNT(DISTINCT region) AS regions FROM u').first<{ regions: number }>();
+		expect(result?.regions).toBe(2);
+	});
+
+	it('supports LIKE pattern matching', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, name TEXT)').run();
+		await db.prepare('INSERT INTO u (id, name) VALUES (?, ?)').bind('1', 'Alice').run();
+		await db.prepare('INSERT INTO u (id, name) VALUES (?, ?)').bind('2', 'Bob').run();
+		await db.prepare('INSERT INTO u (id, name) VALUES (?, ?)').bind('3', 'Alicia').run();
+
+		const matched = await db.prepare('SELECT id FROM u WHERE name LIKE ?').bind('Ali%').all<{ id: string }>();
+		expect(matched.results.map((r) => r.id).sort()).toEqual(['1', '3']);
+	});
+
+	it('aggregate SELECT evaluates COALESCE(MAX(id), 0) + 1 across rows', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE tickets (id INTEGER PRIMARY KEY)').run();
+		await db.prepare('INSERT INTO tickets (id) VALUES (?)').bind(1).run();
+		await db.prepare('INSERT INTO tickets (id) VALUES (?)').bind(5).run();
+		await db.prepare('INSERT INTO tickets (id) VALUES (?)').bind(3).run();
+
+		const result = await db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM tickets').first<{ next_id: number }>();
+		expect(result?.next_id).toBe(6);
+
+		const empty = await db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM tickets WHERE id < ?').bind(0).first<{
+			next_id: number;
+		}>();
+		expect(empty?.next_id).toBe(1);
+	});
+});
+
+describe('InMemorySQLDatabase - UPDATE/DELETE advanced usage', () => {
+	it('UPDATE applies to all rows matching a compound WHERE', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, status TEXT, score INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, status, score) VALUES (?, ?, ?)').bind('a', 'new', 5).run();
+		await db.prepare('INSERT INTO u (id, status, score) VALUES (?, ?, ?)').bind('b', 'new', 12).run();
+		await db.prepare('INSERT INTO u (id, status, score) VALUES (?, ?, ?)').bind('c', 'done', 7).run();
+
+		const update = await db.prepare('UPDATE u SET status = ? WHERE status = ? AND score >= ?').bind('active', 'new', 10).run();
+		expect(update.meta.changes).toBe(1);
+
+		const updated = await db.prepare('SELECT id, status FROM u WHERE status = ?').bind('active').all<{ id: string }>();
+		expect(updated.results.map((r) => r.id)).toEqual(['b']);
+	});
+
+	it('DELETE removes rows matching a compound WHERE', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, status TEXT, score INTEGER)').run();
+		await db.prepare('INSERT INTO u (id, status, score) VALUES (?, ?, ?)').bind('a', 'new', 5).run();
+		await db.prepare('INSERT INTO u (id, status, score) VALUES (?, ?, ?)').bind('b', 'new', 12).run();
+
+		const result = await db.prepare('DELETE FROM u WHERE status = ? AND score > ?').bind('new', 10).run();
+		expect(result.meta.changes).toBe(1);
+
+		const remaining = await db.prepare('SELECT id FROM u').all<{ id: string }>();
+		expect(remaining.results.map((r) => r.id)).toEqual(['a']);
+	});
+
+	it('DELETE without WHERE removes everything', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY)').run();
+		await db.prepare('INSERT INTO u (id) VALUES (?)').bind('a').run();
+		await db.prepare('INSERT INTO u (id) VALUES (?)').bind('b').run();
+
+		const result = await db.prepare('DELETE FROM u').run();
+		expect(result.meta.changes).toBe(2);
+
+		const rows = await db.prepare('SELECT id FROM u').all();
+		expect(rows.results).toHaveLength(0);
+	});
+
+	it('UPDATE returns RETURNING rows', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, status TEXT)').run();
+		await db.prepare('INSERT INTO u (id, status) VALUES (?, ?)').bind('a', 'new').run();
+		const result = await db
+			.prepare('UPDATE u SET status = ? WHERE id = ? RETURNING id, status')
+			.bind('done', 'a')
+			.all<{ id: string; status: string }>();
+		expect(result.results[0]).toEqual({ id: 'a', status: 'done' });
+	});
+
+	it('UPDATE preserves columns whose names contain "w"', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE t (id TEXT PRIMARY KEY, wrapped_dek TEXT, nonce TEXT)').run();
+		await db.prepare('INSERT INTO t (id, wrapped_dek, nonce) VALUES (?, ?, ?)').bind('a', 'old', 'n1').run();
+		await db.prepare('UPDATE t SET wrapped_dek = ?, nonce = ? WHERE id = ?').bind('new', 'n2', 'a').run();
+
+		const row = await db.prepare('SELECT wrapped_dek, nonce FROM t WHERE id = ?').bind('a').first<{
+			wrapped_dek: string;
+			nonce: string;
+		}>();
+		expect(row?.wrapped_dek).toBe('new');
+		expect(row?.nonce).toBe('n2');
+	});
+});
+
+describe('InMemorySQLDatabase - PRAGMA + sqlite_master', () => {
+	it('returns page_count / page_size and table_info', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE u (id TEXT PRIMARY KEY, name TEXT NOT NULL)').run();
+		await db.prepare('INSERT INTO u (id, name) VALUES (?, ?)').bind('1', 'A').run();
+
+		const pageCount = await db.prepare('PRAGMA page_count').first<{ page_count: number }>();
+		const pageSize = await db.prepare('PRAGMA page_size').first<{ page_size: number }>();
+		expect(pageCount?.page_count).toBeGreaterThan(0);
+		expect(pageSize?.page_size).toBeGreaterThan(0);
+
+		const info = await db.prepare('PRAGMA table_info(u)').all<{ name: string; pk: number }>();
+		const idColumn = info.results.find((row) => row.name === 'id');
+		expect(idColumn?.pk).toBe(1);
+	});
+
+	it('lists tables via sqlite_master', async () => {
+		const db = createInMemorySQLProvider();
+		await db.prepare('CREATE TABLE one (id TEXT PRIMARY KEY)').run();
+		await db.prepare('CREATE TABLE two (id TEXT PRIMARY KEY)').run();
+		const result = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all<{ name: string }>();
+		expect(result.results.map((row) => row.name).sort()).toEqual(['one', 'two']);
+	});
+});
+
+describe('InMemoryKVStorage', () => {
+	it('supports text + JSON get, TTL expiry, and prefix listing', async () => {
+		const kv = createInMemoryKVProvider();
+		await kv.put('hello', 'world');
+		expect(await kv.get('hello')).toBe('world');
+
+		await kv.put('json', JSON.stringify({ a: 1 }));
+		expect(await kv.get<{ a: number }>('json', 'json')).toEqual({ a: 1 });
+
+		await kv.put('temp', 'gone', { expirationTtl: 0.05 });
+		await new Promise((resolve) => setTimeout(resolve, 70));
+		expect(await kv.get('temp')).toBeNull();
+
+		await kv.put('a:1', '1');
+		await kv.put('a:2', '2');
+		await kv.put('b:1', '3');
+		const prefix = await kv.list({ prefix: 'a:' });
+		expect(prefix.keys.map((k) => k.name).sort()).toEqual(['a:1', 'a:2']);
+	});
+
+	it('supports paginated list via cursor', async () => {
+		const kv = createInMemoryKVProvider();
+		for (let i = 0; i < 5; i++) {
+			await kv.put(`item:${i}`, String(i));
+		}
+
+		const first = await kv.list({ prefix: 'item:', limit: 2 });
+		expect(first.list_complete).toBe(false);
+		expect(first.keys).toHaveLength(2);
+
+		const second = await kv.list({ prefix: 'item:', limit: 2, cursor: first.cursor });
+		expect(second.keys).toHaveLength(2);
+
+		const third = await kv.list({ prefix: 'item:', limit: 2, cursor: second.cursor });
+		expect(third.list_complete).toBe(true);
+		expect(third.keys).toHaveLength(1);
+	});
+
+	it('exposes NuxtHub-style aliases (set/del/keys/getItem/setItem/removeItem)', async () => {
+		const kv = createInMemoryKVProvider();
+		await kv.set('o', { a: 1 });
+		expect(await kv.get('o')).toBe(JSON.stringify({ a: 1 }));
+
+		await kv.setItem('s', 'string');
+		expect(await kv.getItem<string>('s')).toBe('string');
+
+		expect(await kv.getKeys('')).toContain('o');
+
+		await kv.del('o');
+		await kv.removeItem('s');
+		expect(kv.size()).toBe(0);
+	});
+
+	it('clear() drops everything', async () => {
+		const kv = createInMemoryKVProvider();
+		await kv.put('a', '1');
+		await kv.put('b', '2');
+		expect(kv.size()).toBe(2);
+		kv.clear();
+		expect(kv.size()).toBe(0);
+	});
+});
+
+describe('InMemory Providers - Insert via Router and Aggregates', () => {
+	beforeEach(() => {
+		resetConfig();
+		clearMigrationCache();
+	});
+
+	afterEach(() => {
+		resetConfig();
+		clearMigrationCache();
+	});
+
+	it('insert() returns generated ids and finds the row again via routed first()', async () => {
+		const kv = createInMemoryKVProvider();
+		initialize({
+			kv,
+			shards: {
+				'db-a': createInMemorySQLProvider(),
+				'db-b': createInMemorySQLProvider()
+			},
+			strategy: 'round-robin',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-a', 'CREATE TABLE auto_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)');
+		await runShard('db-b', 'CREATE TABLE auto_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)');
+
+		const result = await insert('INSERT INTO auto_users (name) VALUES (?)', ['Ada']);
+		expect(typeof result.generatedId).toBe('number');
+
+		const row = await first<{ id: number; name: string }>(String(result.generatedId), 'SELECT id, name FROM auto_users WHERE id = ?', [
+			result.generatedId
+		]);
+		expect(row?.name).toBe('Ada');
+	});
+
+	it('all() with aggregates routes through the in-memory provider', async () => {
+		const kv = createInMemoryKVProvider();
+		initialize({
+			kv,
+			shards: { 'db-a': createInMemorySQLProvider() },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-a', 'CREATE TABLE u (id TEXT PRIMARY KEY, score INTEGER)');
+		await run('a', 'INSERT INTO u (id, score) VALUES (?, ?)', ['a', 10]);
+		await run('b', 'INSERT INTO u (id, score) VALUES (?, ?)', ['b', 20]);
+
+		const result = await allShard<{ total: number }>('db-a', 'SELECT SUM(score) AS total FROM u');
+		expect(result.results[0]?.total).toBe(30);
 	});
 });

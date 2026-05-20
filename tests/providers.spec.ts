@@ -2,6 +2,7 @@ import { sql as drizzleSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { KVShardMapper } from '../src/kvmap';
 import {
+	createDrizzleSQLProvider,
 	createHyperdriveMySQLProvider,
 	createHyperdrivePostgresProvider,
 	createMySQLProvider,
@@ -9,7 +10,9 @@ import {
 	createPostgreSQLProvider,
 	createRedisKVProvider,
 	createSQLiteProvider,
-	createValkeyKVProvider
+	createValkeyKVProvider,
+	isKVStorage,
+	isSQLDatabase
 } from '../src/providers';
 
 class MockRedisClient {
@@ -472,5 +475,380 @@ describe('KVShardMapper Caching', () => {
 		expect(second).toEqual(['db-east', 'db-west']);
 		expect(afterFirstRead - beforeReads).toBeLessThanOrEqual(1);
 		expect(kv.getCalls).toBe(afterFirstRead);
+	});
+});
+
+describe('Hyperdrive Postgres helper', () => {
+	it('falls back to release() when end() is unavailable', async () => {
+		const lifecycle: string[] = [];
+		const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({
+			async query() {
+				lifecycle.push('query');
+				return { rows: [], rowCount: 0 };
+			},
+			release() {
+				lifecycle.push('release');
+			}
+		}));
+
+		await provider.prepare('SELECT 1').run();
+		expect(lifecycle).toContain('release');
+	});
+
+	it('skips connect() when not provided', async () => {
+		const lifecycle: string[] = [];
+		const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({
+			async query<T = Record<string, unknown>>() {
+				lifecycle.push('query');
+				return { rows: [{ id: 1 }] as unknown as T[], rowCount: 1 };
+			}
+		}));
+
+		const result = await provider.prepare('SELECT 1').all();
+		expect(result.results).toHaveLength(1);
+		expect(lifecycle).toEqual(['query']);
+	});
+});
+
+describe('Hyperdrive MySQL helper', () => {
+	it('falls back to query() when execute is missing, then close()', async () => {
+		const lifecycle: string[] = [];
+		const provider = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => ({
+			async query() {
+				lifecycle.push('query');
+				return [[{ ok: 1 }], []];
+			},
+			close() {
+				lifecycle.push('close');
+			}
+		}));
+
+		const result = await provider.prepare('SELECT 1').all();
+		expect(result.results).toEqual([{ ok: 1 }]);
+		expect(lifecycle).toEqual(['query', 'close']);
+	});
+
+	it('falls back to destroy() when end+close are missing', async () => {
+		const lifecycle: string[] = [];
+		const provider = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => ({
+			async execute() {
+				lifecycle.push('execute');
+				return [[{ ok: true }], []];
+			},
+			destroy() {
+				lifecycle.push('destroy');
+			}
+		}));
+
+		await provider.prepare('SELECT 1').first();
+		expect(lifecycle).toEqual(['execute', 'destroy']);
+	});
+
+	it('throws when the underlying client exposes nothing useful', async () => {
+		const provider = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => ({}));
+		await expect(provider.prepare('SELECT 1').run()).rejects.toThrow(/missing execute\/query/);
+	});
+});
+
+describe('MySQL adapter packet handling', () => {
+	it('exposes affectedRows on all() when execute returns an OK packet', async () => {
+		const provider = createMySQLProvider({
+			async execute() {
+				return { affectedRows: 3, warningStatus: 0 } as any;
+			}
+		});
+
+		const result = await provider.prepare('DELETE FROM t WHERE x = ?').bind(1).all();
+		expect(result.meta.changes).toBe(3);
+		expect(result.results).toEqual([]);
+	});
+
+	it('returns null on first() when no rows are produced', async () => {
+		const provider = createMySQLProvider({
+			async execute() {
+				return [[], []] as any;
+			}
+		});
+
+		const result = await provider.prepare('SELECT 1').first();
+		expect(result).toBeNull();
+	});
+
+	it('throws when the MySQL client lacks execute and query', async () => {
+		const provider = createMySQLProvider({} as any);
+		await expect(provider.prepare('SELECT 1').run()).rejects.toThrow(/execute\(\) or query\(\)/);
+	});
+});
+
+describe('SQLite adapter validation', () => {
+	it('throws when neither execute nor prepare.run is exposed', async () => {
+		const provider = createSQLiteProvider({
+			prepare() {
+				return {};
+			}
+		});
+
+		await expect(provider.prepare('SELECT 1').run()).rejects.toMatchObject({ code: 'SQLITE_CLIENT_INVALID' });
+		await expect(provider.prepare('SELECT 1').all()).rejects.toMatchObject({ code: 'SQLITE_CLIENT_INVALID' });
+	});
+
+	it('reads rows via the execute()-style adapter shape', async () => {
+		const provider = createSQLiteProvider({
+			async execute(sql: string) {
+				return { rows: [{ id: 'x', sql }] };
+			}
+		});
+
+		const all = await provider.prepare('SELECT *').all<{ id: string }>();
+		expect(all.results[0]?.id).toBe('x');
+
+		const first = await provider.prepare('SELECT *').first<{ id: string }>();
+		expect(first?.id).toBe('x');
+	});
+
+	it('first() falls back to prepare().all() when get() is missing', async () => {
+		const provider = createSQLiteProvider({
+			prepare() {
+				return {
+					all() {
+						return [{ id: 'fallback' }];
+					}
+				};
+			}
+		});
+
+		const first = await provider.prepare('SELECT id').first<{ id: string }>();
+		expect(first).toEqual({ id: 'fallback' });
+	});
+});
+
+describe('Drizzle adapter execute/run/all fallbacks', () => {
+	const sqlTag = ((strings: TemplateStringsArray, ...params: any[]) => ({
+		text: strings.join('?'),
+		params,
+		append() {}
+	})) as any;
+	sqlTag.raw = (sql: string) => ({ text: sql, params: [], append() {} });
+	sqlTag.empty = () => ({ text: '', params: [], append() {} });
+
+	it('uses all() when run() is missing on the Drizzle client', async () => {
+		const calls: string[] = [];
+		const provider = createDrizzleSQLProvider(
+			{
+				async all() {
+					calls.push('all');
+					return { rows: [{ ok: true }] };
+				}
+			},
+			sqlTag
+		);
+
+		const result = await provider.prepare('UPDATE t SET x = ? WHERE id = ?').bind(1, 2).run();
+		expect(result.success).toBe(true);
+		expect(calls).toEqual(['all']);
+	});
+
+	it('uses execute() for all() when all is missing', async () => {
+		const provider = createDrizzleSQLProvider(
+			{
+				async execute() {
+					return [[{ id: 1 }], []];
+				}
+			},
+			sqlTag
+		);
+
+		const result = await provider.prepare('SELECT * FROM t').all();
+		expect(result.results).toEqual([{ id: 1 }]);
+	});
+
+	it('throws when Drizzle binding count mismatches placeholders', () => {
+		const provider = createDrizzleSQLProvider(
+			{
+				async execute() {
+					return { rows: [] };
+				}
+			},
+			sqlTag
+		);
+
+		const statement = provider.prepare('SELECT ? FROM t WHERE x = ?').bind('only-one');
+		return expect(statement.all()).rejects.toThrow(/binding mismatch/);
+	});
+});
+
+describe('Redis adapter scan paging', () => {
+	it('iterates through multiple cursor pages', async () => {
+		const store = new Map<string, string>();
+		for (let i = 0; i < 5; i++) {
+			store.set(`shard:${i}`, JSON.stringify({ shard: 'east' }));
+		}
+
+		let callIndex = 0;
+		const redis = {
+			async get(key: string) {
+				return store.get(key) ?? null;
+			},
+			async set(key: string, value: string) {
+				store.set(key, value);
+			},
+			async del(key: string) {
+				store.delete(key);
+			},
+			async scan() {
+				const allKeys = Array.from(store.keys()).filter((k) => k.startsWith('shard:'));
+				if (callIndex === 0) {
+					callIndex++;
+					return ['1', allKeys.slice(0, 3)];
+				}
+				return ['0', allKeys.slice(3)];
+			}
+		};
+
+		const kv = createValkeyKVProvider(redis as any);
+		const listed = await kv.list({ prefix: 'shard:' });
+		expect(listed.keys).toHaveLength(5);
+	});
+
+	it('honors the limit parameter when listing', async () => {
+		const store = new Map<string, string>();
+		for (let i = 0; i < 4; i++) {
+			store.set(`shard:${i}`, '1');
+		}
+		const redis = {
+			async get(key: string) {
+				return store.get(key) ?? null;
+			},
+			async set() {},
+			async del() {},
+			async scan() {
+				return ['0', Array.from(store.keys())];
+			}
+		};
+
+		const kv = createRedisKVProvider(redis as any);
+		const limited = await kv.list({ prefix: 'shard:', limit: 2 });
+		expect(limited.keys).toHaveLength(2);
+	});
+});
+
+describe('NuxtHub adapter edge cases', () => {
+	it('falls back to setItem/removeItem when set/del are missing', async () => {
+		const store = new Map<string, unknown>();
+		const kv = createNuxtHubKVProvider({
+			async setItem(key: string, value: unknown) {
+				store.set(key, value);
+			},
+			async removeItem(key: string) {
+				store.delete(key);
+			},
+			async getItem(key: string) {
+				return store.get(key) ?? null;
+			},
+			async getKeys(prefix: string = '') {
+				return Array.from(store.keys()).filter((k) => k.startsWith(prefix));
+			}
+		} as any);
+
+		await kv.put('hello', 'world');
+		expect(await kv.get('hello')).toBe('world');
+		await kv.delete('hello');
+		expect(await kv.get('hello')).toBeNull();
+	});
+
+	it('NuxtHub KV adapter throws when client is missing get methods', async () => {
+		const kv = createNuxtHubKVProvider({} as any);
+		await expect(kv.get('a')).rejects.toThrow(/get\(\) or getItem\(\)/);
+		await expect(kv.put('a', 'b')).rejects.toThrow(/set\(\) or setItem\(\)/);
+		await expect(kv.delete('a')).rejects.toThrow(/del\(\) or removeItem\(\)/);
+		await expect(kv.list({ prefix: 'a' })).rejects.toThrow(/keys\(\) or getKeys\(\)/);
+	});
+
+	it('NuxtHub KV adapter falls back to JSON.stringify for object values', async () => {
+		const kv = createNuxtHubKVProvider({
+			async get() {
+				return { hello: 'world' };
+			},
+			async set() {}
+		} as any);
+		const value = await kv.get('a');
+		expect(value).toBe(JSON.stringify({ hello: 'world' }));
+	});
+});
+
+describe('Postgres adapter edge cases', () => {
+	it('Postgres adapter surfaces JSON parse errors via KV adapter', async () => {
+		const redis = {
+			async get() {
+				return 'not-json';
+			},
+			async set() {},
+			async del() {},
+			async scan() {
+				return ['0', []];
+			}
+		};
+		const kv = createRedisKVProvider(redis as any);
+		await expect(kv.get('a', 'json')).rejects.toMatchObject({ code: 'KV_JSON_PARSE_FAILED' });
+	});
+
+	it('Postgres adapter constructor accepts Drizzle interop tag', () => {
+		const adapter = createPostgreSQLProvider(
+			{
+				async execute() {
+					return { rows: [], rowCount: 0 };
+				}
+			},
+			((strings: TemplateStringsArray) => ({
+				text: strings[0],
+				params: [],
+				append() {}
+			})) as any
+		);
+		expect(typeof adapter.prepare).toBe('function');
+	});
+});
+
+describe('Type guards', () => {
+	it('isSQLDatabase / isKVStorage detect implementations', () => {
+		expect(isSQLDatabase({ prepare: () => null })).toBe(true);
+		expect(isSQLDatabase(null)).toBe(false);
+		expect(isSQLDatabase({})).toBe(false);
+
+		const kvLike = { get: () => null, put: () => undefined, delete: () => undefined, list: () => ({ keys: [] }) };
+		expect(isKVStorage(kvLike)).toBe(true);
+		expect(isKVStorage(null)).toBe(false);
+		expect(isKVStorage({ get: () => null })).toBe(false);
+	});
+});
+
+describe('Postgres placeholder rewriting', () => {
+	it('caches rewritten SQL between invocations', async () => {
+		let calls = 0;
+		const provider = createPostgreSQLProvider({
+			async query<T = Record<string, unknown>>() {
+				calls++;
+				return { rows: [{ ok: true }] as unknown as T[], rowCount: 1 };
+			}
+		});
+
+		await provider.prepare('SELECT * FROM users WHERE id = ?').bind(1).run();
+		await provider.prepare('SELECT * FROM users WHERE id = ?').bind(2).run();
+		expect(calls).toBe(2);
+	});
+
+	it('handles -- line comments and /* block comments */ when rewriting', async () => {
+		let captured = '';
+		const provider = createPostgreSQLProvider({
+			async query(sql: string) {
+				captured = sql;
+				return { rows: [], rowCount: 0 };
+			}
+		});
+
+		await provider.prepare("-- ignore this ?\n/* and this ? too */ SELECT * FROM t WHERE id = ? AND label = '?'").bind('only-one').all();
+
+		expect(captured).toContain('$1');
+		expect(captured).toContain("'?'");
 	});
 });
