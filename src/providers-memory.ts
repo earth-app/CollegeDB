@@ -1114,6 +1114,10 @@ function applyScalarFunction(fnName: string, args: unknown[]): unknown {
  * Computes a constrained subset of scalar expressions — numeric arithmetic
  * over column references and constants. Anything outside that subset is
  * returned verbatim so the caller can decide whether the result is useful.
+ *
+ * The arithmetic path uses a token-based recursive-descent evaluator rather
+ * than `new Function(...)` so the in-memory provider remains usable inside
+ * Cloudflare Workers isolates, which disallow dynamic code evaluation.
  * @private
  */
 function safelyEvaluate(expression: string, record: Record<string, unknown>): unknown {
@@ -1123,42 +1127,186 @@ function safelyEvaluate(expression: string, record: Record<string, unknown>): un
 	const literal = parseLiteral(trimmed);
 	if (literal.consumed) return literal.value;
 
-	if (!/^[\d+\-*/().\s]+$/.test(trimmed)) {
-		// Try simple identifier-resolved arithmetic, e.g. "max_id + 1".
-		const tokens = trimmed.split(/(\s|[+\-*/()])/).filter((token) => token.trim().length > 0);
-		const replaced = tokens
-			.map((token) => {
-				if (/^[+\-*/()]$/.test(token)) return token;
-				const number = Number(token);
-				if (Number.isFinite(number)) return token;
-				if (token.toLowerCase() === 'null') return 'null';
-				const value = record[normalizeSqlIdentifier(token)];
-				if (value === null || value === undefined) return 'null';
-				if (typeof value === 'number') return String(value);
-				return JSON.stringify(value);
-			})
-			.join(' ');
+	const numeric = evaluateNumericExpression(trimmed, record);
+	return numeric === undefined ? trimmed : numeric;
+}
 
-		if (!/^[\d+\-*/().\s]+$/.test(replaced.replace(/null/g, '0'))) {
-			return trimmed;
+/**
+ * Numeric expression token used by the in-memory arithmetic evaluator.
+ * @private
+ */
+type NumericToken =
+	| { type: 'number'; value: number }
+	| { type: 'identifier'; name: string }
+	| { type: 'null' }
+	| { type: 'lparen' }
+	| { type: 'rparen' }
+	| { type: 'plus' }
+	| { type: 'minus' }
+	| { type: 'star' }
+	| { type: 'slash' };
+
+/**
+ * Tokenizes a numeric expression like `max_id + 1` or `(5 + 3) * 2`. Returns
+ * `undefined` if any character falls outside the supported arithmetic subset
+ * so the caller can bail out without attempting a parse.
+ * @private
+ */
+function tokenizeNumericExpression(expression: string): NumericToken[] | undefined {
+	const tokens: NumericToken[] = [];
+	let i = 0;
+	while (i < expression.length) {
+		const char = expression[i]!;
+		if (/\s/.test(char)) {
+			i++;
+			continue;
 		}
-
-		try {
-			// eslint-disable-next-line no-new-func
-			const evaluator = new Function(`return (${replaced.replace(/null/g, '0')});`);
-			return evaluator();
-		} catch {
-			return trimmed;
+		if (char === '(') {
+			tokens.push({ type: 'lparen' });
+			i++;
+			continue;
 		}
+		if (char === ')') {
+			tokens.push({ type: 'rparen' });
+			i++;
+			continue;
+		}
+		if (char === '+') {
+			tokens.push({ type: 'plus' });
+			i++;
+			continue;
+		}
+		if (char === '-') {
+			tokens.push({ type: 'minus' });
+			i++;
+			continue;
+		}
+		if (char === '*') {
+			tokens.push({ type: 'star' });
+			i++;
+			continue;
+		}
+		if (char === '/') {
+			tokens.push({ type: 'slash' });
+			i++;
+			continue;
+		}
+		if (/[0-9.]/.test(char)) {
+			let end = i;
+			while (end < expression.length && /[0-9.]/.test(expression[end]!)) end++;
+			const value = Number(expression.slice(i, end));
+			if (!Number.isFinite(value)) return undefined;
+			tokens.push({ type: 'number', value });
+			i = end;
+			continue;
+		}
+		if (/[A-Za-z_`"\[]/.test(char)) {
+			let end = i;
+			while (end < expression.length && /[A-Za-z0-9_`"\[\].]/.test(expression[end]!)) end++;
+			const name = expression.slice(i, end);
+			if (/^null$/i.test(name)) {
+				tokens.push({ type: 'null' });
+			} else {
+				tokens.push({ type: 'identifier', name });
+			}
+			i = end;
+			continue;
+		}
+		return undefined;
 	}
+	return tokens;
+}
 
-	try {
-		// eslint-disable-next-line no-new-func
-		const evaluator = new Function(`return (${trimmed});`);
-		return evaluator();
-	} catch {
-		return trimmed;
+/**
+ * Cursor state passed through the recursive-descent numeric parser.
+ * @private
+ */
+interface NumericParser {
+	tokens: NumericToken[];
+	position: number;
+}
+
+/**
+ * Evaluates `<literal-or-column> (+|-|*|/) <literal-or-column>` style
+ * expressions, with parentheses and unary +/-. Returns `undefined` when the
+ * expression contains anything outside that subset — including string column
+ * values, comparison operators, or unsupported syntax — so the caller can
+ * fall back to returning the raw expression.
+ * @private
+ */
+function evaluateNumericExpression(expression: string, record: Record<string, unknown>): number | undefined {
+	const tokens = tokenizeNumericExpression(expression);
+	if (!tokens || tokens.length === 0) return undefined;
+
+	const parser: NumericParser = { tokens, position: 0 };
+	const result = parseAdditive(parser, record);
+	if (result === undefined) return undefined;
+	if (parser.position !== tokens.length) return undefined;
+	return Number.isFinite(result) ? result : undefined;
+}
+
+function parseAdditive(parser: NumericParser, record: Record<string, unknown>): number | undefined {
+	let left = parseMultiplicative(parser, record);
+	if (left === undefined) return undefined;
+	while (parser.position < parser.tokens.length) {
+		const next = parser.tokens[parser.position]!;
+		if (next.type !== 'plus' && next.type !== 'minus') break;
+		parser.position++;
+		const right = parseMultiplicative(parser, record);
+		if (right === undefined) return undefined;
+		left = next.type === 'plus' ? left + right : left - right;
 	}
+	return left;
+}
+
+function parseMultiplicative(parser: NumericParser, record: Record<string, unknown>): number | undefined {
+	let left = parseUnary(parser, record);
+	if (left === undefined) return undefined;
+	while (parser.position < parser.tokens.length) {
+		const next = parser.tokens[parser.position]!;
+		if (next.type !== 'star' && next.type !== 'slash') break;
+		parser.position++;
+		const right = parseUnary(parser, record);
+		if (right === undefined) return undefined;
+		if (next.type === 'slash' && right === 0) return undefined;
+		left = next.type === 'star' ? left * right : left / right;
+	}
+	return left;
+}
+
+function parseUnary(parser: NumericParser, record: Record<string, unknown>): number | undefined {
+	const next = parser.tokens[parser.position];
+	if (!next) return undefined;
+	if (next.type === 'plus') {
+		parser.position++;
+		return parseUnary(parser, record);
+	}
+	if (next.type === 'minus') {
+		parser.position++;
+		const value = parseUnary(parser, record);
+		return value === undefined ? undefined : -value;
+	}
+	return parsePrimary(parser, record);
+}
+
+function parsePrimary(parser: NumericParser, record: Record<string, unknown>): number | undefined {
+	const token = parser.tokens[parser.position++];
+	if (!token) return undefined;
+	if (token.type === 'number') return token.value;
+	if (token.type === 'null') return 0;
+	if (token.type === 'identifier') {
+		const value = record[normalizeSqlIdentifier(token.name)];
+		if (value === null || value === undefined) return 0;
+		return toFiniteNumber(value);
+	}
+	if (token.type === 'lparen') {
+		const inner = parseAdditive(parser, record);
+		if (inner === undefined) return undefined;
+		const close = parser.tokens[parser.position++];
+		if (!close || close.type !== 'rparen') return undefined;
+		return inner;
+	}
+	return undefined;
 }
 
 /**

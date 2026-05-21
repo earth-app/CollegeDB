@@ -551,6 +551,37 @@ describe('InMemorySQLDatabase - SELECT projection and predicates', () => {
 		}>();
 		expect(empty?.next_id).toBe(1);
 	});
+
+	it('aggregate arithmetic does not rely on new Function (Workers-isolate safe)', async () => {
+		const original = globalThis.Function;
+		let invocations = 0;
+		const guarded = function (this: unknown) {
+			invocations++;
+			throw new Error('new Function is blocked in Workers isolates');
+		} as unknown as { prototype: unknown };
+		guarded.prototype = original.prototype;
+		(globalThis as any).Function = guarded;
+
+		try {
+			const db = createInMemorySQLProvider();
+			await db.prepare('CREATE TABLE t (id INTEGER PRIMARY KEY)').run();
+			await db.prepare('INSERT INTO t (id) VALUES (?)').bind(2).run();
+			await db.prepare('INSERT INTO t (id) VALUES (?)').bind(7).run();
+
+			const row = await db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM t').first<{ next_id: number }>();
+			expect(row?.next_id).toBe(8);
+			expect(invocations).toBe(0);
+
+			const empty = await db
+				.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM t WHERE id > ?')
+				.bind(1000)
+				.first<{ next_id: number }>();
+			expect(empty?.next_id).toBe(1);
+			expect(invocations).toBe(0);
+		} finally {
+			(globalThis as any).Function = original;
+		}
+	});
 });
 
 describe('InMemorySQLDatabase - UPDATE/DELETE advanced usage', () => {
