@@ -357,13 +357,17 @@ describe('Provider Adapters', () => {
 		expect(capturedQuery).toBeTruthy();
 	});
 
-	it('supports Drizzle first() when get() returns a plain row object', async () => {
+	it('supports Drizzle first() reading a plain row via the normalized all() path', async () => {
 		const sqlTag = createMockDrizzleSqlTag();
 
 		const provider = createSQLiteProvider(
 			{
+				// get() is intentionally wrong; first() must read through the normalized all() path
 				async get() {
-					return { id: 'plain-row-1', email: 'plain@example.com' };
+					return null;
+				},
+				async all() {
+					return [{ id: 'plain-row-1', email: 'plain@example.com' }];
 				}
 			},
 			sqlTag
@@ -376,6 +380,32 @@ describe('Provider Adapters', () => {
 
 		expect(row?.id).toBe('plain-row-1');
 		expect(row?.email).toBe('plain@example.com');
+	});
+
+	it('supports Drizzle first() selecting a blob column named "data" (regression: get() drops it)', async () => {
+		const sqlTag = createMockDrizzleSqlTag();
+		const blob = new Uint8Array([0, 1, 2, 250, 251, 252]);
+
+		const provider = createSQLiteProvider(
+			{
+				async get() {
+					return { id: 'blob-user-1', data: blob };
+				},
+				async all() {
+					return [{ id: 'blob-user-1', data: blob }];
+				}
+			},
+			sqlTag
+		);
+
+		const row = await provider.prepare('SELECT id, data FROM users WHERE id = ?').bind('blob-user-1').first<{
+			id: string;
+			data: Uint8Array;
+		}>();
+
+		expect(row).not.toBeNull();
+		expect(row?.id).toBe('blob-user-1');
+		expect(row?.data).toEqual(blob);
 	});
 
 	it('supports Drizzle interop via createMySQLProvider', async () => {

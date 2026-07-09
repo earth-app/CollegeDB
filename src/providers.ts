@@ -886,10 +886,7 @@ async function executeDrizzleAll(client: DrizzleClientLike, query: DrizzleSqlChu
 }
 
 async function executeDrizzleFirst(client: DrizzleClientLike, query: DrizzleSqlChunkLike): Promise<unknown> {
-	if (typeof client.get === 'function') {
-		return await client.get(query);
-	}
-
+	// drizzle get() drops blob columns on some drivers (libsql); reuse the normalized all() path and take rows[0]
 	return await executeDrizzleAll(client, query);
 }
 
