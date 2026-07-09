@@ -11,6 +11,7 @@ typedoc
 # code coverage
 coverage
 *.lcov
+test-report.junit.xml
 
 # logs
 logs
