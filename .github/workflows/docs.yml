@@ -6,6 +6,10 @@ on:
       - master
   workflow_dispatch:
 
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
