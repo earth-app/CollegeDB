@@ -18,6 +18,7 @@
     "docs:build": "bunx typedoc src --out ./typedoc",
     "prettier": "bunx prettier --write .",
     "prettier:check": "bunx prettier --check .",
+    "typecheck": "bunx tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
