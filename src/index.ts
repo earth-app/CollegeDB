@@ -21,6 +21,10 @@ export {
 	countAllShards,
 	countShard,
 	createSchema,
+	deleteById,
+	deleteLookup,
+	deleteRow,
+	ensureSchema,
 	explain,
 	explainAllShards,
 	explainShard,
@@ -28,12 +32,15 @@ export {
 	firstAllShards,
 	firstAllShardsGlobal,
 	firstByLookupKey,
+	firstResilient,
 	firstShard,
 	flush,
+	getActiveConfig,
 	getClosestRegionFromIP,
 	getDatabaseSizeForKey,
 	getDatabaseSizeForShard,
 	getDatabaseSizesAllShards,
+	getLookup,
 	getShardStats,
 	getTotalDatabaseSize,
 	index,
@@ -41,26 +48,52 @@ export {
 	indexShard,
 	initialize,
 	initializeAsync,
+	initializeFromEnv,
 	insert,
+	insertInto,
+	insertReturning,
 	insertShard,
+	isInitialized,
 	listKnownShards,
+	nextId,
+	paginate,
+	patch,
 	prepare,
 	reassignShard,
 	resetConfig,
 	run,
 	runAllShards,
-	runShard
+	runShard,
+	setLookup,
+	updateRow,
+	upsert
 } from './router';
 
 export type {
 	CreateIndexOptions,
+	CrudReturningOptions,
+	EnsureSchemaOptions,
 	ExplainOptions,
 	GlobalAllShardsOptions,
+	IdColumnOptions,
 	IndexColumnDefinition,
+	InitializeFromEnvOptions,
 	InsertResult,
+	LookupOptions,
+	NextIdOptions,
+	PaginateOptions,
+	PaginatedResult,
 	ShardSizeResult,
 	ShardTableCount
 } from './router';
+
+// Export deterministic SQL builders
+export { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier } from './query';
+export type { BuildInsertOptions, BuildUpsertOptions, BuiltQuery, ColumnValues } from './query';
+
+// Export KV read-through cache helpers
+export { cached, invalidate } from './cache';
+export type { CacheOptions } from './cache';
 
 // Export utility classes
 export { ShardCoordinator } from './durable';
@@ -78,8 +111,10 @@ export {
 	createRedisKVProvider,
 	createSQLiteProvider,
 	createValkeyKVProvider,
+	createWorkersKVProvider,
 	isKVStorage,
 	isSQLDatabase,
+	toProvider,
 	type DrizzleClientLike,
 	type DrizzleSqlChunkLike,
 	type DrizzleSqlTagLike,
@@ -90,7 +125,9 @@ export {
 	type NuxtHubKVLike,
 	type PostgresClientLike,
 	type RedisLikeClient,
-	type SQLiteClientLike
+	type SQLiteClientLike,
+	type ToProviderOptions,
+	type WorkersKVNamespaceLike
 } from './providers';
 
 // Export in-memory mock providers for testing
