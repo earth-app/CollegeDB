@@ -405,4 +405,47 @@ describe('ShardCoordinator', () => {
 			expect((await coordinator.fetch(new Request('http://coordinator/nope') as any)).status).toBe(404);
 		});
 	});
+
+	describe('Sequence allocation', () => {
+		async function sequence(body: unknown): Promise<Response> {
+			return await coordinator.fetch(
+				new Request('http://coordinator/sequence', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(body)
+				}) as any
+			);
+		}
+
+		it('increments a named sequence monotonically', async () => {
+			const first = (await (await sequence({ name: 'tickets' })).json()) as { value: number };
+			const second = (await (await sequence({ name: 'tickets' })).json()) as { value: number };
+			expect(first.value).toBe(1);
+			expect(second.value).toBe(2);
+		});
+
+		it('keeps separate counters per name', async () => {
+			await sequence({ name: 'tickets' });
+			const customers = (await (await sequence({ name: 'customers' })).json()) as { value: number };
+			expect(customers.value).toBe(1);
+		});
+
+		it('respects the min floor and stays monotonic afterward', async () => {
+			const seeded = (await (await sequence({ name: 'labels', min: 50 })).json()) as { value: number };
+			expect(seeded.value).toBe(50);
+			const next = (await (await sequence({ name: 'labels' })).json()) as { value: number };
+			expect(next.value).toBe(51);
+		});
+
+		it('ignores a min lower than the current counter', async () => {
+			await sequence({ name: 'orders', min: 10 });
+			const next = (await (await sequence({ name: 'orders', min: 5 })).json()) as { value: number };
+			expect(next.value).toBe(11);
+		});
+
+		it('rejects a missing name', async () => {
+			const result = await sequence({});
+			expect(result.status).toBe(400);
+		});
+	});
 });

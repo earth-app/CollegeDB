@@ -11,8 +11,11 @@ import {
 	createRedisKVProvider,
 	createSQLiteProvider,
 	createValkeyKVProvider,
+	createWorkersKVProvider,
 	isKVStorage,
-	isSQLDatabase
+	isSQLDatabase,
+	toProvider,
+	type WorkersKVNamespaceLike
 } from '../src/providers';
 
 class MockRedisClient {
@@ -880,5 +883,105 @@ describe('Postgres placeholder rewriting', () => {
 
 		expect(captured).toContain('$1');
 		expect(captured).toContain("'?'");
+	});
+});
+
+describe('toProvider', () => {
+	it('returns an SQLDatabase-shaped binding (e.g. D1) unchanged', () => {
+		const d1 = { prepare: () => ({ bind: () => ({}), run: async () => ({}), all: async () => ({}), first: async () => null }) };
+		expect(toProvider(d1)).toBe(d1);
+	});
+
+	it('wraps a Drizzle-style client when a sql tag is supplied', () => {
+		const drizzleClient = {
+			run: async () => ({ rows: [] }),
+			all: async () => ({ rows: [] }),
+			get: async () => null
+		};
+		const provider = toProvider(drizzleClient, { sql: drizzleSql });
+		expect(provider).not.toBeNull();
+		expect(provider).not.toBe(drizzleClient);
+		expect(typeof provider?.prepare).toBe('function');
+	});
+
+	it('wraps a raw sqlite client exposing prepare via createSQLiteProvider', () => {
+		const sqliteClient = {
+			prepare: (_sql: string) => ({
+				run: () => ({ success: true }),
+				all: () => [],
+				get: () => undefined
+			})
+		};
+		// Has prepare, so isSQLDatabase returns it as-is (D1-compatible contract).
+		const provider = toProvider(sqliteClient);
+		expect(provider).not.toBeNull();
+		expect(typeof provider?.prepare).toBe('function');
+	});
+
+	it('returns null for a Drizzle client without a sql tag', () => {
+		const drizzleClient = { run: async () => ({}), all: async () => ({}), get: async () => null };
+		expect(toProvider(drizzleClient)).toBeNull();
+	});
+
+	it('returns null for unrecognized values', () => {
+		expect(toProvider(null)).toBeNull();
+		expect(toProvider(undefined)).toBeNull();
+		expect(toProvider(42)).toBeNull();
+		expect(toProvider({})).toBeNull();
+	});
+});
+
+describe('createWorkersKVProvider', () => {
+	function createWorkersKVMock(): WorkersKVNamespaceLike {
+		const store = new Map<string, string>();
+		return {
+			async get(key: string) {
+				return store.has(key) ? store.get(key)! : null;
+			},
+			async put(key: string, value: string) {
+				store.set(key, value);
+			},
+			async delete(key: string) {
+				store.delete(key);
+			},
+			async list(options?: { prefix?: string; cursor?: string; limit?: number }) {
+				const prefix = options?.prefix ?? '';
+				const keys = Array.from(store.keys())
+					.filter((name) => name.startsWith(prefix))
+					.map((name) => ({ name }));
+				return { keys, list_complete: true };
+			}
+		};
+	}
+
+	it('adapts a raw Workers KV namespace to the KVStorage contract', async () => {
+		const provider = createWorkersKVProvider(createWorkersKVMock());
+		expect(isKVStorage(provider)).toBe(true);
+
+		await provider.put('a', 'hello');
+		expect(await provider.get('a', 'text')).toBe('hello');
+
+		await provider.put('j', JSON.stringify({ n: 5 }));
+		expect(await provider.get<{ n: number }>('j', 'json')).toEqual({ n: 5 });
+
+		await provider.delete('a');
+		expect(await provider.get('a', 'text')).toBeNull();
+	});
+
+	it('normalizes list results and preserves list_complete', async () => {
+		const provider = createWorkersKVProvider(createWorkersKVMock());
+		await provider.put('user:1', '1');
+		await provider.put('user:2', '2');
+		await provider.put('post:1', '3');
+
+		const result = await provider.list({ prefix: 'user:' });
+		expect(result.keys.map((k) => k.name).sort()).toEqual(['user:1', 'user:2']);
+		expect(result.list_complete).toBe(true);
+	});
+
+	it('throws a typed error on malformed JSON', async () => {
+		const provider = createWorkersKVProvider(createWorkersKVMock());
+		await provider.put('bad', 'not-json{');
+		await expect(provider.get('bad', 'json')).rejects.toThrow('Failed to parse JSON from Workers KV');
 	});
 });
