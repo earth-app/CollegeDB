@@ -49,7 +49,7 @@
     "@babel/core": "^8.0.0",
     "@babel/preset-env": "^8.0.0",
     "@babel/preset-typescript": "^8.0.0",
-    "@cloudflare/workers-types": "^4.20260702.1",
+    "@cloudflare/workers-types": "^5.0.0",
     "@types/bun": "latest",
     "@types/pg": "^8.20.0",
     "@vitest/coverage-v8": "^4.1.10",
