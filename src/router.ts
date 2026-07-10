@@ -43,9 +43,21 @@
 import type { Request } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors';
 import { KVShardMapper } from './kvmap';
+import { createSchemaAcrossShards } from './migrations';
+import { createWorkersKVProvider, isKVStorage, toProvider, type DrizzleSqlTagLike } from './providers';
+import {
+	buildDelete,
+	buildInsert,
+	buildUpdate,
+	buildUpsert,
+	type BuildInsertOptions,
+	type BuildUpsertOptions,
+	type ColumnValues
+} from './query';
 import type {
 	CollegeDBConfig,
 	D1Region,
+	KVStorage,
 	OperationType,
 	PreparedStatement,
 	QueryResult,
@@ -331,6 +343,38 @@ export function resetConfig(): void {
 	globalMapper = null;
 	shardSizeCache.clear();
 	generatedInsertRoundRobinIndex = 0;
+	ensuredSchemaFingerprints.clear();
+}
+
+/**
+ * Reports whether CollegeDB has been initialized in the current context.
+ *
+ * Lets callers drop the ad-hoc `let initialized = false` guard they otherwise
+ * keep alongside a wrapper around {@link initialize}.
+ *
+ * @returns `true` once {@link initialize}/{@link initializeAsync}/{@link initializeFromEnv} has run
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * if (!isInitialized()) {
+ *   initializeFromEnv(env);
+ * }
+ * ```
+ */
+export function isInitialized(): boolean {
+	return globalConfig !== null;
+}
+
+/**
+ * Returns the active configuration, or `null` when not initialized.
+ *
+ * Intended for CollegeDB's own KV-layer helpers (`cached`, `setLookup`, ...)
+ * that need the configured KV store without throwing.
+ *
+ * @internal
+ */
+export function getActiveConfig(): CollegeDBConfig | null {
+	return globalConfig;
 }
 
 /**
@@ -1844,6 +1888,12 @@ export interface GlobalAllShardsOptions<T = Record<string, unknown>> {
 	comparator?: (left: T, right: T) => number;
 	/** Optional global row filter applied before sort/paginate. */
 	filter?: (row: T) => boolean;
+	/**
+	 * When `true`, record the total number of rows that matched (after `filter`,
+	 * before `offset`/`limit`) on `meta.total`. Useful for paginated UIs.
+	 * @since 1.2.4
+	 */
+	includeTotal?: boolean;
 }
 
 function normalizeBatchSize(batchSize: number | undefined, defaultValue: number = 50): number {
@@ -1976,12 +2026,14 @@ export async function allAllShardsGlobal<T = Record<string, unknown>>(
 		});
 	}
 
+	const total = rows.length;
 	const end = limit === undefined ? undefined : offset + limit;
 	const pagedRows = rows.slice(offset, end);
 
 	return {
 		...merged,
-		results: pagedRows
+		results: pagedRows,
+		meta: options.includeTotal ? { ...merged.meta, total } : merged.meta
 	};
 }
 
@@ -2561,4 +2613,606 @@ export async function getDatabaseSizesAllShards(batchSize: number = 50): Promise
 export async function getTotalDatabaseSize(batchSize: number = 50): Promise<number> {
 	const sizes = await getDatabaseSizesAllShards(batchSize);
 	return sizes.reduce((sum, result) => sum + (result.size ?? 0), 0);
+}
+
+/**
+ * Reads the first matching row via key routing, falling back to a global
+ * all-shards scan when the routed read misses.
+ *
+ * The routed read stays the fast path. The fallback exists for the window
+ * where a primary-key -> shard mapping has not been created yet (a brand-new
+ * key, an eventually-consistent KV, or a row written directly to a shard), so
+ * a single lookup still resolves without the caller wiring their own fanout.
+ *
+ * @template T - Type of the result record
+ * @param key - Primary key used for routing the fast-path read
+ * @param sql - SQL statement to execute
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @returns The first matching row, or `null` when neither path finds one
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * const user = await firstResilient<User>('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+ * ```
+ */
+export async function firstResilient<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<T | null> {
+	const routed = await first<T>(key, sql, bindings);
+	if (routed) {
+		return routed;
+	}
+
+	return (await firstAllShardsGlobal<T>(sql, bindings)) ?? null;
+}
+
+/**
+ * Options for {@link paginate}.
+ * @since 1.2.4
+ */
+export interface PaginateOptions<T = Record<string, unknown>> extends Omit<GlobalAllShardsOptions<T>, 'offset' | 'includeTotal'> {
+	/** 1-based page number (default: 1) */
+	page?: number;
+}
+
+/**
+ * A page of rows plus the metadata needed to render pagination controls.
+ * @since 1.2.4
+ */
+export interface PaginatedResult<T = Record<string, unknown>> {
+	/** Rows for the requested page */
+	results: T[];
+	/** Total rows across all shards that matched (after `filter`, before paging) */
+	total: number;
+	/** The 1-based page number that was returned */
+	page: number;
+	/** The page size that was applied */
+	limit: number;
+	/** Total number of pages for `total`/`limit` */
+	pages: number;
+}
+
+/**
+ * Runs a query across all shards and returns a single page plus the total
+ * match count.
+ *
+ * `allAllShardsGlobal` already merges, filters, sorts, and slices across shards
+ * but discards the pre-slice count. `paginate` keeps that count so list
+ * endpoints can return `{ results, total, page, limit, pages }` for a UI in one
+ * call instead of issuing a second COUNT query.
+ *
+ * @template T - Type of the result records
+ * @param sql - SQL statement to execute on each shard
+ * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Sort/filter options plus `page` and `limit`
+ * @returns The requested page and pagination metadata
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * const { results, total, pages } = await paginate<User>(
+ *   'SELECT * FROM users WHERE username LIKE ?',
+ *   ['%ada%'],
+ *   { page: 2, limit: 25, sortBy: 'created_at', sortDirection: 'desc' }
+ * );
+ * ```
+ */
+export async function paginate<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: PaginateOptions<T> = {}
+): Promise<PaginatedResult<T>> {
+	const limit = normalizeLimit(options.limit) ?? 20;
+	const page = Math.max(1, Math.floor(options.page ?? 1));
+	const offset = (page - 1) * limit;
+
+	const merged = await allAllShardsGlobal<T>(sql, bindings, {
+		...options,
+		offset,
+		limit,
+		includeTotal: true
+	});
+
+	const total = Number(merged.meta.total ?? merged.results.length);
+	const pages = limit > 0 ? Math.ceil(total / limit) : 0;
+
+	return {
+		results: merged.results,
+		total: Number.isFinite(total) ? total : merged.results.length,
+		page,
+		limit,
+		pages
+	};
+}
+
+/**
+ * Options for {@link nextId}.
+ * @since 1.2.4
+ */
+export interface NextIdOptions {
+	/** Primary-key column to scan for the current maximum (default: `id`) */
+	column?: string;
+	/** Lower bound applied to the returned id (never returns below `min`) */
+	min?: number;
+}
+
+/**
+ * Computes the greatest numeric value of `column` across every shard for a table.
+ * @private
+ */
+async function maxColumnAcrossShards(table: string, column: string): Promise<number> {
+	const quotedTable = quoteIdentifier(table);
+	const quotedColumn = quoteIdentifier(column);
+	const rows = await firstAllShards<{ max_value: number | string | null }>(`SELECT MAX(${quotedColumn}) AS max_value FROM ${quotedTable}`);
+
+	let max = 0;
+	for (const row of rows) {
+		const value = Number(row?.max_value ?? 0);
+		if (Number.isFinite(value) && value > max) {
+			max = value;
+		}
+	}
+
+	return max;
+}
+
+/**
+ * Generates the next monotonic integer id for a sharded table.
+ *
+ * This replaces the common but broken `SELECT COALESCE(MAX(id), 0) + 1` on a
+ * single shard: because rows for a generated id land on the shard the *new* id
+ * hashes to, a per-shard MAX never sees rows on the other shards and hands out
+ * colliding ids. `nextId` reads `MAX(column)` across *all* shards, then:
+ *
+ * - If a coordinator is configured, it calls the Durable Object's atomic
+ *   sequence (seeded by that cross-shard max), which is race-free across
+ *   concurrent callers and isolates. **Recommended for production writes.**
+ * - Otherwise it returns `max + 1`. This is cross-shard-correct but not
+ *   concurrency-safe on its own; pair it with a unique constraint or a
+ *   coordinator when multiple writers race.
+ *
+ * @param table - Table whose id sequence is being advanced
+ * @param options - Column override and lower bound
+ * @returns The next id to use for an insert
+ * @throws {CollegeDBError} If CollegeDB is not initialized
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * const id = await nextId('tickets');
+ * await insertInto(String(id), 'tickets', { id, title, created_at: nowSeconds });
+ * ```
+ */
+export async function nextId(table: string, options: NextIdOptions = {}): Promise<number> {
+	const config = getConfig();
+	const column = options.column ?? 'id';
+	const base = await maxColumnAcrossShards(table, column);
+	const floor = Math.max(base + 1, Math.floor(options.min ?? 0));
+
+	if (config.coordinator) {
+		try {
+			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinator = config.coordinator.get(coordinatorId);
+			const response = await coordinator.fetch('http://coordinator/sequence', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name: table, min: floor })
+			});
+
+			if (response.ok) {
+				const result = (await response.json()) as { value: number };
+				if (typeof result.value === 'number' && Number.isFinite(result.value)) {
+					return result.value;
+				}
+			}
+		} catch (error) {
+			console.warn('Coordinator sequence allocation failed, falling back to cross-shard MAX:', error);
+		}
+	}
+
+	return floor;
+}
+
+/**
+ * Options for {@link ensureSchema}.
+ * @since 1.2.4
+ */
+export interface EnsureSchemaOptions {
+	/**
+	 * Skip re-running when the same schema has already been applied to the same
+	 * set of shards in this process. DDL is idempotent (`IF NOT EXISTS`), so
+	 * this is a latency optimization, not a correctness gate.
+	 */
+	once?: boolean;
+	/**
+	 * KV key holding an applied-schema version marker. When the stored value
+	 * equals `version`, schema creation is skipped entirely; otherwise the
+	 * schema runs and the marker is written. Persists across processes.
+	 */
+	versionKey?: string;
+	/** Version value paired with `versionKey` (default: `'1'`) */
+	version?: string;
+}
+
+/** In-process record of schema fingerprints already applied (for `once`). */
+const ensuredSchemaFingerprints = new Set<string>();
+
+/**
+ * Creates schema across every configured shard, idempotently.
+ *
+ * Wraps {@link createSchemaAcrossShards} with the two guards consumers keep
+ * rebuilding: an in-process `once` flag and a KV-backed `versionKey` gate. Pass
+ * either a single schema string (statements separated by `;`) or an array of
+ * statements.
+ *
+ * @param schema - Schema SQL string, or an array of statements
+ * @param options - Idempotency guards (`once`, `versionKey`/`version`)
+ * @returns Promise that resolves when schema is ensured on all shards
+ * @throws {CollegeDBError} If CollegeDB is not initialized or a statement fails
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await ensureSchema(
+ *   [
+ *     'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL)',
+ *     'CREATE INDEX IF NOT EXISTS idx_users_name ON users (name)'
+ *   ],
+ *   { versionKey: 'schema:version', version: '3' }
+ * );
+ * ```
+ */
+export async function ensureSchema(schema: string | string[], options: EnsureSchemaOptions = {}): Promise<void> {
+	const config = getConfig();
+	const schemaSql = Array.isArray(schema) ? schema.join(';\n') : schema;
+
+	if (options.versionKey) {
+		const version = options.version ?? '1';
+		try {
+			const existing = await config.kv.get(options.versionKey, 'text');
+			if (existing === version) {
+				return;
+			}
+		} catch {
+			// fall through and (re)apply schema when the version marker is unreadable
+		}
+
+		await createSchemaAcrossShards(config.shards, schemaSql);
+
+		try {
+			await config.kv.put(options.versionKey, version);
+		} catch (error) {
+			console.warn('Failed to persist schema version marker:', error);
+		}
+		return;
+	}
+
+	if (options.once) {
+		const fingerprint = `${Object.keys(config.shards).sort().join(',')}::${schemaSql}`;
+		if (ensuredSchemaFingerprints.has(fingerprint)) {
+			return;
+		}
+		await createSchemaAcrossShards(config.shards, schemaSql);
+		ensuredSchemaFingerprints.add(fingerprint);
+		return;
+	}
+
+	await createSchemaAcrossShards(config.shards, schemaSql);
+}
+
+/**
+ * Options for {@link initializeFromEnv}.
+ * @since 1.2.4
+ */
+export interface InitializeFromEnvOptions extends Partial<Omit<CollegeDBConfig, 'kv' | 'shards'>> {
+	/** Explicit KV store; when omitted, `env.KV` is detected and wrapped */
+	kv?: KVStorage;
+	/** Drizzle `sql` tag, forwarded to {@link toProvider} for Drizzle bindings */
+	sql?: DrizzleSqlTagLike;
+	/** Binding-name prefixes that identify shards (default: `['DB_', 'DB-', 'db-']`) */
+	shardPrefixes?: string[];
+	/** Binding names to never treat as a shard */
+	reserved?: string[];
+	/** Explicit primary binding; defaults to `env.DB` when present */
+	primary?: unknown;
+	/** Shard name to register the primary binding under (default: `'db-primary'`) */
+	primaryName?: string;
+}
+
+const DEFAULT_SHARD_PREFIXES = ['DB_', 'DB-', 'db-'];
+const DEFAULT_RESERVED_BINDINGS = ['KV', 'CACHE', 'EMAIL', 'ShardCoordinator', 'HYPERDRIVE', 'ASSETS', 'DB'];
+
+/**
+ * Initializes CollegeDB by discovering shard bindings from a Workers `env`.
+ *
+ * On Cloudflare, D1 bindings live on `env` under conventional names
+ * (`DB_EAST`, `DB_WEST`, ...). This scans `env` for those, resolves each with
+ * {@link toProvider} (D1 / Drizzle / SQLite), wires the KV store (raw Workers
+ * KV is auto-wrapped via {@link createWorkersKVProvider}), and calls
+ * {@link initialize}. It removes the ~40-line hand-rolled wiring most Worker
+ * apps otherwise write.
+ *
+ * Shard names are the binding name lowercased with `_` replaced by `-`
+ * (`DB_EAST` -> `db-east`).
+ *
+ * @param env - The Worker environment bindings
+ * @param options - KV/coordinator overrides, discovery prefixes, strategy, etc.
+ * @returns The list of shard names that were registered
+ * @throws {CollegeDBError} If no KV binding or no shard bindings can be resolved
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * import { sql } from 'drizzle-orm';
+ *
+ * export default {
+ *   async fetch(request, env) {
+ *     if (!isInitialized()) {
+ *       initializeFromEnv(env, { sql, strategy: { read: 'location', write: 'hash' } });
+ *     }
+ *     // ... routed queries
+ *   }
+ * };
+ * ```
+ */
+export function initializeFromEnv(env: Record<string, unknown>, options: InitializeFromEnvOptions = {}): string[] {
+	const { kv: kvOption, sql, shardPrefixes, reserved, primary, primaryName, ...configRest } = options;
+
+	const prefixes = shardPrefixes ?? DEFAULT_SHARD_PREFIXES;
+	const reservedNames = new Set(reserved ?? DEFAULT_RESERVED_BINDINGS);
+
+	let kv = kvOption;
+	if (!kv) {
+		const envKv = env?.KV;
+		if (envKv) {
+			kv = isKVStorage(envKv) ? envKv : createWorkersKVProvider(envKv as any);
+		}
+	}
+	if (!kv) {
+		throw new CollegeDBError('No KV binding found; pass options.kv or set env.KV', 'NO_KV');
+	}
+
+	const shards: Record<string, SQLDatabase> = {};
+
+	const primaryBinding = primary ?? env?.DB;
+	if (primaryBinding) {
+		const provider = toProvider(primaryBinding, { sql });
+		if (provider) {
+			shards[primaryName ?? 'db-primary'] = provider;
+		}
+	}
+
+	for (const key of Object.keys(env ?? {})) {
+		if (!key || reservedNames.has(key)) {
+			continue;
+		}
+		if (!prefixes.some((prefix) => key.startsWith(prefix))) {
+			continue;
+		}
+
+		const binding = env[key];
+		if (!binding) {
+			continue;
+		}
+
+		const provider = toProvider(binding, { sql });
+		if (!provider) {
+			console.warn(`Binding ${key} is not a recognized SQL provider; skipping`);
+			continue;
+		}
+
+		shards[key.toLowerCase().replace(/_/g, '-')] = provider;
+	}
+
+	if (Object.keys(shards).length === 0) {
+		throw new CollegeDBError('No shard bindings found in env', 'NO_SHARDS');
+	}
+
+	const config: CollegeDBConfig = { ...configRest, kv, shards };
+	if (!config.coordinator && env?.ShardCoordinator) {
+		config.coordinator = env.ShardCoordinator as CollegeDBConfig['coordinator'];
+	}
+
+	initialize(config);
+	return Object.keys(shards);
+}
+
+/**
+ * Options shared by the object CRUD helpers that support a `RETURNING` clause.
+ */
+export interface CrudReturningOptions {
+	/** Append a `RETURNING` clause; `true` returns `*`, or pass explicit columns */
+	returning?: boolean | string | string[];
+}
+
+/**
+ * Options for the id-scoped convenience helpers ({@link patch}, {@link deleteById}).
+ */
+export interface IdColumnOptions extends CrudReturningOptions {
+	/** Primary-key column name (default: `id`) */
+	idColumn?: string;
+}
+
+/**
+ * Inserts a row built from a plain object, routed to `key`'s shard.
+ *
+ * @template T - Type of returned rows when `RETURNING` is used
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param values - Column to value map for the new row
+ * @param options - Insert modifiers (`orReplace`/`orIgnore`, `returning`)
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await insertInto('user-123', 'users', {
+ *   id: 'user-123',
+ *   username: 'ada',
+ *   created_at: Math.floor(Date.now() / 1000)
+ * });
+ * ```
+ */
+export async function insertInto<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	values: ColumnValues,
+	options: BuildInsertOptions = {}
+): Promise<QueryResult<T>> {
+	const { sql, bindings } = buildInsert(table, values, options);
+	return await run<T>(key, sql, bindings);
+}
+
+/**
+ * Inserts a row, then reads it back and returns it.
+ *
+ * Folds the ubiquitous "insert then immediately SELECT the row" pattern into a
+ * single call. The row is re-read on the same shard using the routing `key`,
+ * matched by `idColumn` (defaulting to the value at `values[idColumn]`, else
+ * `key`).
+ *
+ * @template T - Type of the returned row
+ * @param key - Primary key used for shard routing and re-read
+ * @param table - Target table name
+ * @param values - Column to value map for the new row
+ * @param options - Insert modifiers plus the `idColumn` used to re-read (default `id`)
+ * @returns The created row, or `null` if it could not be read back
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * const created = await insertReturning('user-123', 'users', { id: 'user-123', username: 'ada' });
+ * ```
+ */
+export async function insertReturning<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	values: ColumnValues,
+	options: BuildInsertOptions & { idColumn?: string } = {}
+): Promise<T | null> {
+	const idColumn = options.idColumn ?? 'id';
+	await insertInto(key, table, values, options);
+
+	const idValue = values[idColumn] ?? key;
+	return await first<T>(key, `SELECT * FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(idColumn)} = ?`, [idValue]);
+}
+
+/**
+ * Updates rows built from a changes object, scoped by a WHERE map.
+ *
+ * @template T - Type of returned rows when `RETURNING` is used
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param values - Column to value map of changes to apply
+ * @param where - Column to value equality conditions (required; empty throws)
+ * @param options - Update modifiers (`returning`)
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await updateRow('user-123', 'users', { username: 'ada2' }, { id: 'user-123' });
+ * ```
+ */
+export async function updateRow<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	values: ColumnValues,
+	where: ColumnValues,
+	options: CrudReturningOptions = {}
+): Promise<QueryResult<T>> {
+	const { sql, bindings } = buildUpdate(table, values, where, options);
+	return await run<T>(key, sql, bindings);
+}
+
+/**
+ * Convenience wrapper over {@link updateRow} that scopes the update to a single
+ * id (`WHERE idColumn = id`).
+ *
+ * @template T - Type of returned rows when `RETURNING` is used
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param id - Primary-key value to match
+ * @param values - Column to value map of changes to apply
+ * @param options - `idColumn` (default `id`) and `returning`
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await patch('42', 'tickets', 42, { status: 'closed', priority: 'high' });
+ * ```
+ */
+export async function patch<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	id: string | number,
+	values: ColumnValues,
+	options: IdColumnOptions = {}
+): Promise<QueryResult<T>> {
+	const idColumn = options.idColumn ?? 'id';
+	return await updateRow<T>(key, table, values, { [idColumn]: id }, { returning: options.returning });
+}
+
+/**
+ * Deletes rows scoped by a WHERE map.
+ *
+ * @template T - Type of returned rows
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param where - Column to value equality conditions (required; empty throws)
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await deleteRow('user-123', 'sessions', { user_id: 'user-123' });
+ * ```
+ */
+export async function deleteRow<T = Record<string, unknown>>(key: string, table: string, where: ColumnValues): Promise<QueryResult<T>> {
+	const { sql, bindings } = buildDelete(table, where);
+	return await run<T>(key, sql, bindings);
+}
+
+/**
+ * Convenience wrapper over {@link deleteRow} that deletes a single id
+ * (`WHERE idColumn = id`).
+ *
+ * @template T - Type of returned rows
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param id - Primary-key value to match
+ * @param options - `idColumn` (default `id`)
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await deleteById('user-123', 'users', 'user-123');
+ * ```
+ */
+export async function deleteById<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	id: string | number,
+	options: { idColumn?: string } = {}
+): Promise<QueryResult<T>> {
+	const idColumn = options.idColumn ?? 'id';
+	return await deleteRow<T>(key, table, { [idColumn]: id });
+}
+
+/**
+ * Inserts a row, or updates the conflicting columns when a unique/primary key
+ * already exists (`INSERT ... ON CONFLICT ... DO UPDATE`).
+ *
+ * @template T - Type of returned rows when `RETURNING` is used
+ * @param key - Primary key used for shard routing
+ * @param table - Target table name
+ * @param values - Column to value map for the row
+ * @param conflictColumns - Column(s) forming the conflict target
+ * @param options - Upsert modifiers (`update` subset, `returning`)
+ * @returns The write result
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await upsert('settings:theme', 'settings', { key: 'theme', value: 'dark' }, 'key');
+ * ```
+ */
+export async function upsert<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	values: ColumnValues,
+	conflictColumns: string | string[],
+	options: BuildUpsertOptions = {}
+): Promise<QueryResult<T>> {
+	const { sql, bindings } = buildUpsert(table, values, conflictColumns, options);
+	return await run<T>(key, sql, bindings);
 }
