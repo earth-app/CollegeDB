@@ -1,14 +1,35 @@
 {
   "name": "@earth-app/collegedb",
+  "description": "Cloudflare D1 sharding router with KV-backed primary-key mappings and a Durable Object shard coordinator.",
+  "version": "1.2.4",
+  "license": "MIT",
+  "author": "Gregory Mitchell",
+  "type": "module",
   "module": "dist/index.js",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "type": "module",
-  "version": "1.2.4",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": [
     "dist/**/*",
     "README.md",
     "LICENSE"
+  ],
+  "keywords": [
+    "cloudflare",
+    "d1",
+    "sharding",
+    "shard",
+    "kv",
+    "durable-objects",
+    "drizzle",
+    "sqlite",
+    "workers",
+    "database"
   ],
   "publishConfig": {
     "access": "public"
@@ -72,5 +93,13 @@
   },
   "lint-staged": {
     "*.{js,ts,css,md,json,yml,jsonc}": "prettier --write"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earth-app/CollegeDB.git"
+  },
+  "bugs": {
+    "url": "https://github.com/earth-app/CollegeDB/issues"
+  },
+  "homepage": "https://github.com/earth-app/CollegeDB#readme"
 }
