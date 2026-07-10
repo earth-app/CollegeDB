@@ -156,6 +156,8 @@ export class ShardCoordinator {
 					return this.handleUpdateStats(request);
 				case 'POST /allocate':
 					return this.handleAllocateShard(request);
+				case 'POST /sequence':
+					return this.handleSequence(request);
 				case 'POST /flush':
 					return this.handleFlush();
 				case 'GET /health':
@@ -365,6 +367,47 @@ export class ShardCoordinator {
 		}
 
 		return new Response(JSON.stringify({ shard: selectedShard }), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
+	/**
+	 * Atomically returns the next value for a named monotonic sequence.
+	 *
+	 * Because a Durable Object serializes all requests to a single instance,
+	 * the read-increment-write cycle here is race-free across concurrent
+	 * callers and isolates. Callers may pass a `min` floor (typically derived
+	 * from the current cross-shard `MAX(id)`) so a freshly created coordinator
+	 * still respects rows that already exist in the shards; the returned value
+	 * is `max(storedCounter + 1, min)`.
+	 *
+	 * @private
+	 * @param request - HTTP request containing the sequence name and optional floor
+	 * @returns Promise resolving to HTTP response with the allocated value
+	 * @example Request body: `{"name": "tickets", "min": 42}`
+	 * @example Response body: `{"value": 42}`
+	 */
+	private async handleSequence(request: Request): Promise<Response> {
+		const { name, min } = (await request.json()) as { name: string; min?: number };
+
+		if (!name || typeof name !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid name parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		const state = await this.getState();
+		const sequences = state.sequences ?? {};
+		const current = sequences[name] ?? 0;
+		const floor = typeof min === 'number' && Number.isFinite(min) ? Math.floor(min) : 0;
+		const next = Math.max(current + 1, floor);
+
+		sequences[name] = next;
+		state.sequences = sequences;
+		await this.saveState(state);
+
+		return new Response(JSON.stringify({ value: next }), {
 			headers: { 'Content-Type': 'application/json' }
 		});
 	}
