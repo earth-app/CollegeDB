@@ -45,10 +45,10 @@
     "prepare": "husky install"
   },
   "devDependencies": {
-    "@babel/cli": "^7.29.7",
-    "@babel/core": "^7.29.7",
-    "@babel/preset-env": "^7.29.7",
-    "@babel/preset-typescript": "^7.29.7",
+    "@babel/cli": "^8.0.0",
+    "@babel/core": "^8.0.0",
+    "@babel/preset-env": "^8.0.0",
+    "@babel/preset-typescript": "^8.0.0",
     "@cloudflare/workers-types": "^4.20260702.1",
     "@types/bun": "latest",
     "@types/pg": "^8.20.0",
