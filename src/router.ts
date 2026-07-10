@@ -3216,3 +3216,88 @@ export async function upsert<T = Record<string, unknown>>(
 	const { sql, bindings } = buildUpsert(table, values, conflictColumns, options);
 	return await run<T>(key, sql, bindings);
 }
+
+const DEFAULT_LOOKUP_NAMESPACE = 'collegedb:lookup:';
+
+/**
+ * Options for the lookup helpers.
+ */
+export interface LookupOptions {
+	/** KV store override; defaults to the store passed to {@link initialize} */
+	kv?: KVStorage;
+	/** Key namespace prefix (default: `collegedb:lookup:`) */
+	namespace?: string;
+}
+
+/**
+ * Resolves the KV store to use, preferring an explicit override.
+ * @private
+ */
+function resolveKV(explicit?: KVStorage): KVStorage {
+	const kv = explicit ?? getActiveConfig()?.kv;
+	if (!kv) {
+		throw new CollegeDBError('CollegeDB not initialized. Call initialize() first or pass options.kv.', 'NOT_INITIALIZED');
+	}
+	return kv;
+}
+
+/**
+ * Builds the namespaced KV key for a lookup entry.
+ * @private
+ */
+function lookupKey(key: string, namespace?: string): string {
+	return `${namespace ?? DEFAULT_LOOKUP_NAMESPACE}${key}`;
+}
+
+/**
+ * Stores (or overwrites) a secondary-index value.
+ *
+ * @param key - Secondary identifier (e.g. an email hash or slug)
+ * @param value - Value to associate (e.g. a primary id)
+ * @param options - Namespace and KV override
+ * @throws {CollegeDBError} If no KV store is available
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await setLookup(emailHash, String(customerId));
+ * ```
+ */
+export async function setLookup(key: string, value: string, options: LookupOptions = {}): Promise<void> {
+	const kv = resolveKV(options.kv);
+	await kv.put(lookupKey(key, options.namespace), value);
+}
+
+/**
+ * Reads a secondary-index value.
+ *
+ * @param key - Secondary identifier
+ * @param options - Namespace and KV override
+ * @returns The stored value, or `null` if absent
+ * @throws {CollegeDBError} If no KV store is available
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * const customerId = await getLookup(emailHash);
+ * ```
+ */
+export async function getLookup(key: string, options: LookupOptions = {}): Promise<string | null> {
+	const kv = resolveKV(options.kv);
+	return await kv.get(lookupKey(key, options.namespace), 'text');
+}
+
+/**
+ * Deletes a secondary-index value.
+ *
+ * @param key - Secondary identifier
+ * @param options - Namespace and KV override
+ * @throws {CollegeDBError} If no KV store is available
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * await deleteLookup(oldEmailHash);
+ * ```
+ */
+export async function deleteLookup(key: string, options: LookupOptions = {}): Promise<void> {
+	const kv = resolveKV(options.kv);
+	await kv.delete(lookupKey(key, options.namespace));
+}
