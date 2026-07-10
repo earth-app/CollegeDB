@@ -334,4 +334,10 @@ export interface ShardCoordinatorState {
 	targetRegion?: D1Region;
 	/** Geographic locations of each shard */
 	shardLocations?: Record<string, ShardLocation>;
+	/**
+	 * Monotonic named sequence counters used for cross-shard id generation.
+	 * Keyed by sequence name (typically a table name).
+	 * @since 1.2.4
+	 */
+	sequences?: Record<string, number>;
 }
