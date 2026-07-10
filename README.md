@@ -70,9 +70,12 @@ This allows you to:
 ## Features
 
 - Automatic query routing (primary key to shard mapping)
-- Provider adapters for Redis/Valkey/NuxtHub KV plus PostgreSQL/MySQL/SQLite SQL
+- Provider adapters for Redis/Valkey/NuxtHub/Workers KV plus PostgreSQL/MySQL/SQLite SQL
 - Drizzle interop through existing SQL providers (`createPostgreSQLProvider`, `createMySQLProvider`, `createSQLiteProvider`)
 - Auto-allocated generated-id inserts via `insert()` and direct-shard inserts via `insertShard()` for AUTOINCREMENT / RETURNING workflows
+- Object-shaped CRUD helpers (`insertInto`, `patch`, `updateRow`, `deleteById`, `upsert`) so you never hand-align columns and bindings
+- Cross-shard-safe id generation (`nextId`), one-call setup from a Worker `env` (`initializeFromEnv`), and pagination with totals (`paginate`)
+- KV read-through cache (`cached` / `invalidate`) and secondary-index lookups (`setLookup` / `getLookup` / `deleteLookup`)
 - Hyperdrive helpers for PostgreSQL and MySQL
 - Multiple allocation strategies: round-robin, random, hash, location-aware, and mixed read/write strategies
 - Durable Object shard coordination and shard statistics
@@ -1006,6 +1009,123 @@ const row = await first(String(created.generatedId), 'SELECT * FROM auto_users W
 
 If your SQL dialect uses `RETURNING`, include it in the insert statement. The helper will use the returned row instead of provider metadata when present.
 
+## Utility Helpers
+
+CollegeDB ships helpers that remove the boilerplate most consumers otherwise rewrite per table. Every helper routes through the same shard map as `run`/`first`, and every generated statement uses positional bindings with validated, quoted identifiers.
+
+### One-Call Setup From a Worker `env`
+
+`initializeFromEnv` discovers D1 bindings on `env` (any name matching `DB_`, `DB-`, or `db-`, plus a primary `env.DB`), resolves each with `toProvider` (D1 / Drizzle / SQLite), wires the KV store (raw Workers KV is auto-wrapped), and calls `initialize`. Shard names are the binding name lowercased with `_` replaced by `-` (`DB_EAST` -> `db-east`).
+
+```typescript
+import { initializeFromEnv, isInitialized } from '@earth-app/collegedb';
+import { sql } from 'drizzle-orm';
+
+export default {
+	async fetch(request: Request, env: Env) {
+		if (!isInitialized()) {
+			// Pass `sql` so Drizzle bindings can be wrapped; omit it for raw D1.
+			initializeFromEnv(env, { sql, strategy: { read: 'location', write: 'hash' } });
+		}
+		// ... routed queries
+	}
+};
+```
+
+Lower-level building blocks are exported too:
+
+- `toProvider(binding, { sql? })` - detect and wrap a single binding, or `null` if unrecognized.
+- `createWorkersKVProvider(env.KV)` - adapt a raw Cloudflare Workers `KVNamespace` to CollegeDB's `KVStorage`.
+- `isInitialized()` - replaces the ad-hoc `let initialized = false` guard.
+
+### Object-Shaped CRUD
+
+Build routed statements from plain objects instead of hand-aligned SQL strings:
+
+```typescript
+import { insertInto, insertReturning, patch, updateRow, deleteById, deleteRow, upsert } from '@earth-app/collegedb';
+
+// INSERT INTO "users" ("id", "username", "created_at") VALUES (?, ?, ?)
+await insertInto('user-123', 'users', { id: 'user-123', username: 'ada', created_at: nowSeconds });
+
+// Insert and read the row back in one call
+const created = await insertReturning('user-123', 'users', { id: 'user-123', username: 'ada' });
+
+// Partial UPDATE by id: UPDATE "tickets" SET "status" = ?, "priority" = ? WHERE "id" = ?
+await patch('42', 'tickets', 42, { status: 'closed', priority: 'high' });
+
+// General UPDATE / DELETE scoped by a where map (an empty where throws, never a full-table write)
+await updateRow('user-123', 'users', { username: 'ada2' }, { id: 'user-123' });
+await deleteById('user-123', 'users', 'user-123');
+await deleteRow('user-123', 'sessions', { user_id: 'user-123' });
+
+// INSERT ... ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"
+await upsert('settings:theme', 'settings', { key: 'theme', value: 'dark' }, 'key');
+```
+
+The pure builders (`buildInsert`, `buildUpdate`, `buildDelete`, `buildUpsert`) are exported as well when you want the `{ sql, bindings }` pair without executing it.
+
+### Cross-Shard-Safe Id Generation
+
+`nextId` replaces the common but broken `SELECT COALESCE(MAX(id), 0) + 1` on a single shard. Because a generated id lands on the shard it hashes to, a per-shard `MAX` never sees rows on the other shards and hands out colliding ids. `nextId` reads `MAX` across every shard, then uses the Durable Object's atomic sequence when a coordinator is configured.
+
+```typescript
+import { nextId, insertInto } from '@earth-app/collegedb';
+
+const id = await nextId('tickets'); // atomic when a coordinator is configured
+await insertInto(String(id), 'tickets', { id, title, created_at: nowSeconds });
+```
+
+> With a coordinator the sequence is race-free across concurrent callers and isolates. Without one, `nextId` returns a cross-shard-correct `MAX + 1` that is not concurrency-safe on its own; pair it with a coordinator or a unique constraint when writers race.
+
+### Resilient Reads and Pagination
+
+```typescript
+import { firstResilient, paginate } from '@earth-app/collegedb';
+
+// Routed read, falling back to a global scan when the key->shard mapping has not been created yet
+const user = await firstResilient<User>('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
+
+// One call returns the page plus the total match count for a UI
+const { results, total, page, pages } = await paginate<User>('SELECT * FROM users WHERE username LIKE ?', ['%ada%'], {
+	page: 2,
+	limit: 25,
+	sortBy: 'created_at',
+	sortDirection: 'desc'
+});
+```
+
+### Idempotent Schema Across Shards
+
+`ensureSchema` runs DDL on every configured shard with an in-process `once` guard and an optional KV-backed version gate.
+
+```typescript
+import { ensureSchema } from '@earth-app/collegedb';
+
+await ensureSchema(
+	[
+		'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL)',
+		'CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)'
+	],
+	{ versionKey: 'schema:version', version: '3' }
+);
+```
+
+### KV Cache and Secondary-Index Lookups
+
+`cached` wraps a read with the configured KV store (TTL enforced in-band, so it works on any KV backend); `invalidate` clears a key prefix. `setLookup` / `getLookup` / `deleteLookup` maintain a namespaced secondary index (for example `email hash -> customer id`), distinct from the shard-routing lookup keys used by `firstByLookupKey`.
+
+```typescript
+import { cached, invalidate, setLookup, getLookup, deleteLookup } from '@earth-app/collegedb';
+
+const user = await cached(`user:${id}`, () => loadUser(id), { ttl: 3600 });
+await invalidate('tickets:list:'); // after a write
+
+await setLookup(emailHash, String(customerId));
+const customerId = await getLookup(emailHash);
+await deleteLookup(oldEmailHash);
+```
+
 ## Multi-Key Shard Mappings
 
 CollegeDB supports **multiple lookup keys** for the same record, allowing you to query by username, email, ID, or any unique identifier. Keys are automatically hashed with SHA-256 for security and privacy.
@@ -1078,9 +1198,7 @@ This avoids accidentally creating a new primary-key mapping for secondary identi
 
 const config = {
 	kv: env.KV,
-	shards: {
-		/* ... */
-	},
+	shards: {/* ... */},
 	hashShardMappings: true, // Hashes keys with SHA-256
 	strategy: 'hash'
 };
@@ -1557,6 +1675,7 @@ The `ShardCoordinator` is an optional Durable Object that provides centralized s
 | `/stats`    | POST   | Update shard statistics            | `{"shard": "db-east", "count": 1600}`            | `{"success": true}`                    |
 | `/allocate` | POST   | Allocate shard for primary key     | `{"primaryKey": "user-123"}`                     | `{"shard": "db-west"}`                 |
 | `/allocate` | POST   | Allocate with specific strategy    | `{"primaryKey": "user-123", "strategy": "hash"}` | `{"shard": "db-west"}`                 |
+| `/sequence` | POST   | Allocate next atomic sequence id   | `{"name": "tickets", "min": 42}`                 | `{"value": 42}`                        |
 | `/flush`    | POST   | Clear all state (development only) | None                                             | `{"success": true}`                    |
 | `/health`   | GET    | Health check                       | None                                             | `"OK"`                                 |
 
@@ -1645,9 +1764,7 @@ type OperationType = 'read' | 'write';
 const singleStrategyConfig: CollegeDBConfig = {
 	kv: env.KV,
 	strategy: 'hash', // All operations use hash strategy
-	shards: {
-		/* ... */
-	}
+	shards: {/* ... */}
 };
 
 // Mixed strategy configuration (new feature)
@@ -1658,12 +1775,8 @@ const mixedStrategyConfig: CollegeDBConfig = {
 		write: 'location' // Optimal data placement
 	},
 	targetRegion: 'wnam',
-	shardLocations: {
-		/* ... */
-	},
-	shards: {
-		/* ... */
-	}
+	shardLocations: {/* ... */},
+	shards: {/* ... */}
 };
 ```
 
