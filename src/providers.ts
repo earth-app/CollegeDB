@@ -523,6 +523,148 @@ export function isKVStorage(value: unknown): value is KVStorage {
 	return typeof kv.get === 'function' && typeof kv.put === 'function' && typeof kv.delete === 'function' && typeof kv.list === 'function';
 }
 
+/**
+ * Options for {@link toProvider}.
+ */
+export interface ToProviderOptions {
+	/**
+	 * Drizzle `sql` tag from `drizzle-orm`. Required to wrap a raw Drizzle
+	 * client (one exposing `run`/`all`/`get`/`execute`) into a shard provider.
+	 */
+	sql?: DrizzleSqlTagLike;
+}
+
+/**
+ * Minimal raw Cloudflare Workers `KVNamespace` shape consumed by
+ * {@link createWorkersKVProvider}. Declared structurally so the library keeps
+ * zero runtime dependency on `@cloudflare/workers-types`.
+ */
+export interface WorkersKVNamespaceLike {
+	get(key: string, type?: 'text'): Promise<string | null>;
+	put(key: string, value: string, options?: { expirationTtl?: number; expiration?: number; metadata?: unknown }): Promise<void>;
+	delete(key: string): Promise<void>;
+	list(options?: {
+		prefix?: string;
+		cursor?: string;
+		limit?: number;
+	}): Promise<{ keys: Array<{ name: string; expiration?: number; metadata?: unknown }>; list_complete?: boolean; cursor?: string }>;
+}
+
+/**
+ * Detects the right CollegeDB shard provider for an arbitrary binding.
+ *
+ * This removes the per-app "is this a D1 binding, a Drizzle client, or a raw
+ * SQLite client?" wiring that every consumer otherwise rewrites. Resolution
+ * order:
+ *
+ * 1. A raw Drizzle client (`run`/`all`/`get`/`execute`) is wrapped with
+ *    {@link createDrizzleSQLProvider} when `options.sql` is supplied.
+ * 2. A value already implementing the {@link SQLDatabase} contract (a D1
+ *    binding, or a provider from any `create*Provider`) is returned as-is.
+ * 3. A client exposing `prepare(sql)` is wrapped with
+ *    {@link createSQLiteProvider}.
+ * 4. Anything else returns `null` (unrecognized).
+ *
+ * @param binding - Candidate database binding
+ * @param options - Resolution options (Drizzle `sql` tag)
+ * @returns A shard provider, or `null` when the binding is not recognized
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * import { sql } from 'drizzle-orm';
+ * const provider = toProvider(env.DB_EAST, { sql });
+ * if (!provider) throw new Error('Unrecognized database binding');
+ * ```
+ */
+export function toProvider(binding: unknown, options: ToProviderOptions = {}): SQLDatabase | null {
+	if (!binding || typeof binding !== 'object') {
+		return null;
+	}
+
+	const candidate = binding as DrizzleClientLike & { prepare?: unknown };
+	const looksDrizzle =
+		typeof candidate.run === 'function' ||
+		typeof candidate.all === 'function' ||
+		typeof candidate.get === 'function' ||
+		typeof candidate.execute === 'function';
+
+	if (looksDrizzle && options.sql) {
+		return createDrizzleSQLProvider(candidate, options.sql);
+	}
+
+	if (isSQLDatabase(binding)) {
+		return binding;
+	}
+
+	if (typeof candidate.prepare === 'function') {
+		return createSQLiteProvider(binding as SQLiteClientLike);
+	}
+
+	return null;
+}
+
+/**
+ * Wraps a raw Cloudflare Workers `KVNamespace` in CollegeDB's
+ * {@link KVStorage} contract.
+ *
+ * Use this when your KV binding is the native Workers `KVNamespace` (from
+ * `env.KV`) rather than a NuxtHub/Unstorage-style client (see
+ * {@link createNuxtHubKVProvider} for that). The adapter maps `get`/`put`/
+ * `delete`/`list` directly and preserves the paginated `list` cursor.
+ *
+ * @param kv - Raw Workers KV namespace
+ * @returns KVStorage-compatible adapter
+ * @since 1.2.4
+ * @example
+ * ```typescript
+ * initialize({
+ *   kv: createWorkersKVProvider(env.KV),
+ *   shards: { 'db-east': env.DB_EAST },
+ *   strategy: 'hash'
+ * });
+ * ```
+ */
+export function createWorkersKVProvider(kv: WorkersKVNamespaceLike): KVStorage {
+	return {
+		async get<T = unknown>(key: string, type: 'text' | 'json' = 'text'): Promise<T | string | null> {
+			const raw = await kv.get(key, 'text');
+			if (raw === null || raw === undefined) {
+				return null;
+			}
+
+			if (type === 'json') {
+				try {
+					return JSON.parse(raw) as T;
+				} catch (error) {
+					throw new CollegeDBError(
+						`Failed to parse JSON from Workers KV for key ${key}: ${error instanceof Error ? error.message : String(error)}`,
+						'KV_JSON_PARSE_FAILED'
+					);
+				}
+			}
+
+			return raw;
+		},
+
+		async put(key: string, value: string): Promise<void> {
+			await kv.put(key, value);
+		},
+
+		async delete(key: string): Promise<void> {
+			await kv.delete(key);
+		},
+
+		async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<KVListResult> {
+			const result = await kv.list(options);
+			return {
+				keys: result.keys.map((item) => ({ name: item.name, expiration: item.expiration, metadata: item.metadata })),
+				list_complete: result.list_complete ?? true,
+				cursor: result.cursor
+			};
+		}
+	};
+}
+
 class PostgresPreparedStatement implements PreparedStatement {
 	private readonly client: PostgresClientLike;
 	private readonly sql: string;
