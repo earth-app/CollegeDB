@@ -6,41 +6,57 @@ on:
       changelog:
         type: string
         description: 'Changelog to replace the auto-generated one'
+      suffix:
+        type: string
+        description: 'Suffix to append to the version'
+        default: ''
+      skip_publish:
+        type: boolean
+        description: 'Skip publishing to NPM'
+        default: false
 
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
 
     permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade NPM
+        run: npm install -g npm@latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun run test
+      - name: Build
+        run: bun run build
+      - name: Publish to NPM
+        if: ${{ !inputs.skip_publish }}
+        run: npm publish --provenance --access public
+
+  release:
+    runs-on: ubuntu-latest
+    needs: publish
+
+    permissions:
       contents: write
-      packages: write
 
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - name: Install Dependencies
-        run: |
-          bun install --global husky
-          bun install --frozen-lockfile
-      - name: Verify Tests
-        run: bun run test --coverage
-      - name: Build Project
-        run: bun run build
-      - name: Publish to NPM
-        if: success() || failure()
-        run: bun publish --registry https://registry.npmjs.org
-        env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish to GitHub Packages
-        if: success() || failure()
-        run: bun publish --registry https://npm.pkg.github.com
-        env:
-          NPM_CONFIG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract Version from package.json
         run: |
           VERSION=$(node -p "require('./package.json').version")
@@ -54,15 +70,15 @@ jobs:
         id: changelog
         uses: mikepenz/release-changelog-builder-action@v6
         with:
-          configuration: ".github/release.json"
-          mode: "HYBRID"
-          fromTag: "${{ env.LATEST_TAG }}"
-          toTag: "master"
+          configuration: '.github/release.json'
+          mode: 'HYBRID'
+          fromTag: '${{ env.LATEST_TAG }}'
+          toTag: '${{ github.ref_name }}'
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ env.VERSION }}
-          name: CollegeDB v${{ env.VERSION }}
+          tag_name: v${{ env.VERSION }}${{ github.event.inputs.suffix }}
+          name: CollegeDB v${{ env.VERSION }}${{ github.event.inputs.suffix }}
           body: ${{ steps.changelog.outputs.changelog || github.event.inputs.changelog }}
           draft: false
           prerelease: false
