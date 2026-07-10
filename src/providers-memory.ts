@@ -1526,6 +1526,7 @@ export class InMemorySQLDatabase implements SQLDatabase {
 		const explicitColumns = extractInsertColumns(sql);
 		const isOrReplace = /\binsert\s+or\s+replace\b/i.test(sql);
 		const isOrIgnore = /\binsert\s+or\s+(?:ignore|abort|fail|rollback)\b/i.test(sql);
+		const onConflict = parseOnConflict(sql);
 
 		const valuesSegments = extractInsertValues(sql);
 		const insertedRows: Record<string, unknown>[] = [];
@@ -1606,6 +1607,26 @@ export class InMemorySQLDatabase implements SQLDatabase {
 			}
 
 			const key = String(primaryKeyValue);
+
+			if (onConflict) {
+				const conflictRow =
+					onConflict.columns.length > 0
+						? Array.from(table.values()).find((existing) =>
+								onConflict.columns.every((column) => sqlValuesEqual(existing[column], record[column]))
+							)
+						: table.get(key);
+
+				if (conflictRow) {
+					if (onConflict.action === 'update') {
+						for (const assignment of onConflict.assignments) {
+							conflictRow[assignment.column] = resolveConflictAssignmentValue(assignment.expression, record, conflictRow);
+						}
+						insertedRows.push(conflictRow);
+					}
+					continue;
+				}
+			}
+
 			const existed = table.has(key);
 
 			if (existed && !isOrReplace) {
@@ -1974,6 +1995,100 @@ function computeAssignmentValue(expression: string, slice: unknown[], row: Recor
 
 	const substituted = substituteBindings(expression, slice, 0).expression;
 	return evaluateScalarExpression(substituted, row);
+}
+
+/**
+ * Parsed `ON CONFLICT` clause from an INSERT statement.
+ * @private
+ */
+type OnConflictClause =
+	| { columns: string[]; action: 'nothing' }
+	| { columns: string[]; action: 'update'; assignments: Array<{ column: string; expression: string }> };
+
+/**
+ * Parses an `ON CONFLICT (cols) DO NOTHING|UPDATE SET ...` tail from an INSERT
+ * statement. Returns `null` when the statement has no conflict clause.
+ * @private
+ */
+function parseOnConflict(sql: string): OnConflictClause | null {
+	const match = sql.match(/\bon\s+conflict\b/i);
+	if (!match || match.index === undefined) {
+		return null;
+	}
+
+	let rest = sql.slice(match.index + match[0].length).trim();
+
+	let columns: string[] = [];
+	if (rest.startsWith('(')) {
+		const close = findMatchingParen(rest, 0);
+		if (close === -1) return null;
+		columns = rest
+			.slice(1, close)
+			.split(',')
+			.map((column) => normalizeSqlIdentifier(column))
+			.filter((column) => column.length > 0);
+		rest = rest.slice(close + 1).trim();
+	}
+
+	const doMatch = rest.match(/^do\s+(nothing|update\s+set\s+([\s\S]+))/i);
+	if (!doMatch) {
+		return null;
+	}
+
+	if (/^nothing/i.test(doMatch[1] ?? '')) {
+		return { columns, action: 'nothing' };
+	}
+
+	let setBody = doMatch[2] ?? '';
+	const returningIdx = findKeyword(setBody.toUpperCase(), setBody, 'RETURNING');
+	if (returningIdx !== -1) {
+		setBody = setBody.slice(0, returningIdx);
+	}
+
+	return {
+		columns,
+		action: 'update',
+		assignments: parseSetAssignments(setBody.replace(/;\s*$/, '').trim())
+	};
+}
+
+/**
+ * Resolves a single `DO UPDATE SET` assignment value, honoring the `excluded.*`
+ * pseudo-row that refers to the row proposed for insertion.
+ * @private
+ */
+function resolveConflictAssignmentValue(expression: string, excluded: Record<string, unknown>, target: Record<string, unknown>): unknown {
+	const excludedMatch = expression.match(/^excluded\s*\.\s*([`"\[]?[\w.]+[`"\]]?)$/i);
+	if (excludedMatch) {
+		return excluded[normalizeSqlIdentifier(excludedMatch[1] ?? '')] ?? null;
+	}
+
+	const literal = parseLiteral(expression.trim());
+	if (literal.consumed) {
+		return literal.value;
+	}
+
+	return evaluateScalarExpression(expression, target);
+}
+
+/**
+ * Loose SQL equality used to match `ON CONFLICT` target columns; compares
+ * numerically when both sides are numeric, else by string value.
+ * @private
+ */
+function sqlValuesEqual(a: unknown, b: unknown): boolean {
+	if (a === b) {
+		return true;
+	}
+	const na = toFiniteNumber(a);
+	const nb = toFiniteNumber(b);
+	if (na !== undefined && nb !== undefined) {
+		return na === nb;
+	}
+	if (a === null || a === undefined || b === null || b === undefined) {
+		return (a ?? null) === (b ?? null);
+	}
+	return String(a) === String(b);
 }
 
 /**
