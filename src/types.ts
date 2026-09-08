@@ -28,6 +28,7 @@
  */
 
 import type { DurableObjectNamespace } from '@cloudflare/workers-types';
+import type { PhaseObserver } from './telemetry';
 
 /**
  * Result item returned by a key-value store list operation.
@@ -77,6 +78,31 @@ export interface KVStorage {
 	 * Lists keys, optionally filtered by prefix.
 	 */
 	list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<KVListResult>;
+	/**
+	 * Reads several keys in one round trip, returning results positionally.
+	 *
+	 * Optional. Backends with a native multi-get (Redis/Valkey `MGET`) implement
+	 * it; CollegeDB falls back to concurrent single reads when it is absent, so
+	 * callers never need to check for it.
+	 * @since 1.4.0
+	 */
+	getMany?<T = unknown>(keys: string[], type: 'json'): Promise<(T | null)[]>;
+	getMany?(keys: string[], type?: 'text'): Promise<(string | null)[]>;
+	/**
+	 * Writes several key/value pairs in one round trip.
+	 *
+	 * Optional, with the same fallback contract as {@link KVStorage.getMany}.
+	 * A multi-key shard mapping otherwise costs one round trip per lookup key.
+	 * @since 1.4.0
+	 */
+	putMany?(entries: Array<{ key: string; value: string }>): Promise<void>;
+	/**
+	 * Deletes several keys in one round trip.
+	 *
+	 * Optional, with the same fallback contract as {@link KVStorage.getMany}.
+	 * @since 1.4.0
+	 */
+	deleteMany?(keys: string[]): Promise<void>;
 }
 
 /**
