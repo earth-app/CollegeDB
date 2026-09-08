@@ -33,7 +33,7 @@
 
 import { CollegeDBError } from './errors';
 import type { KVShardMapper } from './kvmap';
-import type { CollegeDBConfig, SQLDatabase, ShardingStrategy } from './types';
+import type { CollegeDBConfig, SQLDatabase, SQLDialect, ShardingStrategy } from './types';
 
 /**
  * Cache for migration status to avoid repeated checks
@@ -156,8 +156,13 @@ export async function createSchema(db: SQLDatabase, schema: string): Promise<voi
  * performance, but provides detailed error reporting that identifies
  * which specific shard failed if any errors occur.
  *
+ * A cluster that mixes backends cannot share one DDL string: `INTEGER PRIMARY
+ * KEY AUTOINCREMENT` is a syntax error on Postgres, and `SERIAL` is one on
+ * SQLite. Pass a function instead of a string to build the statement per shard
+ * from its dialect.
+ *
  * @param shards - Record mapping shard names to database instances
- * @param schema - Schema SQL to use
+ * @param schema - Schema SQL, or a function returning it for a given shard
  * @returns Promise that resolves when schema is created on all shards
  * @throws {Error} If schema creation fails on any shard, with shard identification
  * @example
@@ -169,17 +174,29 @@ export async function createSchema(db: SQLDatabase, schema: string): Promise<voi
  * };
  *
  * try {
- *   await createSchemaAcrossShards(shards);
+ *   await createSchemaAcrossShards(shards, userSchema);
  *   console.log('Schema created on all shards successfully');
  * } catch (error) {
  *   console.error('Schema creation failed:', error.message);
  *   // Error will specify which shard failed
  * }
  * ```
+ * @example
+ * ```typescript
+ * // A cluster spanning D1 and Postgres needs the generated-key column spelled
+ * // the way each backend spells it.
+ * await createSchemaAcrossShards(shards, (dialect) =>
+ * 	dialect === 'postgres' ? POSTGRES_SCHEMA : SQLITE_SCHEMA
+ * );
+ * ```
  */
-export async function createSchemaAcrossShards(shards: Record<string, SQLDatabase>, schema: string): Promise<void> {
+export async function createSchemaAcrossShards(
+	shards: Record<string, SQLDatabase>,
+	schema: string | ((dialect: SQLDialect | undefined, binding: string) => string)
+): Promise<void> {
 	const promises = Object.entries(shards).map(([shardName, db]) => {
-		return createSchema(db, schema).catch((error) => {
+		const statement = typeof schema === 'function' ? schema(db.dialect, shardName) : schema;
+		return createSchema(db, statement).catch((error) => {
 			throw new CollegeDBError(`Failed to create schema on shard ${shardName}: ${error.message}`, 'SCHEMA_CREATION_FAILED');
 		});
 	});
