@@ -26,7 +26,7 @@ import {
 	run,
 	runShard
 } from '../src/router';
-import type { KVStorage, SQLDatabase } from '../src/types';
+import type { BatchStatement, KVStorage, QueryResult, SQLDatabase } from '../src/types';
 
 const SCHEMA = 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)';
 
@@ -52,6 +52,22 @@ function countingKV(inner: KVStorage): { kv: KVStorage; counts: { get: number; p
 			return await inner.list(options);
 		}
 	};
+
+	// Forwarded so the counters measure round trips rather than keys, and so a
+	// wrapper cannot silently drop the store back to one key at a time.
+	if (inner.getMany) {
+		kv.getMany = (async (keys: string[], type?: 'text' | 'json') => {
+			counts.get++;
+			return type === 'json' ? await inner.getMany!(keys, 'json') : await inner.getMany!(keys, type);
+		}) as KVStorage['getMany'];
+	}
+
+	if (inner.putMany) {
+		kv.putMany = async (entries) => {
+			counts.put++;
+			await inner.putMany!(entries);
+		};
+	}
 
 	return { kv, counts };
 }
@@ -428,6 +444,145 @@ describe('Routed batch', () => {
 		const kv = createInMemoryKVProvider();
 		initialize({ kv, shards: await makeShards(['db-a']), strategy: 'hash', disableAutoMigration: true });
 		expect(await batch([])).toEqual([]);
+	});
+
+	it('reads and writes the mappings for a whole batch in one round trip each', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards(['db-a', 'db-b']);
+
+		initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false, mappingCacheTtlMs: 0 });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		counts.get = 0;
+		counts.put = 0;
+
+		const entries = new Array(40).fill(null).map((_, index) => ({
+			key: `bulk-${index}`,
+			sql: 'INSERT INTO users (id, name) VALUES (?, ?)',
+			bindings: [`bulk-${index}`, `User ${index}`]
+		}));
+
+		await batch(entries);
+
+		// Routing these one at a time was 40 reads and 40 writes. The in-memory
+		// store implements the bulk primitives, so it is now one of each.
+		expect(counts.get).toBe(1);
+		expect(counts.put).toBe(1);
+
+		for (let index = 0; index < 40; index++) {
+			const row = await first<{ id: string }>(`bulk-${index}`, 'SELECT id FROM users WHERE id = ?', [`bulk-${index}`]);
+			expect(row?.id).toBe(`bulk-${index}`);
+		}
+	});
+
+	it('reuses mappings that already exist rather than reallocating them', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards(['db-a', 'db-b']);
+
+		initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false, mappingCacheTtlMs: 0 });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		await run('known-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['known-1', 'Ada']);
+
+		counts.put = 0;
+		await batch([{ key: 'known-1', sql: 'UPDATE users SET name = ? WHERE id = ?', bindings: ['Grace', 'known-1'] }]);
+
+		// An existing mapping is read, never rewritten. The row is only reachable
+		// through that mapping, so reading it back proves the batch went to the
+		// shard the mapping already named.
+		expect(counts.put).toBe(0);
+		const row = await first<{ name: string }>('known-1', 'SELECT name FROM users WHERE id = ?', ['known-1']);
+		expect(row?.name).toBe('Grace');
+	});
+
+	it('allocates a repeated key once so the second entry cannot overwrite the first', async () => {
+		const kv = createInMemoryKVProvider();
+		const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+
+		initialize({ kv, shards, strategy: 'round-robin', disableAutoMigration: true, hashShardMappings: false });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		// round-robin would hand the same key two different shards, stranding the
+		// first row where the surviving mapping does not point.
+		const groups = await batch([
+			{ key: 'same-key', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['same-key', 'Ada'] },
+			{ key: 'same-key', sql: 'UPDATE users SET name = ? WHERE id = ?', bindings: ['Grace', 'same-key'] }
+		]);
+
+		expect(groups).toHaveLength(1);
+		expect(groups[0]!.indices).toEqual([0, 1]);
+
+		const row = await first<{ name: string }>('same-key', 'SELECT name FROM users WHERE id = ?', ['same-key']);
+		expect(row?.name).toBe('Grace');
+	});
+
+	it('does not record mappings for reads in a batch', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards(['db-a', 'db-b']);
+
+		initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false, mappingCacheTtlMs: 0 });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		counts.put = 0;
+		await batch([
+			{ key: 'absent-1', sql: 'SELECT * FROM users WHERE id = ?', bindings: ['absent-1'] },
+			{ key: 'absent-2', sql: 'SELECT * FROM users WHERE id = ?', bindings: ['absent-2'] }
+		]);
+
+		expect(counts.put).toBe(0);
+	});
+
+	it('runs each shard group in one call when the provider batches', async () => {
+		const kv = createInMemoryKVProvider();
+		const batched: number[] = [];
+
+		function batchingShard(): SQLDatabase {
+			const inner = createInMemorySQLProvider();
+			return {
+				prepare: (sql: string) => inner.prepare(sql),
+				async runBatch<T = Record<string, unknown>>(statements: BatchStatement[]) {
+					batched.push(statements.length);
+					const results: QueryResult<T>[] = [];
+					for (const statement of statements) {
+						results.push(
+							await inner
+								.prepare(statement.sql)
+								.bind(...(statement.bindings ?? []))
+								.run<T>()
+						);
+					}
+					return results;
+				}
+			};
+		}
+
+		const shards: Record<string, SQLDatabase> = { 'db-a': batchingShard(), 'db-b': batchingShard() };
+		initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		batched.length = 0;
+		await batch(
+			new Array(12).fill(null).map((_, index) => ({
+				key: `batched-${index}`,
+				sql: 'INSERT INTO users (id, name) VALUES (?, ?)',
+				bindings: [`batched-${index}`, `User ${index}`]
+			}))
+		);
+
+		// One call per shard that received work, not one per statement.
+		expect(batched.length).toBeGreaterThan(0);
+		expect(batched.length).toBeLessThanOrEqual(2);
+		expect(batched.reduce((sum, size) => sum + size, 0)).toBe(12);
 	});
 });
 

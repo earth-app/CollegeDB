@@ -2378,6 +2378,44 @@ export class InMemoryKVStorage implements KVStorage {
 		}
 	}
 
+	/**
+	 * Reads many keys at once, in the order they were given.
+	 *
+	 * Present so the in-memory store exercises the same code path the Redis and
+	 * Valkey adapters take, rather than quietly leaving every test on the
+	 * one-key-at-a-time fallback.
+	 * @since 1.4.0
+	 */
+	async getMany<T = unknown>(keys: string[], type: 'json'): Promise<(T | null)[]>;
+	async getMany(keys: string[], type?: 'text'): Promise<(string | null)[]>;
+	async getMany<T = unknown>(keys: string[], type: 'text' | 'json' = 'text'): Promise<any[]> {
+		const out: any[] = [];
+		for (const key of keys) {
+			out.push(type === 'json' ? await this.get<T>(key, 'json') : await this.get(key, type));
+		}
+		return out;
+	}
+
+	/**
+	 * Writes many entries at once.
+	 * @since 1.4.0
+	 */
+	async putMany(entries: Array<{ key: string; value: string }>): Promise<void> {
+		for (const entry of entries) {
+			await this.put(entry.key, entry.value);
+		}
+	}
+
+	/**
+	 * Deletes many keys at once.
+	 * @since 1.4.0
+	 */
+	async deleteMany(keys: string[]): Promise<void> {
+		for (const key of keys) {
+			await this.delete(key);
+		}
+	}
+
 	async del(key: string): Promise<void> {
 		await this.delete(key);
 	}
