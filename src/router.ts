@@ -1282,6 +1282,28 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 		return existingMapping.shard;
 	}
 
+	const selectedShard = await allocateShardForKey(config, primaryKey, operationType);
+
+	// A read that finds no mapping does not need to leave one behind. Recording
+	// it costs a KV write and pins a key that may have no row at all, which is
+	// what a lookup for something that does not exist looks like.
+	if (operationType === 'write' || config.allocateOnRead === true) {
+		await mapper.setShardMapping(primaryKey, selectedShard);
+	}
+
+	return selectedShard;
+}
+
+/**
+ * Picks the shard a not-yet-mapped key should live on, without recording it.
+ *
+ * Split out of {@link getShardForKey} so {@link batch} can allocate many keys and
+ * then persist their mappings in one write, rather than one write per key,
+ * while both paths keep the same coordinator, strategy and size-filter behavior.
+ *
+ * @private
+ */
+async function allocateShardForKey(config: CollegeDBConfig, primaryKey: string, operationType: OperationType): Promise<string> {
 	// Before allocating a new shard, check if any existing shards contain this key
 	const availableShards = Object.keys(config.shards);
 	if (availableShards.length === 0) {
@@ -1329,13 +1351,6 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 		}
 	} else {
 		selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
-	}
-
-	// A read that finds no mapping does not need to leave one behind. Recording
-	// it costs a KV write and pins a key that may have no row at all, which is
-	// what a lookup for something that does not exist looks like.
-	if (operationType === 'write' || config.allocateOnRead === true) {
-		await mapper.setShardMapping(primaryKey, selectedShard);
 	}
 
 	return selectedShard;
@@ -3648,6 +3663,68 @@ export interface BatchShardResult<T = Record<string, unknown>> {
  * }
  * ```
  */
+/**
+ * Resolves every entry in a batch to a shard, in submission order.
+ *
+ * Routing a batch one key at a time costs a KV read per key and a KV write per
+ * new key, which for a few hundred statements is more round trips than the
+ * statements themselves. The mappings that exist are read together, and the
+ * mappings that have to be created are written together.
+ *
+ * Allocation itself stays per key: a coordinator has to see each one, and the
+ * strategies that are not functions of the key depend on call order.
+ *
+ * @private
+ */
+async function resolveBatchShards(config: CollegeDBConfig, entries: BatchEntry[]): Promise<string[]> {
+	const decision = placementDecision ?? (await resolvePlacement(config));
+
+	// Computed placement reads no mappings at all, and the epoch walk is per key.
+	if (decision.mode === 'computed' && decision.manifest) {
+		return await Promise.all(entries.map((entry) => getShardForKey(entry.key, getOperationType(entry.sql))));
+	}
+
+	const mapper = getMapper(config);
+	const known = await mapper.getShardMappings(entries.map((entry) => entry.key));
+
+	const shards: string[] = new Array(entries.length);
+	const created: Array<{ primaryKey: string; shard: string }> = [];
+	const allocated = new Map<string, string>();
+
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i]!;
+		const mapping = known.get(entry.key);
+
+		if (mapping) {
+			shards[i] = mapping.shard;
+			continue;
+		}
+
+		// A key can appear more than once in one batch; it must not be allocated
+		// twice or the second decision would overwrite the first.
+		const already = allocated.get(entry.key);
+		if (already !== undefined) {
+			shards[i] = already;
+			continue;
+		}
+
+		const operationType = getOperationType(entry.sql);
+		const shard = await allocateShardForKey(config, entry.key, operationType);
+		shards[i] = shard;
+		allocated.set(entry.key, shard);
+
+		if (operationType === 'write' || config.allocateOnRead === true) {
+			created.push({ primaryKey: entry.key, shard });
+		}
+	}
+
+	if (created.length > 0) {
+		await mapper.setShardMappings(created);
+	}
+
+	return shards;
+}
+
 export async function batch<T = Record<string, unknown>>(entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
 	const config = getConfig();
 
@@ -3656,10 +3733,7 @@ export async function batch<T = Record<string, unknown>>(entries: BatchEntry[]):
 	}
 
 	const groups = new Map<string, number[]>();
-
-	// Resolution is per key and independent, so it runs concurrently rather than
-	// serially in front of the statements it is routing.
-	const shards = await Promise.all(entries.map((entry) => getShardForKey(entry.key, getOperationType(entry.sql))));
+	const shards = await resolveBatchShards(config, entries);
 
 	shards.forEach((shard, index) => {
 		const existing = groups.get(shard);

@@ -965,6 +965,118 @@ export class KVShardMapper {
 	}
 
 	/**
+	 * Resolves many primary keys to their shard mappings in one round trip.
+	 *
+	 * Keys already in the in-process cache are answered from it and never reach
+	 * the store. The remainder go out as a single {@link KVStorage.getMany} where
+	 * the store implements one (Redis and Valkey issue `MGET`), and as bounded
+	 * concurrent reads where it does not, so the result is the same either way
+	 * and only the round-trip count differs.
+	 *
+	 * @param primaryKeys - Keys to resolve; duplicates are collapsed
+	 * @returns Mapping per key, `null` for a key with no mapping
+	 * @since 1.4.0
+	 * @example
+	 * ```typescript
+	 * const mappings = await mapper.getShardMappings(['user-1', 'user-2']);
+	 * console.log(mappings.get('user-1')?.shard);
+	 * ```
+	 */
+	async getShardMappings(primaryKeys: string[]): Promise<Map<string, ShardMapping | null>> {
+		const resolved = new Map<string, ShardMapping | null>();
+		if (primaryKeys.length === 0) {
+			return resolved;
+		}
+
+		const pending: Array<{ primaryKey: string; hashedKey: string }> = [];
+
+		for (const primaryKey of new Set(primaryKeys)) {
+			const hashedKey = await this.hashKey(primaryKey);
+			const cached = this.getCachedMapping(hashedKey);
+			if (cached !== undefined) {
+				resolved.set(primaryKey, cached);
+				continue;
+			}
+			pending.push({ primaryKey, hashedKey });
+		}
+
+		if (pending.length === 0) {
+			return resolved;
+		}
+
+		const storeKeys = pending.map((entry) => `${SHARD_MAPPING_PREFIX}${entry.hashedKey}`);
+
+		if (this.kv.getMany) {
+			const values = await this.kv.getMany<ShardMapping>(storeKeys, 'json');
+			pending.forEach((entry, index) => {
+				const mapping = values[index] ?? null;
+				this.setCachedMapping(entry.hashedKey, mapping);
+				resolved.set(entry.primaryKey, mapping);
+			});
+			return resolved;
+		}
+
+		await runWithConcurrency(pending, DEFAULT_KV_FANOUT_CONCURRENCY, async (entry) => {
+			const mapping = (await this.kv.get<ShardMapping>(`${SHARD_MAPPING_PREFIX}${entry.hashedKey}`, 'json')) ?? null;
+			this.setCachedMapping(entry.hashedKey, mapping);
+			resolved.set(entry.primaryKey, mapping);
+		});
+
+		return resolved;
+	}
+
+	/**
+	 * Writes many single-key shard mappings in one round trip.
+	 *
+	 * The counterpart to {@link getShardMappings}, and the same trade: one
+	 * {@link KVStorage.putMany} where the store has one, bounded concurrent writes
+	 * where it does not. Only single-key mappings are written; use
+	 * {@link setShardMapping} when a key needs lookup aliases.
+	 *
+	 * @param entries - Key to shard assignments to record
+	 * @since 1.4.0
+	 */
+	async setShardMappings(entries: Array<{ primaryKey: string; shard: string }>): Promise<void> {
+		if (entries.length === 0) {
+			return;
+		}
+
+		const timestamp = Date.now();
+		const writes: Array<{ key: string; value: string; hashedKey: string; mapping: ShardMapping }> = [];
+
+		for (const entry of entries) {
+			const hashedKey = await this.hashKey(entry.primaryKey);
+			const mapping: ShardMapping = {
+				shard: entry.shard,
+				createdAt: timestamp,
+				updatedAt: timestamp,
+				originalKey: this.hashKeys ? undefined : entry.primaryKey
+			};
+
+			writes.push({
+				key: `${SHARD_MAPPING_PREFIX}${hashedKey}`,
+				value: JSON.stringify(mapping),
+				hashedKey,
+				mapping
+			});
+		}
+
+		if (this.kv.putMany) {
+			await this.kv.putMany(writes.map((write) => ({ key: write.key, value: write.value })));
+		} else {
+			await runWithConcurrency(writes, DEFAULT_KV_FANOUT_CONCURRENCY, async (write) => {
+				await this.kv.put(write.key, write.value);
+			});
+		}
+
+		// Cached only after the store accepted them, so a failed write cannot leave
+		// this process believing a mapping exists.
+		for (const write of writes) {
+			this.setCachedMapping(write.hashedKey, write.mapping);
+		}
+	}
+
+	/**
 	 * Sets multiple shard mappings concurrently with a configurable concurrency limit.
 	 *
 	 * This helper is used by migration workflows to significantly reduce total
