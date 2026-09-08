@@ -32,8 +32,8 @@ import {
 	flush,
 	getShardStats,
 	initialize,
-	insert,
 	insertShard,
+	invalidateMappingCache,
 	nextId,
 	paginate,
 	resetConfig,
@@ -662,12 +662,14 @@ function profilesForCombo(dbFlavor: DatabaseFlavor, profileFilter: AdapterProfil
 }
 
 function profilesForCloudflare(profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
-	// `hyperdrive` only exists here. It is the sole place a real `env.HYPERDRIVE`
-	// binding is exercised, which `wrangler dev` supplies from the compose
-	// Postgres through `localConnectionString`.
+	// `hyperdrive` only exists here, because it is the sole place a real
+	// `env.HYPERDRIVE` binding exists: `wrangler dev` supplies one from the
+	// compose Postgres through `localConnectionString`. It is also the only
+	// environment in the matrix where one cluster spans two backends, since the
+	// Hyperdrive shard is Postgres and the other two are D1.
 	const supported: AdapterProfile[] = ['native', 'drizzle', 'hyperdrive'];
 	if (profileFilter === 'all') {
-		return [...supported];
+		return supported;
 	}
 	return supported.includes(profileFilter) ? [profileFilter] : [];
 }
@@ -940,8 +942,14 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		const stderr = await stderrPromise;
-		const stdout = await stdoutPromise;
+
+		// The dev server has to be stopped before its pipes are read. Awaiting them
+		// while it is still running waits for an EOF that never arrives, so every
+		// failure in this lane hung with no diagnostic instead of reporting the
+		// error that caused it.
+		await terminateProcess(proc);
+		const stderr = await readCapturedOutput(stderrPromise);
+		const stdout = await readCapturedOutput(stdoutPromise);
 		return {
 			id: resultId,
 			baseId: 'cloudflare',
@@ -1737,7 +1745,9 @@ async function scenarioColdMappingCache(iterations: number, config: CollegeDBCon
 	initialize({ ...config, mappingCacheTtlMs: 0 });
 
 	const stats = await measureScenario('cold_mapping_cache', iterations, async (i) => {
-		const key = seeded[i]!;
+		// Wrapped, because the warmup pass runs with an index past the measured
+		// range and this is the one scenario that indexes a fixed set of keys.
+		const key = seeded[i % seeded.length]!;
 		const row = await first<Record<string, unknown>>(key, SELECT_USER_SQL, [key]);
 		if (!row) {
 			throw new Error(`Missing seeded row ${key}`);
@@ -1802,7 +1812,10 @@ async function scenarioReassignment(iterations: number, config: CollegeDBConfig)
 			throw new Error('Expected reassigned record to exist on target shard');
 		}
 
-		initialize(config);
+		// The mapping was changed through a separate mapper, so this process has
+		// to be told to drop what it cached. Re-running initialize is no longer
+		// the way: it reuses the mapper when the config is unchanged.
+		await invalidateMappingCache(id);
 
 		const moved = await first(id, SELECT_USER_SQL, [id]);
 		if (!moved) {
@@ -2027,8 +2040,24 @@ async function postCloudflareBenchmark(path: string, payload: Record<string, unk
 	return response;
 }
 
+/**
+ * Host ports for the compose services.
+ *
+ * Overridable because these are published on the host, and a machine that
+ * already runs a Redis or a Postgres on the default port cannot otherwise start
+ * the sandbox at all. The compose file reads the same variables, so both sides
+ * move together.
+ */
+const PORTS = {
+	postgres: Number(process.env.COLLEGEDB_POSTGRES_PORT ?? 5432),
+	mysql: Number(process.env.COLLEGEDB_MYSQL_PORT ?? 3306),
+	mariadb: Number(process.env.COLLEGEDB_MARIADB_PORT ?? 3307),
+	redis: Number(process.env.COLLEGEDB_REDIS_PORT ?? 6379),
+	valkey: Number(process.env.COLLEGEDB_VALKEY_PORT ?? 6380)
+} as const;
+
 async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Promise<KVRuntime> {
-	const url = kvFlavor === 'valkey' ? 'redis://127.0.0.1:6380' : 'redis://127.0.0.1:6379';
+	const url = kvFlavor === 'valkey' ? `redis://127.0.0.1:${PORTS.valkey}` : `redis://127.0.0.1:${PORTS.redis}`;
 	await waitForRedis(url);
 
 	const client: any = createRedisClient({
@@ -2069,9 +2098,9 @@ async function createSQLRuntime(
 		case 'postgres':
 			return createPostgresRuntime(runId, profile, shardBindings);
 		case 'mysql':
-			return createMySQLRuntime(runId, 3306, profile, shardBindings);
+			return createMySQLRuntime(runId, PORTS.mysql, profile, shardBindings);
 		case 'mariadb':
-			return createMySQLRuntime(runId, 3307, profile, shardBindings);
+			return createMySQLRuntime(runId, PORTS.mariadb, profile, shardBindings);
 		case 'sqlite':
 			return createSQLiteRuntime(runId, profile, shardBindings);
 	}
@@ -2087,7 +2116,7 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 
 	const admin = new PostgresClient({
 		host: '127.0.0.1',
-		port: 5432,
+		port: PORTS.postgres,
 		user: 'collegedb',
 		password: 'collegedb',
 		database: 'postgres'
@@ -2105,7 +2134,7 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 	for (const [binding, dbName] of dbNamesByBinding) {
 		const pool = new PostgresPool({
 			host: '127.0.0.1',
-			port: 5432,
+			port: PORTS.postgres,
 			user: 'collegedb',
 			password: 'collegedb',
 			database: dbName,
@@ -2154,7 +2183,7 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 		if (!dbName) {
 			continue;
 		}
-		const connectionString = `postgres://collegedb:collegedb@127.0.0.1:5432/${dbName}`;
+		const connectionString = `postgres://collegedb:collegedb@127.0.0.1:${PORTS.postgres}/${dbName}`;
 		shards[binding] = createPostgresProviderForProfile(pool, connectionString, profile);
 	}
 
@@ -2167,7 +2196,7 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 
 			const closeAdmin = new PostgresClient({
 				host: '127.0.0.1',
-				port: 5432,
+				port: PORTS.postgres,
 				user: 'collegedb',
 				password: 'collegedb',
 				database: 'postgres'
@@ -2316,10 +2345,13 @@ function buildIterationPlan(baseIterations: number): IterationPlan {
 		bulk: Math.max(3, Math.floor(baseIterations * 0.35)),
 		autoIncrement: Math.max(4, Math.floor(baseIterations * 0.45)),
 		indexing: Math.max(6, Math.floor(baseIterations * 0.75)),
-		metadata: Math.max(6, Math.floor(baseIterations * 0.7)),
-		pragma: Math.max(6, Math.floor(baseIterations * 0.7)),
-		counting: Math.max(6, Math.floor(baseIterations * 0.7)),
-		fanout: Math.max(6, Math.floor(baseIterations * 0.7)),
+		// Sampled harder than the rest: one iteration of these costs well under a
+		// millisecond, so 14 samples put the reported mean within range of a single
+		// scheduler hiccup while 30 samples cost 15 ms in total.
+		metadata: Math.max(20, Math.floor(baseIterations * 1.5)),
+		pragma: Math.max(20, Math.floor(baseIterations * 1.5)),
+		counting: Math.max(20, Math.floor(baseIterations * 1.5)),
+		fanout: Math.max(20, Math.floor(baseIterations * 1.5)),
 		reassignment: Math.max(4, Math.floor(baseIterations * 0.5))
 	};
 }
@@ -2402,6 +2434,15 @@ async function measureScenario(
 	const samplesMs: number[] = [];
 
 	try {
+		// One discarded pass first. Without it the first sample carries JIT
+		// compilation, the driver's first prepare and a cold connection, and on the
+		// sub-millisecond scenarios that single sample moved the reported mean by
+		// double digits: metadata_fetch reported avg=0.63 ms against p50=0.47 ms
+		// off one 2.45 ms first sample in a set of 14.
+		// Indexed past the measured range so a scenario that derives primary keys
+		// from the iteration number cannot collide with its own warmup.
+		await workload(iterations);
+
 		for (let i = 0; i < iterations; i++) {
 			const started = performance.now();
 			await workload(i);
@@ -2522,6 +2563,29 @@ async function terminateProcess(proc: Bun.Subprocess): Promise<void> {
 	}
 }
 
+/**
+ * Reads output captured from a subprocess, giving up rather than blocking.
+ *
+ * A backstop for the case the pipe stays open anyway, because a stuck read here
+ * costs the whole run and the output is only ever used to explain a failure.
+ */
+async function readCapturedOutput(captured: Promise<string>, timeoutMs: number = 5_000): Promise<string> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+
+	try {
+		return await Promise.race([
+			captured,
+			new Promise<string>((resolve) => {
+				timer = setTimeout(() => resolve('<output unavailable: stream did not close>'), timeoutMs);
+			})
+		]);
+	} finally {
+		if (timer) {
+			clearTimeout(timer);
+		}
+	}
+}
+
 async function retry<T>(task: () => Promise<T>, attempts: number, delayMs: number, label: string): Promise<T> {
 	let lastError: unknown;
 
@@ -2561,7 +2625,7 @@ async function waitForPostgres(): Promise<void> {
 		async () => {
 			const client = new PostgresClient({
 				host: '127.0.0.1',
-				port: 5432,
+				port: PORTS.postgres,
 				user: 'collegedb',
 				password: 'collegedb',
 				database: 'postgres'
@@ -2572,7 +2636,7 @@ async function waitForPostgres(): Promise<void> {
 		},
 		60,
 		1000,
-		'PostgreSQL on 5432'
+		`PostgreSQL on ${PORTS.postgres}`
 	);
 }
 
@@ -2594,12 +2658,16 @@ async function waitForMySQL(port: number): Promise<void> {
 	);
 }
 
-async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
+async function waitForHttp(url: string, timeoutMs: number, perAttemptMs: number = 5_000): Promise<void> {
 	const started = Date.now();
 	let lastError: unknown;
 	while (Date.now() - started < timeoutMs) {
 		try {
-			const response = await fetch(url);
+			// Each attempt needs its own deadline. Without one, a server that
+			// accepts the connection and never answers leaves this fetch pending
+			// forever, so the outer deadline is never reached and the lane hangs
+			// instead of failing. A failed Worker build does exactly that.
+			const response = await fetch(url, { signal: AbortSignal.timeout(perAttemptMs) });
 			if (response.ok) {
 				return;
 			}
