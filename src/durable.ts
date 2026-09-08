@@ -25,23 +25,33 @@
  * });
  * ```
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.0.0
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors';
+import { hrwShard } from './placement';
 import type { D1Region, MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types';
+
+/**
+ * Storage key prefix for the per-key allocation ledger.
+ *
+ * Recording each decision is what makes allocation idempotent across concurrent
+ * callers, since a Durable Object serializes its own requests.
+ * @private
+ */
+const ALLOCATION_LEDGER_PREFIX = 'alloc:';
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
  *
  * The ShardCoordinator is a Cloudflare Durable Object that provides centralized
- * coordination for shard allocation across multiple D1 databases. It maintains
+ * coordination for shard allocation across multiple database instances. It maintains
  * state about available shards, allocation strategies, and usage statistics.
  *
  * Key responsibilities:
- * - Track available D1 shards and their current load
+ * - Track available shards and their current load
  * - Implement allocation strategies (round-robin, random, hash-based)
  * - Provide HTTP API for shard allocation and management
  * - Maintain persistent state using Durable Object storage
@@ -156,6 +166,8 @@ export class ShardCoordinator {
 					return this.handleUpdateStats(request);
 				case 'POST /allocate':
 					return this.handleAllocateShard(request);
+				case 'POST /forget':
+					return this.handleForgetAllocation(request);
 				case 'POST /sequence':
 					return this.handleSequence(request);
 				case 'POST /flush':
@@ -186,7 +198,7 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Registers a new D1 database binding with the coordinator. If the shard
+	 * Registers a new shard binding with the coordinator. If the shard
 	 * is already known, this operation is idempotent. Initializes statistics
 	 * for the new shard.
 	 * @private
@@ -224,7 +236,7 @@ export class ShardCoordinator {
 	}
 
 	/**
-	 * Unregisters a D1 database binding from the coordinator. Removes the shard
+	 * Unregisters a shard binding from the coordinator. Removes the shard
 	 * from the known shards list and deletes its statistics. Adjusts the round-robin
 	 * index if necessary to prevent out-of-bounds access.
 	 * @private
@@ -358,8 +370,24 @@ export class ShardCoordinator {
 			});
 		}
 
+		// A Durable Object serializes its requests, so recording the decision here
+		// makes allocation idempotent per key. Without it, two concurrent
+		// first-touches of the same key under round-robin or random receive
+		// different shards, both write the mapping to KV, and the row written by
+		// the loser of that race sits on a shard the surviving mapping does not
+		// name.
+		const ledgerKey = `${ALLOCATION_LEDGER_PREFIX}${primaryKey}`;
+		const recorded = await this.state.storage.get<string>(ledgerKey);
+		if (typeof recorded === 'string' && eligibleShards.includes(recorded)) {
+			return new Response(JSON.stringify({ shard: recorded, reused: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const effectiveStrategy = this.resolveStrategy(state.strategy, strategy, operationType || 'write');
 		const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy, eligibleShards);
+
+		await this.state.storage.put(ledgerKey, selectedShard);
 
 		if (effectiveStrategy === 'round-robin') {
 			state.roundRobinIndex = (state.roundRobinIndex + 1) % eligibleShards.length;
@@ -367,6 +395,44 @@ export class ShardCoordinator {
 		}
 
 		return new Response(JSON.stringify({ shard: selectedShard }), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
+	/**
+	 * Forgets the recorded allocation for a primary key.
+	 *
+	 * Called when a key is reassigned or its mapping deleted, so a later
+	 * first-touch allocates afresh instead of being handed the stale decision.
+	 *
+	 * @param primaryKey - The key whose recorded allocation should be dropped
+	 * @since 1.4.0
+	 */
+	async forgetAllocation(primaryKey: string): Promise<void> {
+		await this.state.storage.delete(`${ALLOCATION_LEDGER_PREFIX}${primaryKey}`);
+	}
+
+	/**
+	 * Drops a recorded allocation so the key is allocated afresh next time.
+	 *
+	 * @private
+	 * @param request - HTTP request containing the primary key
+	 * @returns Promise resolving to HTTP response
+	 * @example Request body: `{"primaryKey": "user-123"}`
+	 */
+	private async handleForgetAllocation(request: Request): Promise<Response> {
+		const { primaryKey } = (await request.json()) as { primaryKey?: string };
+
+		if (!primaryKey || typeof primaryKey !== 'string') {
+			return new Response(JSON.stringify({ error: 'Missing or invalid primaryKey parameter' }), {
+				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		await this.forgetAllocation(primaryKey);
+
+		return new Response(JSON.stringify({ success: true }), {
 			headers: { 'Content-Type': 'application/json' }
 		});
 	}
@@ -388,7 +454,7 @@ export class ShardCoordinator {
 	 * @example Response body: `{"value": 42}`
 	 */
 	private async handleSequence(request: Request): Promise<Response> {
-		const { name, min } = (await request.json()) as { name: string; min?: number };
+		const { name, min, requireExisting } = (await request.json()) as { name: string; min?: number; requireExisting?: boolean };
 
 		if (!name || typeof name !== 'string') {
 			return new Response(JSON.stringify({ error: 'Missing or invalid name parameter' }), {
@@ -399,6 +465,17 @@ export class ShardCoordinator {
 
 		const state = await this.getState();
 		const sequences = state.sequences ?? {};
+
+		// A caller that has not paid for a cross-shard maximum asks with
+		// `requireExisting` so it only gets an answer when the sequence is already
+		// past every existing row. Answering with 1 here would hand out an id that
+		// collides with rows the shards already hold.
+		if (requireExisting && sequences[name] === undefined) {
+			return new Response(JSON.stringify({ needsSeed: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
 		const current = sequences[name] ?? 0;
 		const floor = typeof min === 'number' && Number.isFinite(min) ? Math.floor(min) : 0;
 		const next = Math.max(current + 1, floor);
@@ -489,18 +566,11 @@ export class ShardCoordinator {
 
 		switch (strategy) {
 			case 'round-robin':
-				return shards[state.roundRobinIndex] ?? shards[0]!;
+				return shards[state.roundRobinIndex % shards.length] ?? shards[0]!;
 			case 'random':
 				return shards[Math.floor(Math.random() * shards.length)]!;
 			case 'hash': {
-				let hash = 0;
-				for (let i = 0; i < primaryKey.length; i++) {
-					const char = primaryKey.charCodeAt(i);
-					hash = (hash << 5) - hash + char;
-					hash = hash & hash; // Convert to 32-bit integer
-				}
-				const index = Math.abs(hash) % shards.length;
-				return shards[index]!;
+				return hrwShard(primaryKey, shards);
 			}
 			case 'location': {
 				// If location config missing, fallback to hash
@@ -508,14 +578,7 @@ export class ShardCoordinator {
 				const locations = state.shardLocations || {};
 				const located = shards.filter((s) => locations[s]);
 				if (!region || located.length === 0) {
-					let h = 0;
-					for (let i = 0; i < primaryKey.length; i++) {
-						const c = primaryKey.charCodeAt(i);
-						h = (h << 5) - h + c;
-						h = h & h;
-					}
-					const idx = Math.abs(h) % shards.length;
-					return shards[idx]!;
+					return hrwShard(primaryKey, shards);
 				}
 
 				// Simple location scoring similar to router.ts
@@ -561,18 +624,14 @@ export class ShardCoordinator {
 				if (best.length === 1) return best[0]!.shard;
 
 				// Tie-breaker by consistent hash
-				let h2 = 0;
-				for (let i = 0; i < primaryKey.length; i++) {
-					const c = primaryKey.charCodeAt(i);
-					h2 = (h2 << 5) - h2 + c;
-					h2 = h2 & h2;
-				}
-				const idx2 = Math.abs(h2) % best.length;
-				return best[idx2]!.shard;
+				return hrwShard(
+					primaryKey,
+					best.map((candidate) => candidate.shard)
+				);
 			}
 
 			default:
-				return shards[0]!;
+				return hrwShard(primaryKey, shards);
 		}
 	}
 
