@@ -290,6 +290,9 @@ describe('Provider Adapters', () => {
 
 		const result = await provider.prepare('SELECT 1').all<{ id: number }>();
 		expect(result.results[0]?.id).toBe(1);
+		expect(lifecycle).toEqual(['connect:postgres://hyperdrive-host/db', 'query']);
+
+		await provider.dispose();
 		expect(lifecycle).toEqual(['connect:postgres://hyperdrive-host/db', 'query', 'end']);
 	});
 
@@ -525,7 +528,68 @@ describe('Hyperdrive Postgres helper', () => {
 		}));
 
 		await provider.prepare('SELECT 1').run();
-		expect(lifecycle).toContain('release');
+		expect(lifecycle).toEqual(['query']);
+
+		await provider.dispose();
+		expect(lifecycle).toEqual(['query', 'release']);
+	});
+
+	it('reuses one client and one connect across statements in a request', async () => {
+		const lifecycle: string[] = [];
+		let created = 0;
+
+		const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => {
+			created++;
+			return {
+				async connect() {
+					lifecycle.push('connect');
+				},
+				async query() {
+					lifecycle.push('query');
+					return { rows: [], rowCount: 0 };
+				},
+				async end() {
+					lifecycle.push('end');
+				}
+			};
+		});
+
+		await provider.prepare('SELECT 1').run();
+		await provider.prepare('SELECT 2').run();
+		await provider.prepare('SELECT 3').run();
+
+		expect(created).toBe(1);
+		expect(lifecycle).toEqual(['connect', 'query', 'query', 'query']);
+
+		await provider.dispose();
+		expect(lifecycle.at(-1)).toBe('end');
+	});
+
+	it('gives each request scope its own client', async () => {
+		let created = 0;
+		let scope = { id: 'request-1' };
+
+		const provider = createHyperdrivePostgresProvider(
+			{ connectionString: 'postgres://example' },
+			() => {
+				created++;
+				return {
+					async query() {
+						return { rows: [], rowCount: 0 };
+					},
+					async end() {}
+				};
+			},
+			{ scope: () => scope }
+		);
+
+		await provider.prepare('SELECT 1').run();
+		await provider.prepare('SELECT 2').run();
+		expect(created).toBe(1);
+
+		scope = { id: 'request-2' };
+		await provider.prepare('SELECT 3').run();
+		expect(created).toBe(2);
 	});
 
 	it('skips connect() when not provided', async () => {
@@ -558,6 +622,9 @@ describe('Hyperdrive MySQL helper', () => {
 
 		const result = await provider.prepare('SELECT 1').all();
 		expect(result.results).toEqual([{ ok: 1 }]);
+		expect(lifecycle).toEqual(['query']);
+
+		await provider.dispose();
 		expect(lifecycle).toEqual(['query', 'close']);
 	});
 
@@ -574,7 +641,27 @@ describe('Hyperdrive MySQL helper', () => {
 		}));
 
 		await provider.prepare('SELECT 1').first();
+		expect(lifecycle).toEqual(['execute']);
+
+		await provider.dispose();
 		expect(lifecycle).toEqual(['execute', 'destroy']);
+	});
+
+	it('reuses one client across statements in a request', async () => {
+		let created = 0;
+		const provider = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => {
+			created++;
+			return {
+				async execute() {
+					return [[{ ok: true }], []];
+				},
+				async end() {}
+			};
+		});
+
+		await provider.prepare('SELECT 1').first();
+		await provider.prepare('SELECT 2').first();
+		expect(created).toBe(1);
 	});
 
 	it('throws when the underlying client exposes nothing useful', async () => {
