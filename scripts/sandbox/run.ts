@@ -18,11 +18,11 @@ import {
 	all,
 	allAllShards,
 	allShard,
+	batch,
 	createHyperdriveMySQLProvider,
 	createHyperdrivePostgresProvider,
 	createMappingsForExistingKeys,
 	createMySQLProvider,
-	createNuxtHubKVProvider,
 	createPostgreSQLProvider,
 	createRedisKVProvider,
 	createSQLiteProvider,
@@ -30,14 +30,19 @@ import {
 	createValkeyKVProvider,
 	first,
 	flush,
+	getShardStats,
 	initialize,
 	insert,
+	insertShard,
+	nextId,
+	paginate,
 	resetConfig,
 	run,
 	runAllShards,
 	runShard
 } from '../../src/index';
 import { KVShardMapper } from '../../src/kvmap';
+import { PhaseCollector } from '../../src/telemetry';
 import type {
 	CollegeDBConfig,
 	D1Region,
@@ -58,7 +63,15 @@ const WRANGLER_BIN = resolve(PROJECT_ROOT, 'node_modules', '.bin', 'wrangler');
 
 const ALL_DATABASES = ['postgres', 'mysql', 'mariadb', 'sqlite'] as const;
 const ALL_KV = ['redis', 'valkey'] as const;
-const ALL_ADAPTER_PROFILES = ['native', 'drizzle', 'hyperdrive', 'nuxthub'] as const;
+// `nuxthub` used to sit here, but it built the same Drizzle SQL provider as
+// `drizzle` and differed only in the KV adapter, so its column measured noise
+// (the observed delta swung from -4.40 ms to +5.11 ms on the same adapter).
+// KV-adapter behaviour is covered by the KVStorage conformance spec instead.
+// `per-statement-connection` is the old `hyperdrive` profile under the name of
+// what it actually measures: a fresh driver connection per statement against a
+// local server, with no Hyperdrive involved.
+const ALL_ADAPTER_PROFILES = ['native', 'drizzle', 'per-statement-connection', 'hyperdrive'] as const;
+const DEFAULT_ADAPTER_PROFILES = ['native', 'drizzle'] as const;
 const SCENARIO_NAMES = [
 	'basic_crud',
 	'advanced_usage',
@@ -70,7 +83,13 @@ const SCENARIO_NAMES = [
 	'pragma_or_info',
 	'counting',
 	'shard_fanout',
-	'reassignment'
+	'reassignment',
+	'mapping_miss',
+	'next_id',
+	'paginate',
+	'batch_write',
+	'cold_mapping_cache',
+	'concurrent_load'
 ] as const;
 const SHARDING_STRATEGIES = ['round-robin', 'random', 'hash', 'location'] as const;
 const STRATEGY_BENCHMARK_TARGET_REGIONS = ['wnam', 'enam', 'weur', 'apac', 'oc'] as const;
@@ -124,6 +143,15 @@ interface ScenarioStats {
 	notes?: string;
 }
 
+interface PhaseAttribution {
+	phase: string;
+	count: number;
+	totalMs: number;
+	avgMs: number;
+	p95Ms: number;
+	share: number;
+}
+
 interface ComboResult {
 	id: string;
 	baseId: string;
@@ -134,6 +162,8 @@ interface ComboResult {
 	scenarios: Record<ScenarioName, ScenarioStats>;
 	strategyBenchmark?: StrategyBenchmarkResult;
 	overallAvgMs?: number;
+	perOpAvgMs?: number;
+	phaseAttribution?: PhaseAttribution[];
 	durationMs: number;
 	error?: string;
 }
@@ -157,6 +187,22 @@ interface StrategyBenchmarkCell {
 	p95Ms?: number;
 	minMs?: number;
 	maxMs?: number;
+	/**
+	 * Keys landed per shard. This is the axis strategies actually differ on: the
+	 * latency spread across all 16 columns of the old matrix was 5.2% with
+	 * near-uniform wins, because without a coordinator every strategy is a few
+	 * microseconds of local computation and only decides where a new key goes.
+	 */
+	keysPerShard?: Record<string, number>;
+	/**
+	 * Fraction of keys on the busiest shard. Even distribution over N shards puts
+	 * this at 1/N; 1.0 means every key landed on one shard. Preferred over a
+	 * busiest-to-quietest ratio, which is infinite as soon as one shard is empty
+	 * and so cannot rank anything.
+	 */
+	maxShare?: number;
+	/** Chi-square against a uniform distribution over the shards. */
+	chiSquare?: number;
 	error?: string;
 }
 
@@ -340,6 +386,36 @@ const SCENARIO_CATALOG: Record<
 		title: 'Shard reassignment flow',
 		details: 'Creates a record, reassigns it to another shard, and verifies routed reads still succeed.',
 		workload: (plan) => `${plan.reassignment} iterations; insert + reassignment + verification per iteration`
+	},
+	mapping_miss: {
+		title: 'Lookup of a key with no row',
+		details: 'Reads a key that was never written, which is the most common shape a public API sees and used to be the most expensive path.',
+		workload: (plan) => `${plan.basic} iterations; 1 routed read of an unmapped key per iteration`
+	},
+	next_id: {
+		title: 'Cross-shard id allocation',
+		details: 'Allocates a cluster-unique id with nextId, which is the supported way to key a generated-id table that spans shards.',
+		workload: (plan) => `${plan.basic} iterations; 1 id allocation per iteration`
+	},
+	paginate: {
+		title: 'Global paginated read',
+		details: 'Reads one sorted page across all shards, exercising the per-shard limit pushdown.',
+		workload: (plan) => `${plan.counting} iterations; 1 global page per iteration after a warmup dataset`
+	},
+	batch_write: {
+		title: 'Shard-grouped batch write',
+		details: 'Writes a batch of routed statements with one round trip per shard rather than one per statement.',
+		workload: (plan, bulkSize) => `${plan.bulk} iterations; ${bulkSize} routed statements grouped per shard`
+	},
+	cold_mapping_cache: {
+		title: 'Cold mapping cache read',
+		details: 'Reads an existing key with the in-memory mapping cache disabled, so every read pays the KV lookup.',
+		workload: (plan) => `${plan.basic} iterations; 1 routed read with no mapping cache per iteration`
+	},
+	concurrent_load: {
+		title: 'Concurrent routed reads',
+		details: 'Issues routed reads concurrently rather than one at a time, which every other scenario does.',
+		workload: (plan) => `${plan.basic} iterations; 16 concurrent routed reads per iteration`
 	}
 };
 
@@ -393,6 +469,21 @@ async function main(): Promise<void> {
 		await ensureDockerComposeReady();
 	}
 
+	// Every run already isolates itself with run-scoped database names that are
+	// created and dropped per run, so tearing the containers down between runs
+	// only bought a cold boot of each server. MySQL and MariaDB reinitialise
+	// their data directory on every one of those.
+	const requiredServices = [...new Set(combos.flatMap((combo) => composeServicesForCombo(combo)))];
+	let composeStarted = false;
+
+	if (requiredServices.length > 0) {
+		const composeBegan = performance.now();
+		await composeDown();
+		await composeUp(requiredServices);
+		composeStarted = true;
+		console.log(`[Sandbox] Brought up ${requiredServices.join(', ')} in ${formatMs(performance.now() - composeBegan)}`);
+	}
+
 	const comboResults: ComboResult[] = [];
 
 	for (const combo of combos) {
@@ -415,7 +506,21 @@ async function main(): Promise<void> {
 
 	const cloudflareResults: ComboResult[] = [];
 	if (options.includeCloudflare || options.cloudflareOnly) {
-		for (const profile of profilesForCloudflare(options.profile)) {
+		const cloudflareProfiles = profilesForCloudflare(options.profile);
+
+		// The hyperdrive profile binds env.HYPERDRIVE to the compose Postgres via
+		// `localConnectionString`, so that container has to be running even for a
+		// Cloudflare-only run.
+		if (cloudflareProfiles.includes('hyperdrive') && !composeStarted) {
+			await composeDown();
+			await composeUp(['postgres']);
+			composeStarted = true;
+		}
+		if (cloudflareProfiles.includes('hyperdrive')) {
+			await waitForPostgres();
+		}
+
+		for (const profile of cloudflareProfiles) {
 			const startedAt = new Date();
 			const wallStarted = performance.now();
 			console.log(`\n[Sandbox] [${startedAt.toISOString()}] START cloudflare (${profile})`);
@@ -431,6 +536,10 @@ async function main(): Promise<void> {
 		}
 	}
 
+	if (composeStarted) {
+		await composeDown();
+	}
+
 	const markdown = buildMarkdownReport(options, comboResults, cloudflareResults);
 	const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 	const scope = options.cloudflareOnly
@@ -440,10 +549,16 @@ async function main(): Promise<void> {
 	const latestPath = join(RESULTS_DIR, 'latest.md');
 
 	await Bun.write(outPath, markdown);
-	await Bun.write(latestPath, markdown);
+
+	// `latest.md` is pasted into the CI job summary, so a single-combo run must
+	// not overwrite it and present itself as the matrix.
+	const isFullMatrix = options.db === 'all' && options.kv === 'all' && options.profile === 'all' && !options.cloudflareOnly;
+	if (isFullMatrix) {
+		await Bun.write(latestPath, markdown);
+	}
 
 	console.log(`\n[Sandbox] Markdown report written: ${outPath}`);
-	console.log(`[Sandbox] Latest report updated: ${latestPath}\n`);
+	console.log(isFullMatrix ? `[Sandbox] Latest report updated: ${latestPath}\n` : `[Sandbox] Partial run; ${latestPath} left untouched\n`);
 	printMarkdownAnsi(markdown);
 
 	// Calculate pass rate and determine if we should exit with code 1
@@ -532,22 +647,29 @@ function normalizeProfile(raw: string): AdapterProfile | 'all' {
 }
 
 function profilesForCombo(dbFlavor: DatabaseFlavor, profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
-	const supported =
-		dbFlavor === 'sqlite' ? (['native', 'drizzle', 'nuxthub'] as const) : (['native', 'drizzle', 'hyperdrive', 'nuxthub'] as const);
+	// `hyperdrive` is deliberately absent: without a Workers runtime there is no
+	// Hyperdrive binding to test, which is what the old profile of that name got
+	// wrong.
+	const supported: AdapterProfile[] = dbFlavor === 'sqlite' ? ['native', 'drizzle'] : ['native', 'drizzle', 'per-statement-connection'];
 
 	if (profileFilter === 'all') {
-		return [...supported];
+		// `per-statement-connection` accounted for 40.6% of the full matrix while
+		// measuring a pattern no supported deployment uses, so it is opt-in.
+		return supported.filter((profile) => (DEFAULT_ADAPTER_PROFILES as readonly AdapterProfile[]).includes(profile));
 	}
 
-	return (supported as readonly AdapterProfile[]).includes(profileFilter) ? [profileFilter] : [];
+	return supported.includes(profileFilter) ? [profileFilter] : [];
 }
 
 function profilesForCloudflare(profileFilter: AdapterProfile | 'all'): AdapterProfile[] {
-	const supported = ['native', 'drizzle', 'nuxthub'] as const;
+	// `hyperdrive` only exists here. It is the sole place a real `env.HYPERDRIVE`
+	// binding is exercised, which `wrangler dev` supplies from the compose
+	// Postgres through `localConnectionString`.
+	const supported: AdapterProfile[] = ['native', 'drizzle', 'hyperdrive'];
 	if (profileFilter === 'all') {
 		return [...supported];
 	}
-	return (supported as readonly AdapterProfile[]).includes(profileFilter) ? [profileFilter] : [];
+	return supported.includes(profileFilter) ? [profileFilter] : [];
 }
 
 function buildCombos(dbFilter: DatabaseFlavor | 'all', kvFilter: KVFlavor | 'all'): Combo[] {
@@ -574,19 +696,14 @@ async function ensureDockerComposeReady(): Promise<void> {
 async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CLIOptions): Promise<ComboResult> {
 	const started = performance.now();
 	const scenarios = createSkippedScenarioMap('Not run');
-	const services = composeServicesForCombo(combo);
 	let kvRuntime: KVRuntime | null = null;
 	let sqlRuntime: SQLRuntime | null = null;
 	let strategyBenchmark: StrategyBenchmarkResult | undefined;
+	let phaseAttribution: PhaseAttribution[] | undefined;
 	let initialized = false;
 	const resultId = `${combo.id}/${profile}`;
 
 	try {
-		await composeDown();
-		if (services.length > 0) {
-			await composeUp(services);
-		}
-
 		const runId = createRunId(resultId);
 		kvRuntime = await createKVRuntime(combo.kv, profile);
 		sqlRuntime = await createSQLRuntime(combo.db, runId, profile);
@@ -640,6 +757,28 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 		await resetBenchData();
 		scenarios.reassignment = await scenarioReassignment(plan.reassignment, config);
 
+		await resetBenchData();
+		scenarios.mapping_miss = await scenarioMappingMiss(plan.basic);
+
+		await resetBenchData();
+		scenarios.next_id = await scenarioNextId(plan.basic);
+
+		await resetBenchData();
+		scenarios.paginate = await scenarioPaginate(plan.counting, options.bulkSize);
+
+		await resetBenchData();
+		scenarios.batch_write = await scenarioBatchWrite(plan.bulk, options.bulkSize);
+
+		await resetBenchData();
+		scenarios.cold_mapping_cache = await scenarioColdMappingCache(plan.basic, config);
+
+		await resetBenchData();
+		scenarios.concurrent_load = await scenarioConcurrentLoad(plan.basic);
+
+		await resetBenchData();
+		phaseAttribution = await measurePhaseAttribution(config, Math.max(5, Math.floor(options.iterations / 2)));
+
+		await resetBenchData();
 		strategyBenchmark = await benchmarkStrategyBulkMatrix(combo.db, profile, options, kvRuntime.kv);
 
 		const totalScenarios = Object.values(scenarios).length;
@@ -661,6 +800,8 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 			scenarios,
 			strategyBenchmark,
 			overallAvgMs: computeOverallAverage(scenarios),
+			perOpAvgMs: computePerOpAverage(scenarios, options.bulkSize),
+			phaseAttribution,
 			durationMs: performance.now() - started
 		};
 	} catch (error) {
@@ -690,8 +831,6 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 		if (sqlRuntime) {
 			await safely(async () => sqlRuntime?.close());
 		}
-
-		await composeDown();
 	}
 }
 
@@ -796,6 +935,7 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 			scenarios,
 			strategyBenchmark,
 			overallAvgMs: computeOverallAverage(scenarios),
+			perOpAvgMs: computePerOpAverage(scenarios, options.bulkSize),
 			durationMs: performance.now() - started
 		};
 	} catch (error) {
@@ -1145,7 +1285,8 @@ async function runStrategyBenchmarkCell(
 			status: 'passed',
 			statements: samplesMs.length,
 			samplesMs,
-			...calculateLatencyStats(samplesMs)
+			...calculateLatencyStats(samplesMs),
+			...(await measureKeyDistribution(getStrategyBenchmarkShardBindings()))
 		};
 	} catch (error) {
 		return {
@@ -1155,6 +1296,51 @@ async function runStrategyBenchmarkCell(
 			...calculateLatencyStats(samplesMs),
 			error: error instanceof Error ? error.message : String(error)
 		};
+	}
+}
+
+/**
+ * Counts how the just-written keys landed across the shards.
+ *
+ * Distribution is what separates the strategies; latency does not. Sizes cannot
+ * substitute either, because SQLite page granularity reported all five shards at
+ * exactly 64.00 KB for a hundred rows.
+ */
+async function measureKeyDistribution(
+	expectedShards: string[]
+): Promise<Pick<StrategyBenchmarkCell, 'keysPerShard' | 'maxShare' | 'chiSquare'>> {
+	try {
+		const stats = await getShardStats();
+
+		// getShardStats merges the configured shards with every shard the KV store
+		// still remembers, so earlier scenarios leave extra bindings in the list.
+		// Counting those inflates the chi-square baseline: five shards holding
+		// twenty keys each scored 40.0 instead of 0 because two stale bindings were
+		// being scored as empty.
+		const expected = new Set(expectedShards);
+		const keysPerShard: Record<string, number> = Object.fromEntries(expectedShards.map((shard) => [shard, 0]));
+		for (const stat of stats) {
+			if (expected.has(stat.binding)) {
+				keysPerShard[stat.binding] = stat.count;
+			}
+		}
+
+		const counts = Object.values(keysPerShard);
+		const total = counts.reduce((sum, count) => sum + count, 0);
+		if (counts.length === 0 || total === 0) {
+			return { keysPerShard };
+		}
+
+		const ideal = total / counts.length;
+		const busiest = Math.max(...counts);
+
+		return {
+			keysPerShard,
+			maxShare: busiest / total,
+			chiSquare: counts.reduce((sum, observed) => sum + (observed - ideal) ** 2 / ideal, 0)
+		};
+	} catch {
+		return {};
 	}
 }
 
@@ -1334,10 +1520,17 @@ async function scenarioBulkCrud(iterations: number, bulkSize: number): Promise<S
 async function scenarioAutoIncrement(iterations: number, dbFlavor: DatabaseFlavor): Promise<ScenarioStats> {
 	const insertSql = autoIncrementInsertSqlFor(dbFlavor);
 
+	// Every shard runs its own AUTOINCREMENT/SERIAL sequence, so `insert()`
+	// across shards eventually mints the same id twice and CollegeDB now refuses
+	// the second one. Pinning the generated-id table to one shard is the
+	// supported way to keep using the database's own sequence; `nextId()` is the
+	// other, and `next_id` covers it.
+	const generatedIdShard = 'shard-a';
+
 	return measureScenario('auto_increment', iterations, async (i) => {
 		const routingKey = `auto-${Date.now()}-${i}-${Math.floor(Math.random() * 100_000)}`;
 		const email = `${routingKey}@auto.local`;
-		const result = await insert<{ id: number | string }>(insertSql, [`Auto ${i}`, email, Date.now()]);
+		const result = await insertShard<{ id: number | string }>(generatedIdShard, insertSql, [`Auto ${i}`, email, Date.now()]);
 		const generatedId = result.generatedId;
 
 		const row = await first<Record<string, unknown>>(String(generatedId), AUTO_USER_SELECT_SQL, [generatedId]);
@@ -1426,6 +1619,147 @@ async function scenarioShardFanout(iterations: number, bulkSize: number): Promis
 
 		if (total <= 0) {
 			throw new Error('Expected fanout query total to be > 0');
+		}
+	});
+}
+
+/**
+ * Measures where a routed operation's time actually goes.
+ *
+ * The rest of the harness reports end-to-end scenario latency, which cannot say
+ * whether a change to the KV path helped. This attaches the router's phase
+ * observer and runs the four routed shapes, so KV reads, KV writes, hashing,
+ * shard selection, and SQL execution are reported separately.
+ */
+async function measurePhaseAttribution(config: CollegeDBConfig, iterations: number): Promise<PhaseAttribution[]> {
+	const collector = new PhaseCollector();
+
+	initialize({ ...config, onPhase: collector.observer, mappingCacheTtlMs: 0 });
+
+	try {
+		await resetBenchData();
+		collector.reset();
+
+		for (let i = 0; i < iterations; i++) {
+			const id = `attr-${Date.now()}-${i}`;
+
+			await run(id, INSERT_USER_SQL, [id, `Attr ${i}`, `${id}@attr.local`, Date.now()]);
+			await first<Record<string, unknown>>(id, SELECT_USER_SQL, [id]);
+			await run(id, UPDATE_USER_SQL, [`Attr ${i} updated`, id]);
+			await first<Record<string, unknown>>(`${id}-absent`, SELECT_USER_SQL, [`${id}-absent`]);
+		}
+
+		const stats = collector.stats();
+		const total = stats.reduce((sum, entry) => sum + entry.totalMs, 0);
+
+		return stats.map((entry) => ({
+			phase: entry.phase,
+			count: entry.count,
+			totalMs: entry.totalMs,
+			avgMs: entry.avgMs,
+			p95Ms: entry.p95Ms,
+			share: total > 0 ? entry.totalMs / total : 0
+		}));
+	} finally {
+		initialize(config);
+	}
+}
+
+async function scenarioMappingMiss(iterations: number): Promise<ScenarioStats> {
+	return measureScenario('mapping_miss', iterations, async (i) => {
+		const key = `absent-${Date.now()}-${i}-${Math.floor(Math.random() * 100_000)}`;
+		const row = await first<Record<string, unknown>>(key, SELECT_USER_SQL, [key]);
+		if (row) {
+			throw new Error(`Key ${key} should not exist`);
+		}
+	});
+}
+
+async function scenarioNextId(iterations: number): Promise<ScenarioStats> {
+	await runAllShards('CREATE TABLE IF NOT EXISTS seq_items (id INTEGER PRIMARY KEY, title VARCHAR(191))');
+
+	return measureScenario('next_id', iterations, async () => {
+		const id = await nextId('seq_items');
+		if (!Number.isFinite(id) || id <= 0) {
+			throw new Error(`nextId returned ${String(id)}`);
+		}
+	});
+}
+
+async function scenarioPaginate(iterations: number, seedCount: number): Promise<ScenarioStats> {
+	const prefix = `page-${Date.now()}`;
+	for (let i = 0; i < seedCount; i++) {
+		const id = `${prefix}-${String(i).padStart(4, '0')}`;
+		await run(id, INSERT_USER_SQL, [id, `Page ${i}`, `${id}@page.local`, Date.now()]);
+	}
+
+	return measureScenario('paginate', iterations, async (i) => {
+		const page = await paginate<Record<string, unknown>>('SELECT id, name FROM users', [], {
+			page: (i % 3) + 1,
+			limit: 10,
+			sortBy: 'id'
+		});
+		if (page.results.length === 0) {
+			throw new Error('Paginated read returned no rows');
+		}
+	});
+}
+
+async function scenarioBatchWrite(iterations: number, bulkSize: number): Promise<ScenarioStats> {
+	return measureScenario('batch_write', iterations, async (i) => {
+		const entries = new Array(bulkSize).fill(null).map((_, index) => {
+			const id = `batch-${Date.now()}-${i}-${index}`;
+			return {
+				key: id,
+				sql: INSERT_USER_SQL,
+				bindings: [id, `Batch ${index}`, `${id}@batch.local`, Date.now()]
+			};
+		});
+
+		const groups = await batch(entries);
+		const failed = groups.filter((group) => group.error);
+		if (failed.length > 0) {
+			throw new Error(`Batch failed on ${failed.map((group) => group.shard).join(', ')}: ${failed[0]?.error}`);
+		}
+	});
+}
+
+async function scenarioColdMappingCache(iterations: number, config: CollegeDBConfig): Promise<ScenarioStats> {
+	const seeded: string[] = [];
+	for (let i = 0; i < iterations; i++) {
+		const id = `cold-${Date.now()}-${i}`;
+		await run(id, INSERT_USER_SQL, [id, `Cold ${i}`, `${id}@cold.local`, Date.now()]);
+		seeded.push(id);
+	}
+
+	// Re-initialising with no mapping cache is what makes every read pay the KV
+	// lookup, which is the difference a warm isolate hides.
+	initialize({ ...config, mappingCacheTtlMs: 0 });
+
+	const stats = await measureScenario('cold_mapping_cache', iterations, async (i) => {
+		const key = seeded[i]!;
+		const row = await first<Record<string, unknown>>(key, SELECT_USER_SQL, [key]);
+		if (!row) {
+			throw new Error(`Missing seeded row ${key}`);
+		}
+	});
+
+	initialize(config);
+	return stats;
+}
+
+async function scenarioConcurrentLoad(iterations: number, concurrency: number = 16): Promise<ScenarioStats> {
+	const seeded: string[] = [];
+	for (let i = 0; i < concurrency; i++) {
+		const id = `conc-${Date.now()}-${i}`;
+		await run(id, INSERT_USER_SQL, [id, `Conc ${i}`, `${id}@conc.local`, Date.now()]);
+		seeded.push(id);
+	}
+
+	return measureScenario('concurrent_load', iterations, async () => {
+		const rows = await Promise.all(seeded.map((key) => first<Record<string, unknown>>(key, SELECT_USER_SQL, [key])));
+		if (rows.some((row) => !row)) {
+			throw new Error('Concurrent routed read missed a seeded row');
 		}
 	});
 }
@@ -1708,12 +2042,7 @@ async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Pro
 	});
 	await client.connect();
 
-	const kv =
-		profile === 'nuxthub'
-			? createNuxtHubKVProvider(createNuxtHubKVCompatClient(client))
-			: kvFlavor === 'redis'
-				? createRedisKVProvider(client)
-				: createValkeyKVProvider(client);
+	const kv = kvFlavor === 'redis' ? createRedisKVProvider(client) : createValkeyKVProvider(client);
 	return {
 		kv,
 		close: async () => {
@@ -1728,67 +2057,6 @@ async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Pro
 			}
 		}
 	};
-}
-
-function createNuxtHubKVCompatClient(client: any): {
-	get: <T = unknown>(key: string) => Promise<T | null>;
-	set: (key: string, value: unknown) => Promise<void>;
-	del: (key: string) => Promise<void>;
-	keys: (prefix?: string) => Promise<string[]>;
-} {
-	return {
-		get: async <T = unknown>(key: string) => {
-			const value = await client.get(key);
-			return (value === null ? null : String(value)) as T | null;
-		},
-		set: async (key: string, value: unknown) => {
-			const serialized = typeof value === 'string' ? value : JSON.stringify(value);
-			await client.set(key, serialized);
-		},
-		del: async (key: string) => {
-			await client.del(key);
-		},
-		keys: async (prefix: string = '') => {
-			const pattern = `${prefix}*`;
-			let cursor = '0';
-			const found: string[] = [];
-
-			do {
-				const scanResult = await scanRedisKeys(client, cursor, pattern);
-				cursor = scanResult.cursor;
-				for (const key of scanResult.keys) {
-					if (!prefix || key.startsWith(prefix)) {
-						found.push(key);
-					}
-				}
-			} while (cursor !== '0');
-
-			return found;
-		}
-	};
-}
-
-async function scanRedisKeys(client: any, cursor: string, pattern: string): Promise<{ cursor: string; keys: string[] }> {
-	try {
-		const objectResult = await client.scan(cursor, { MATCH: pattern, COUNT: 500 });
-		if (Array.isArray(objectResult)) {
-			return {
-				cursor: String(objectResult[0] ?? '0'),
-				keys: Array.isArray(objectResult[1]) ? objectResult[1] : []
-			};
-		}
-
-		return {
-			cursor: String(objectResult?.cursor ?? '0'),
-			keys: Array.isArray(objectResult?.keys) ? objectResult.keys : []
-		};
-	} catch {
-		const tupleResult = await client.scan(cursor, 'MATCH', pattern, 'COUNT', '500');
-		return {
-			cursor: String(tupleResult?.[0] ?? '0'),
-			keys: Array.isArray(tupleResult?.[1]) ? tupleResult[1] : []
-		};
-	}
 }
 
 async function createSQLRuntime(
@@ -1849,14 +2117,15 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 
 	const createPostgresProviderForProfile = (pool: PostgresPool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
 		switch (currentProfile) {
+			// 'hyperdrive' never reaches here; it only runs in the Cloudflare lane.
+			default:
 			case 'native':
 				return createPostgreSQLProvider(pool);
-			case 'drizzle':
-			case 'nuxthub': {
+			case 'drizzle': {
 				const drizzleDb = drizzlePostgres(pool);
 				return createPostgreSQLProvider(drizzleDb, drizzleSql);
 			}
-			case 'hyperdrive':
+			case 'per-statement-connection':
 				return createHyperdrivePostgresProvider({ connectionString }, (conn) => {
 					const client = new PostgresClient({ connectionString: conn });
 					return {
@@ -1950,14 +2219,15 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 
 	const createMySQLProviderForProfile = (pool: mysql.Pool, connectionString: string, currentProfile: AdapterProfile): SQLDatabase => {
 		switch (currentProfile) {
+			// 'hyperdrive' never reaches here; it only runs in the Cloudflare lane.
+			default:
 			case 'native':
 				return createMySQLProvider(pool);
-			case 'drizzle':
-			case 'nuxthub': {
+			case 'drizzle': {
 				const drizzleDb = drizzleMySQL(pool);
 				return createMySQLProvider(drizzleDb, drizzleSql);
 			}
-			case 'hyperdrive':
+			case 'per-statement-connection':
 				return createHyperdriveMySQLProvider({ connectionString }, (conn) => ({
 					execute: async (sql: string, bindings: any[] = []) => {
 						const connection = await mysql.createConnection(conn);
@@ -2013,7 +2283,7 @@ async function createSQLiteRuntime(runId: string, profile: AdapterProfile, shard
 		dbByBinding.set(shardFile.binding, new Database(shardFile.file, { create: true }));
 	}
 
-	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
+	const useDrizzle = profile === 'drizzle';
 	const shards: Record<string, SQLDatabase> = {};
 
 	for (const binding of shardBindings) {
@@ -2395,6 +2665,58 @@ function createSkippedScenario(name: ScenarioName, notes: string): ScenarioStats
 	};
 }
 
+/**
+ * Routed operations each scenario performs per iteration, used to normalize its
+ * average into a per-operation figure.
+ *
+ * `Overall Avg` is an unweighted mean of the scenario averages, so `bulk_crud`
+ * at 400 routed operations per iteration dominates `basic_crud` at 4 and the
+ * headline number ranks backends by bulk throughput while calling itself
+ * latency. Per-op normalization is comparable across scenarios.
+ */
+const SCENARIO_OPS_PER_ITERATION: Record<ScenarioName, (bulkSize: number) => number> = {
+	basic_crud: () => 4,
+	mapping_miss: () => 1,
+	next_id: () => 1,
+	paginate: () => 1,
+	batch_write: (bulkSize) => bulkSize,
+	cold_mapping_cache: () => 1,
+	concurrent_load: () => 16,
+	advanced_usage: () => 5,
+	migration_mapping: () => 20,
+	bulk_crud: (bulkSize) => bulkSize * 2 + Math.floor(bulkSize / 2),
+	auto_increment: () => 2,
+	indexing: () => 1,
+	metadata_fetch: () => 1,
+	pragma_or_info: () => 1,
+	counting: () => 1,
+	shard_fanout: () => 1,
+	reassignment: () => 3
+};
+
+/**
+ * Mean latency per routed operation across every scenario that passed.
+ */
+function computePerOpAverage(scenarios: Record<ScenarioName, ScenarioStats>, bulkSize: number): number | undefined {
+	const values: number[] = [];
+
+	for (const name of SCENARIO_NAMES) {
+		const scenario = scenarios[name];
+		if (scenario.status !== 'passed' || scenario.avgMs === undefined) {
+			continue;
+		}
+
+		const ops = Math.max(1, SCENARIO_OPS_PER_ITERATION[name](bulkSize));
+		values.push(scenario.avgMs / ops);
+	}
+
+	if (values.length === 0) {
+		return undefined;
+	}
+
+	return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
 function computeOverallAverage(scenarios: Record<ScenarioName, ScenarioStats>): number | undefined {
 	const passing = Object.values(scenarios).filter((scenario) => scenario.status === 'passed' && typeof scenario.avgMs === 'number');
 	if (passing.length === 0) {
@@ -2538,7 +2860,23 @@ function strategyBenchmarkCell(cell: StrategyBenchmarkCell | undefined): string 
 	if (cell.status === 'skipped') {
 		return 'N/A';
 	}
-	return `${formatMs(cell.avgMs)} / ${formatMs(cell.p95Ms)}`;
+
+	if (cell.maxShare === undefined || cell.chiSquare === undefined) {
+		return 'n/a';
+	}
+
+	return `${(cell.maxShare * 100).toFixed(0)}% / ${cell.chiSquare.toFixed(1)}`;
+}
+
+/**
+ * Chi-square against uniform, used to rank strategy columns. Lower is more even,
+ * and unlike a busiest-to-quietest ratio it stays finite when a shard is empty.
+ */
+function strategyDistributionMetric(cell: StrategyBenchmarkCell | undefined): number | undefined {
+	if (!cell || cell.status !== 'passed' || cell.chiSquare === undefined || !Number.isFinite(cell.chiSquare)) {
+		return undefined;
+	}
+	return cell.chiSquare;
 }
 
 function scenarioMetric(scenario: ScenarioStats): number | undefined {
@@ -2622,6 +2960,12 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		'- `Status` is `PASSED` only when every scenario in that environment passed, `PARTIAL_PASSED` when at least 66% passed, and `FAILED` below that threshold.'
 	);
 	lines.push('- Matrix latency cells are `average / p95` in milliseconds.');
+	lines.push(
+		'- `Per-Op Avg` divides each scenario by the routed operations it performs, so scenarios are comparable; `Overall Avg` is the unweighted scenario mean and is dominated by `bulk_crud`.'
+	);
+	lines.push(
+		'- Strategy cells report key distribution (`imbalance / chi-square`), not latency: without a coordinator every strategy is local computation and only decides where a new key lands.'
+	);
 	lines.push('- Fastest latency in each matrix row is bold; slowest latency is italicized.');
 	lines.push(
 		`- Strategy matrix cells execute ${options.strategyStatements} writes + ${options.strategyStatements} reads per strategy, per target-region profile.`
@@ -2642,33 +2986,50 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 	if (comboResults.length > 0) {
 		lines.push('## Matrix: SQL x KV (Overall)');
 		lines.push('');
-		lines.push('| Combination | Profile | Status | Passed | Failed | Skipped | Overall Avg | Duration | Best Strategy | Worst Strategy |');
-		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+		// The old Best/Worst Strategy columns ranked a 5.2% latency spread whose wins
+		// were near-uniform across all 16 columns, so they reported noise as a
+		// verdict. Strategy comparison lives in the distribution matrix now.
+		lines.push('| Combination | Profile | Status | Passed | Failed | Skipped | Per-Op Avg | Overall Avg | Duration |');
+		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 
 		for (const result of comboResults) {
 			const states = countScenarioStates(result.scenarios);
-			const strategyExtremes = strategyAggregateExtremes(result.strategyBenchmark);
-			const formattedStrategyCells = emphasizeRowExtremes([
-				{ text: formatStrategyAggregate(strategyExtremes.best), metric: strategyExtremes.best?.avgMs },
-				{ text: formatStrategyAggregate(strategyExtremes.worst), metric: strategyExtremes.worst?.avgMs }
-			]);
-
 			lines.push(
-				`| ${result.baseId} | ${result.profile} | ${formatStatus(result.status)} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} | ${formattedStrategyCells[0]} | ${formattedStrategyCells[1]} |`
+				`| ${result.baseId} | ${result.profile} | ${formatStatus(result.status)} | ${states.passed} | ${states.failed} | ${states.skipped} | ${formatMs(result.perOpAvgMs)} | ${formatMs(result.overallAvgMs)} | ${formatMs(result.durationMs)} |`
 			);
 		}
 		lines.push('');
 
+		const attributed = comboResults.filter((result) => result.phaseAttribution && result.phaseAttribution.length > 0);
+		if (attributed.length > 0) {
+			lines.push('## Matrix: Where a Routed Operation Spends Its Time');
+			lines.push('');
+			lines.push('- Measured with the router phase observer, with the in-memory mapping cache disabled so every read pays its KV lookup.');
+			lines.push('- `Share` is the fraction of total measured time in that phase. `Avg` is per occurrence, not per operation.');
+			lines.push('- Workload per environment: insert, routed read, update, and a read of a key with no row.');
+			lines.push('');
+			lines.push('| Combination | Profile | Phase | Count | Avg | p95 | Total | Share |');
+			lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+
+			for (const result of attributed) {
+				for (const phase of result.phaseAttribution ?? []) {
+					lines.push(
+						`| ${result.baseId} | ${result.profile} | \`${phase.phase}\` | ${phase.count} | ${formatMs(phase.avgMs)} | ${formatMs(phase.p95Ms)} | ${formatMs(phase.totalMs)} | ${(phase.share * 100).toFixed(1)}% |`
+					);
+				}
+			}
+			lines.push('');
+		}
+
 		lines.push('## Matrix: Adapter Profiles (Overall Avg)');
 		lines.push('');
-		lines.push('| Combination | native | drizzle | hyperdrive | nuxthub |');
+		lines.push('| Combination | native | drizzle | per-statement-connection |');
 		lines.push('| --- | --- | --- | --- | --- |');
 		for (const [baseId, byProfile] of groupedByBase) {
 			const profileCells = [
 				profileCell(byProfile.get('native')),
 				profileCell(byProfile.get('drizzle')),
-				profileCell(byProfile.get('hyperdrive')),
-				profileCell(byProfile.get('nuxthub'))
+				profileCell(byProfile.get('per-statement-connection'))
 			];
 			const formattedProfileCells = emphasizeRowExtremes(profileCells);
 
@@ -2728,10 +3089,16 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 					.map(([binding, location]) => `${binding}:${location.region}`)
 					.join(', ');
 
-				lines.push('## Matrix: Bulk Read/Write Strategy Mix (avg/p95)');
+				lines.push('## Matrix: Strategy Key Distribution (imbalance / chi-square)');
 				lines.push('');
 				lines.push(
 					`- Workload per strategy cell: ${firstStrategy.writesPerStrategy} writes + ${firstStrategy.readsPerStrategy} reads on ${firstStrategy.shardCount} mock databases.`
+				);
+				lines.push(
+					`- Cells are \`share of keys on the busiest shard\` / \`chi-square against uniform\`. Even distribution over ${firstStrategy.shardCount} shards puts the share at ${(100 / firstStrategy.shardCount).toFixed(0)}%; lower chi-square is more even.`
+				);
+				lines.push(
+					'- Distribution is measured rather than latency: without a coordinator every strategy is a few microseconds of local computation and only decides where a new key lands.'
 				);
 				lines.push('- Strategy columns include every single strategy and mixed read/write permutations where read and write differ.');
 				lines.push(`- Mock shard locations (Cloudflare D1-style regions): ${shardLocationSummary}`);
@@ -2753,7 +3120,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 						const row = benchmark.rows.find((entry) => entry.targetRegion === targetRegion);
 						const cells = benchmark.columns.map((column) => ({
 							text: strategyBenchmarkCell(row?.columns[column.key]),
-							metric: strategyCellMetric(row?.columns[column.key])
+							metric: strategyDistributionMetric(row?.columns[column.key])
 						}));
 						const formattedCells = emphasizeRowExtremes(cells);
 						lines.push(`| ${result.baseId} | ${result.profile} | ${formattedCells.join(' | ')} |`);
@@ -2807,12 +3174,12 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('');
 		lines.push('## Matrix: Cloudflare Adapter Profiles (Overall Avg)');
 		lines.push('');
-		lines.push('| Environment | native | drizzle | nuxthub |');
+		lines.push('| Environment | native | drizzle |');
 		lines.push('| --- | --- | --- | --- |');
 		const cloudflareProfileCells = [
 			profileCell(groupedCloudflare.get('native')),
 			profileCell(groupedCloudflare.get('drizzle')),
-			profileCell(groupedCloudflare.get('nuxthub'))
+			profileCell(groupedCloudflare.get('drizzle'))
 		];
 		const formattedCloudflareProfiles = emphasizeRowExtremes(cloudflareProfileCells);
 		lines.push(
@@ -2853,7 +3220,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 						const row = benchmark.rows.find((entry) => entry.targetRegion === targetRegion);
 						const cells = benchmark.columns.map((column) => ({
 							text: strategyBenchmarkCell(row?.columns[column.key]),
-							metric: strategyCellMetric(row?.columns[column.key])
+							metric: strategyDistributionMetric(row?.columns[column.key])
 						}));
 						const formattedCells = emphasizeRowExtremes(cells);
 						lines.push(`| cloudflare | ${result.profile} | ${formattedCells.join(' | ')} |`);
