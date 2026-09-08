@@ -592,6 +592,90 @@ describe('Hyperdrive Postgres helper', () => {
 		expect(created).toBe(2);
 	});
 
+	it('closes each interleaved request its own connection and no other', async () => {
+		// The sandbox Worker set the scope from a mutable module global, so a
+		// second request arriving mid-flight repointed it and dispose() closed the
+		// client the first request was still querying. Every connection then either
+		// leaked or died under a live statement, which exhausted Postgres and hung
+		// the lane instead of failing it. A per-request closure is the contract;
+		// this holds two scopes open at once to prove it.
+		const ended: string[] = [];
+		const clientsByScope = new Map<string, string>();
+
+		function providerFor(token: object, label: string) {
+			return createHyperdrivePostgresProvider(
+				{ connectionString: 'postgres://example' },
+				() => {
+					clientsByScope.set(label, label);
+					return {
+						async query() {
+							return { rows: [], rowCount: 0 };
+						},
+						async end() {
+							ended.push(label);
+						}
+					};
+				},
+				{ scope: () => token }
+			);
+		}
+
+		const requestOne = { id: 1 };
+		const requestTwo = { id: 2 };
+		const first = providerFor(requestOne, 'request-1');
+		const second = providerFor(requestTwo, 'request-2');
+
+		await first.prepare('SELECT 1').run();
+		await second.prepare('SELECT 2').run();
+		// Interleaved: request one is still running after request two started.
+		await first.prepare('SELECT 3').run();
+
+		expect(clientsByScope.size).toBe(2);
+		expect(ended).toEqual([]);
+
+		await second.dispose();
+		expect(ended).toEqual(['request-2']);
+
+		// Request one's client survived its neighbour's disposal, so its in-flight
+		// statement above could not have been cut off.
+		await first.prepare('SELECT 4').run();
+		await first.dispose();
+		expect(ended).toEqual(['request-2', 'request-1']);
+	});
+
+	it('releases the client for the scope that is current when dispose is called', async () => {
+		let created = 0;
+		const ended: number[] = [];
+		let scope = { id: 'request-1' };
+
+		const provider = createHyperdrivePostgresProvider(
+			{ connectionString: 'postgres://example' },
+			() => {
+				const id = ++created;
+				return {
+					async query() {
+						return { rows: [], rowCount: 0 };
+					},
+					async end() {
+						ended.push(id);
+					}
+				};
+			},
+			{ scope: () => scope }
+		);
+
+		await provider.prepare('SELECT 1').run();
+		scope = { id: 'request-2' };
+		await provider.prepare('SELECT 2').run();
+		expect(created).toBe(2);
+
+		// Disposing now targets the current scope only. The first client is left to
+		// garbage collection with the token it was keyed on, which is why the scope
+		// has to be a per-request closure rather than a value something else moves.
+		await provider.dispose();
+		expect(ended).toEqual([2]);
+	});
+
 	it('skips connect() when not provided', async () => {
 		const lifecycle: string[] = [];
 		const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({

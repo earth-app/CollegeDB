@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { createInMemoryKVProvider } from '../src/providers-memory';
 import {
 	addPlacementException,
 	candidateShards,
@@ -14,6 +13,7 @@ import {
 	withCurrentTopology,
 	type PlacementManifest
 } from '../src/placement';
+import { createInMemoryKVProvider } from '../src/providers-memory';
 import type { KVStorage } from '../src/types';
 
 const SHARDS = ['db-east', 'db-west', 'db-central'];
