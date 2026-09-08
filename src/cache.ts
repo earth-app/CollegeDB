@@ -42,6 +42,19 @@ export interface CacheOptions {
 }
 
 /**
+ * Concurrency used to clear a key prefix when the backend has no bulk delete.
+ * @private
+ */
+const DEFAULT_INVALIDATE_CONCURRENCY = 16;
+
+/**
+ * In-flight fetches, keyed by cache key, so concurrent misses on the same key
+ * share one call to the fetcher.
+ * @private
+ */
+const inFlight = new Map<string, Promise<unknown>>();
+
+/**
  * Resolves the KV store to use, preferring an explicit override.
  * @private
  */
@@ -91,13 +104,31 @@ export async function cached<T>(key: string, fetcher: () => Promise<T>, options:
 		}
 	}
 
-	const data = await fetcher();
-	const envelope: CacheEnvelope<T> = { v: data };
-	if (options.ttl && options.ttl > 0) {
-		envelope.e = Date.now() + options.ttl * 1000;
+	// Single-flight: concurrent callers that all miss share one fetcher call
+	// instead of each running it, which is the point at which a cold popular key
+	// otherwise stampedes whatever the fetcher talks to.
+	const pending = inFlight.get(key) as Promise<T> | undefined;
+	if (pending) {
+		return await pending;
 	}
-	await kv.put(key, JSON.stringify(envelope));
-	return data;
+
+	const work = (async () => {
+		const data = await fetcher();
+		const envelope: CacheEnvelope<T> = { v: data };
+		if (options.ttl && options.ttl > 0) {
+			envelope.e = Date.now() + options.ttl * 1000;
+		}
+		await kv.put(key, JSON.stringify(envelope));
+		return data;
+	})();
+
+	inFlight.set(key, work);
+
+	try {
+		return await work;
+	} finally {
+		inFlight.delete(key);
+	}
 }
 
 /**
@@ -113,17 +144,37 @@ export async function cached<T>(key: string, fetcher: () => Promise<T>, options:
  * await invalidate(`tickets:list:`); // after a ticket write
  * ```
  */
-export async function invalidate(prefix: string, options: { kv?: KVStorage } = {}): Promise<number> {
+export async function invalidate(prefix: string, options: { kv?: KVStorage; concurrency?: number } = {}): Promise<number> {
 	const kv = resolveKV(options.kv);
+	const concurrency = Math.max(1, options.concurrency ?? DEFAULT_INVALIDATE_CONCURRENCY);
 
 	let deleted = 0;
 	let cursor: string | undefined;
 	do {
 		const result = await kv.list({ prefix, cursor });
-		for (const entry of result.keys) {
-			await kv.delete(entry.name);
-			deleted++;
+		const names = result.keys.map((entry) => entry.name);
+
+		if (names.length > 0) {
+			if (kv.deleteMany) {
+				await kv.deleteMany(names);
+			} else {
+				// Deleting one key per round trip made clearing a large prefix a
+				// serial chain as long as the prefix.
+				let next = 0;
+				const workers = new Array(Math.min(concurrency, names.length)).fill(null).map(async () => {
+					while (next < names.length) {
+						const name = names[next++];
+						if (name !== undefined) {
+							await kv.delete(name);
+						}
+					}
+				});
+				await Promise.all(workers);
+			}
+
+			deleted += names.length;
 		}
+
 		cursor = result.list_complete ? undefined : result.cursor;
 	} while (cursor);
 
