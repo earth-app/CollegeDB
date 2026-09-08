@@ -1,9 +1,13 @@
 /**
- * CollegeDB - Cloudflare D1 Sharding Router
+ * CollegeDB - Universal Database Horizontal Sharding Router
  *
- * A TypeScript library for horizontal scaling of SQLite-style databases on Cloudflare
- * using D1 and KV. Routes queries to the correct D1 database instance using primary
- * key mappings stored in Cloudflare KV.
+ * A TypeScript library for horizontal scaling of SQL databases. Routes each
+ * query to the shard that owns its primary key, either by computing the shard
+ * from the key or by reading a mapping from a key-value store.
+ *
+ * SQL backends: Cloudflare D1, PostgreSQL, MySQL, MariaDB, SQLite, and any
+ * Drizzle ORM instance over them. Mapping backends: Cloudflare Workers KV,
+ * Redis, Valkey, and NuxtHub KV. Runs on Cloudflare Workers and on Node or Bun.
  *
  * @author Gregory Mitchell
  * @license MIT
@@ -16,6 +20,7 @@ export {
 	allAllShardsGlobal,
 	allByLookupKey,
 	allShard,
+	batch,
 	collegedb,
 	count,
 	countAllShards,
@@ -59,7 +64,11 @@ export {
 	paginate,
 	patch,
 	prepare,
+	query,
+	queryAll,
+	queryFirst,
 	reassignShard,
+	rebalance,
 	resetConfig,
 	run,
 	runAllShards,
@@ -70,6 +79,8 @@ export {
 } from './router';
 
 export type {
+	BatchEntry,
+	BatchShardResult,
 	CreateIndexOptions,
 	CrudReturningOptions,
 	EnsureSchemaOptions,
@@ -83,9 +94,31 @@ export type {
 	NextIdOptions,
 	PaginateOptions,
 	PaginatedResult,
+	RebalanceResult,
 	ShardSizeResult,
 	ShardTableCount
 } from './router';
+
+// Export the routing-key planner
+export { planQuery, unroutableError } from './planner';
+export type { PlanQueryOptions, QueryPlan } from './planner';
+
+// Export computed-placement primitives
+export {
+	candidateShards,
+	createManifest,
+	hrwShard,
+	legacyModuloShard,
+	shardForEpoch,
+	withCurrentTopology,
+	type PlacementAlgorithm,
+	type PlacementEpoch,
+	type PlacementManifest
+} from './placement';
+
+// Export per-phase timing instrumentation
+export { PhaseCollector, isPhaseObserverActive, setPhaseObserver } from './telemetry';
+export type { PhaseName, PhaseObserver, PhaseSpan, PhaseStats } from './telemetry';
 
 // Export deterministic SQL builders
 export { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier } from './query';
@@ -121,13 +154,16 @@ export {
 	type HyperdriveBindingLike,
 	type HyperdriveMySQLClientFactory,
 	type HyperdrivePostgresClientFactory,
+	type HyperdriveProvider,
+	type HyperdriveProviderOptions,
 	type MySQLClientLike,
 	type NuxtHubKVLike,
 	type PostgresClientLike,
 	type RedisLikeClient,
 	type SQLiteClientLike,
 	type ToProviderOptions,
-	type WorkersKVNamespaceLike
+	type WorkersKVNamespaceLike,
+	type WorkersKVProviderOptions
 } from './providers';
 
 // Export in-memory mock providers for testing
@@ -156,6 +192,7 @@ export {
 
 // Export types
 export type {
+	BatchStatement,
 	CollegeDBConfig,
 	D1Region,
 	Env,
