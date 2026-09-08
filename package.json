@@ -1,7 +1,7 @@
 {
   "name": "@earth-app/collegedb",
   "description": "Cloudflare D1 sharding router with KV-backed primary-key mappings and a Durable Object shard coordinator.",
-  "version": "1.2.4",
+  "version": "1.3.0",
   "license": "MIT",
   "author": "Gregory Mitchell",
   "type": "module",
