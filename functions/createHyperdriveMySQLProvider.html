@@ -13,11 +13,12 @@
 <section class="tsd-panel">
 <ul class="tsd-signatures">
 <li class="">
-<div class="tsd-signature tsd-anchor-link" id="createhyperdrivemysqlprovider"><span class="tsd-kind-call-signature">createHyperdriveMySQLProvider</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">hyperdrive</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/HyperdriveBindingLike.html" class="tsd-signature-type tsd-kind-interface">HyperdriveBindingLike</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">clientFactory</span><span class="tsd-signature-symbol">:</span> <a href="../types/HyperdriveMySQLClientFactory.html" class="tsd-signature-type tsd-kind-type-alias">HyperdriveMySQLClientFactory</a><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><a href="#createhyperdrivemysqlprovider" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-signature tsd-anchor-link" id="createhyperdrivemysqlprovider"><span class="tsd-kind-call-signature">createHyperdriveMySQLProvider</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">hyperdrive</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/HyperdriveBindingLike.html" class="tsd-signature-type tsd-kind-interface">HyperdriveBindingLike</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">clientFactory</span><span class="tsd-signature-symbol">:</span> <a href="../types/HyperdriveMySQLClientFactory.html" class="tsd-signature-type tsd-kind-type-alias">HyperdriveMySQLClientFactory</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">options</span><span class="tsd-signature-symbol">?:</span> <a href="../interfaces/HyperdriveProviderOptions.html" class="tsd-signature-type tsd-kind-interface">HyperdriveProviderOptions</a><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/HyperdriveProvider.html" class="tsd-signature-type tsd-kind-interface">HyperdriveProvider</a><a href="#createhyperdrivemysqlprovider" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Creates a MySQL/MariaDB adapter wired to a Hyperdrive binding.</p>
-<p>The returned provider creates a transient client for each statement execution.
-Hyperdrive handles connection pooling under the hood.</p>
+<p>The client is created once per request and reused for every statement in that
+request. See <a href="createHyperdrivePostgresProvider.html" class="tsd-kind-function">createHyperdrivePostgresProvider</a> for why per-statement
+clients are the wrong unit and why a module-scoped client is not the fix.</p>
 </div>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
@@ -27,11 +28,18 @@ Hyperdrive handles connection pooling under the hood.</p>
 </div></li>
 <li><span><span class="tsd-kind-parameter">clientFactory</span>: <a href="../types/HyperdriveMySQLClientFactory.html" class="tsd-signature-type tsd-kind-type-alias">HyperdriveMySQLClientFactory</a></span>
 <div class="tsd-comment tsd-typography"><p>Client factory (e.g. <code>connectionString =&gt; mysql.createConnection(connectionString)</code>)</p>
+</div></li>
+<li><span><span class="tsd-kind-parameter">options</span>: <a href="../interfaces/HyperdriveProviderOptions.html" class="tsd-signature-type tsd-kind-interface">HyperdriveProviderOptions</a><span class="tsd-signature-symbol"> = {}</span></span>
+<div class="tsd-comment tsd-typography"><p>Request-scope hook</p>
 </div></li></ul></div>
-<h4 class="tsd-returns-title">Returns <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a></h4><p>SQLDatabase-compatible adapter</p>
-<aside class="tsd-sources">
+<h4 class="tsd-returns-title">Returns <a href="../interfaces/HyperdriveProvider.html" class="tsd-signature-type tsd-kind-interface">HyperdriveProvider</a></h4><p>SQLDatabase-compatible adapter with a <code>dispose</code> hook</p>
+
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.0</p>
+</div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/providers.ts#L475">src/providers.ts:475</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/providers.ts#L892">src/providers.ts:892</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

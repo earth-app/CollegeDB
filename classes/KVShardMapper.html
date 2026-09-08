@@ -12,7 +12,7 @@
 <h1>Class KVShardMapper</h1></div>
 <section class="tsd-panel tsd-comment">
 <div class="tsd-comment tsd-typography"><p>The KVShardMapper class provides a persistent storage layer for mapping
-primary keys to their assigned D1 database shards. It uses Cloudflare KV
+primary keys to their assigned shards. It uses the configured key-value store
 for global, eventually consistent storage with low latency reads.</p>
 <p>Features:</p>
 <ul>
@@ -31,7 +31,7 @@ for global, eventually consistent storage with low latency reads.</p>
 
 </div></div></section><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L150">src/kvmap.ts:150</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L182">src/kvmap.ts:182</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -46,15 +46,19 @@ for global, eventually consistent storage with low latency reads.</p>
 <div class="tsd-index-list"><a href="#addknownshard" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Known<wbr/>Shard</span></a>
 <a href="#addlookupkeys" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Lookup<wbr/>Keys</span></a>
 <a href="#clearallmappings" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>clear<wbr/>All<wbr/>Mappings</span></a>
+<a href="#clearmappingcache" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>clear<wbr/>Mapping<wbr/>Cache</span></a>
 <a href="#deleteshardmapping" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>delete<wbr/>Shard<wbr/>Mapping</span></a>
 <a href="#getalllookupkeys" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>All<wbr/>Lookup<wbr/>Keys</span></a>
 <a href="#getkeysforshard" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Keys<wbr/>For<wbr/>Shard</span></a>
 <a href="#getknownshards" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Known<wbr/>Shards</span></a>
 <a href="#getshardkeycounts" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Key<wbr/>Counts</span></a>
 <a href="#getshardmapping" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Mapping</span></a>
+<a href="#getshardmappings" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Mappings</span></a>
 <a href="#hashkey" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>hash<wbr/>Key</span></a>
+<a href="#invalidatecachedmapping" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>invalidate<wbr/>Cached<wbr/>Mapping</span></a>
 <a href="#setknownshards" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Known<wbr/>Shards</span></a>
 <a href="#setshardmapping" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mapping</span></a>
+<a href="#setshardmappings" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mappings</span></a>
 <a href="#setshardmappingsbatch" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mappings<wbr/>Batch</span></a>
 <a href="#updateshardmapping" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>update<wbr/>Shard<wbr/>Mapping</span></a>
 </div></section></div></details></section></section>
@@ -65,7 +69,7 @@ for global, eventually consistent storage with low latency reads.</p>
 <h3 class="tsd-anchor-link" id="constructor"><span>constructor</span><a href="#constructor" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
 <li class="">
-<div class="tsd-signature tsd-anchor-link" id="constructorkvshardmapper"><span class="tsd-signature-keyword">new</span> <span class="tsd-kind-constructor-signature">KVShardMapper</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">kv</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">config</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Partial</span><span class="tsd-signature-symbol">&lt;</span><br/>        <span class="tsd-signature-type">Pick</span><span class="tsd-signature-symbol">&lt;</span><br/>            <a href="../interfaces/CollegeDBConfig.html" class="tsd-signature-type tsd-kind-interface">CollegeDBConfig</a><span class="tsd-signature-symbol">,</span><br/>            <span class="tsd-signature-type">&quot;hashShardMappings&quot;</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;mappingCacheTtlMs&quot;</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;knownShardsCacheTtlMs&quot;</span><span class="tsd-signature-symbol">,</span><br/>        <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="" class="tsd-signature-type tsd-kind-class">KVShardMapper</a><a href="#constructorkvshardmapper" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-signature tsd-anchor-link" id="constructorkvshardmapper"><span class="tsd-signature-keyword">new</span> <span class="tsd-kind-constructor-signature">KVShardMapper</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">kv</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">config</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Partial</span><span class="tsd-signature-symbol">&lt;</span><br/>        <span class="tsd-signature-type">Pick</span><span class="tsd-signature-symbol">&lt;</span><br/>            <a href="../interfaces/CollegeDBConfig.html" class="tsd-signature-type tsd-kind-interface">CollegeDBConfig</a><span class="tsd-signature-symbol">,</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;hashShardMappings&quot;</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;mappingCacheTtlMs&quot;</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;knownShardsCacheTtlMs&quot;</span><br/>            <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;legacyMultiKeyLookup&quot;</span><span class="tsd-signature-symbol">,</span><br/>        <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="" class="tsd-signature-type tsd-kind-class">KVShardMapper</a><a href="#constructorkvshardmapper" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Creates a new KVShardMapper instance</p>
 </div>
@@ -75,12 +79,12 @@ for global, eventually consistent storage with low latency reads.</p>
 <li><span><span class="tsd-kind-parameter">kv</span>: <a href="../interfaces/KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a></span>
 <div class="tsd-comment tsd-typography"><p>KV storage provider</p>
 </div></li>
-<li><span><span class="tsd-kind-parameter">config</span>: <span class="tsd-signature-type">Partial</span><span class="tsd-signature-symbol">&lt;</span><br/>    <span class="tsd-signature-type">Pick</span><span class="tsd-signature-symbol">&lt;</span><br/>        <a href="../interfaces/CollegeDBConfig.html" class="tsd-signature-type tsd-kind-interface">CollegeDBConfig</a><span class="tsd-signature-symbol">,</span><br/>        <span class="tsd-signature-type">&quot;hashShardMappings&quot;</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;mappingCacheTtlMs&quot;</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;knownShardsCacheTtlMs&quot;</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol"> = {}</span></span>
+<li><span><span class="tsd-kind-parameter">config</span>: <span class="tsd-signature-type">Partial</span><span class="tsd-signature-symbol">&lt;</span><br/>    <span class="tsd-signature-type">Pick</span><span class="tsd-signature-symbol">&lt;</span><br/>        <a href="../interfaces/CollegeDBConfig.html" class="tsd-signature-type tsd-kind-interface">CollegeDBConfig</a><span class="tsd-signature-symbol">,</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;hashShardMappings&quot;</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;mappingCacheTtlMs&quot;</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;knownShardsCacheTtlMs&quot;</span><br/>        <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;legacyMultiKeyLookup&quot;</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol"> = {}</span></span>
 <div class="tsd-comment tsd-typography"><p>Configuration options including hashing preference</p>
 </div></li></ul></div>
 <h4 class="tsd-returns-title">Returns <a href="" class="tsd-signature-type tsd-kind-class">KVShardMapper</a></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L201">src/kvmap.ts:201</a></li></ul></aside></div></li></ul></section></section></details>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L239">src/kvmap.ts:239</a></li></ul></aside></div></li></ul></section></section></details>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Methods"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="methods-1">Methods<a href="#methods-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
@@ -111,7 +115,7 @@ This operation is idempotent - adding the same shard multiple times has no effec
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L661">src/kvmap.ts:661</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L736">src/kvmap.ts:736</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="addlookupkeys"><span>add<wbr/>Lookup<wbr/>Keys</span><a href="#addlookupkeys" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -145,7 +149,7 @@ query the same shard mapping using multiple identifiers (e.g., username, email, 
 <h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.3</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L831">src/kvmap.ts:831</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L906">src/kvmap.ts:906</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="clearallmappings"><span>clear<wbr/>All<wbr/>Mappings</span><a href="#clearallmappings" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -171,7 +175,22 @@ complete system resets.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L791">src/kvmap.ts:791</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L866">src/kvmap.ts:866</a></li></ul></aside></div></li></ul></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="clearmappingcache"><span>clear<wbr/>Mapping<wbr/>Cache</span><a href="#clearmappingcache" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="">
+<div class="tsd-signature tsd-anchor-link" id="clearmappingcache-1"><span class="tsd-kind-call-signature">clearMappingCache</span><span class="tsd-signature-symbol">()</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">void</span><a href="#clearmappingcache-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Discards every cached mapping, so the next read of any key goes to KV.</p>
+</div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">void</span></h4>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-1">Since<a href="#since-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L344">src/kvmap.ts:344</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="deleteshardmapping"><span>delete<wbr/>Shard<wbr/>Mapping</span><a href="#deleteshardmapping" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -202,7 +221,7 @@ and may be assigned to a different shard on next access.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L553">src/kvmap.ts:553</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L628">src/kvmap.ts:628</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="getalllookupkeys"><span>get<wbr/>All<wbr/>Lookup<wbr/>Keys</span><a href="#getalllookupkeys" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -230,10 +249,10 @@ understanding what keys resolve to the same shard.</p>
 
 </div>
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-1">Since<a href="#since-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.3</p>
+<h4 class="tsd-anchor-link" id="since-2">Since<a href="#since-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.3</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L944">src/kvmap.ts:944</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L1131">src/kvmap.ts:1131</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="getkeysforshard"><span>get<wbr/>Keys<wbr/>For<wbr/>Shard</span><a href="#getkeysforshard" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -262,7 +281,7 @@ datasets. Consider caching results or using getShardKeyCounts() for statistics.<
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L686">src/kvmap.ts:686</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L761">src/kvmap.ts:761</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="getknownshards"><span>get<wbr/>Known<wbr/>Shards</span><a href="#getknownshards" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -285,7 +304,7 @@ for efficient shard discovery.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L610">src/kvmap.ts:610</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L685">src/kvmap.ts:685</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="getshardkeycounts"><span>get<wbr/>Shard<wbr/>Key<wbr/>Counts</span><a href="#getshardkeycounts" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -311,7 +330,7 @@ accessed statistics.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L748">src/kvmap.ts:748</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L823">src/kvmap.ts:823</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="getshardmapping"><span>get<wbr/>Shard<wbr/>Mapping</span><a href="#getshardmapping" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -340,7 +359,39 @@ assigned to any shard yet. Supports both single-key and multi-key lookups.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L329">src/kvmap.ts:329</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L395">src/kvmap.ts:395</a></li></ul></aside></div></li></ul></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="getshardmappings"><span>get<wbr/>Shard<wbr/>Mappings</span><a href="#getshardmappings" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="">
+<div class="tsd-signature tsd-anchor-link" id="getshardmappings-1"><span class="tsd-kind-call-signature">getShardMappings</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">primaryKeys</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../interfaces/ShardMapping.html" class="tsd-signature-type tsd-kind-interface">ShardMapping</a> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">null</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><a href="#getshardmappings-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Resolves many primary keys to their shard mappings in one round trip.</p>
+<p>Keys already in the in-process cache are answered from it and never reach
+the store. The remainder go out as a single <a href="../interfaces/KVStorage.html#getmany" class="tsd-kind-method">KVStorage.getMany</a> where
+the store implements one (Redis and Valkey issue <code>MGET</code>), and as bounded
+concurrent reads where it does not, so the result is the same either way
+and only the round-trip count differs.</p>
+</div>
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li><span><span class="tsd-kind-parameter">primaryKeys</span>: <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span></span>
+<div class="tsd-comment tsd-typography"><p>Keys to resolve; duplicates are collapsed</p>
+</div></li></ul></div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../interfaces/ShardMapping.html" class="tsd-signature-type tsd-kind-interface">ShardMapping</a> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">null</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4><p>Mapping per key, <code>null</code> for a key with no mapping</p>
+
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-3">Since<a href="#since-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div>
+<div class="tsd-tag-example">
+<h4 class="tsd-anchor-link" id="example-10">Example<a href="#example-10" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-8">mappings</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">getShardMappings</span><span class="hl-1">([</span><span class="hl-2">&#39;user-1&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;user-2&#39;</span><span class="hl-1">]);</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">mappings</span><span class="hl-1">.</span><span class="hl-0">get</span><span class="hl-1">(</span><span class="hl-2">&#39;user-1&#39;</span><span class="hl-1">)?.</span><span class="hl-5">shard</span><span class="hl-1">);</span>
+</code><button type="button">Copy</button></pre>
+
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L985">src/kvmap.ts:985</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="hashkey"><span>hash<wbr/>Key</span><a href="#hashkey" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -358,7 +409,33 @@ assigned to any shard yet. Supports both single-key and multi-key lookups.</p>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span></h4><p>The hashed key or original key if hashing is disabled</p>
 <aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L284">src/kvmap.ts:284</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L355">src/kvmap.ts:355</a></li></ul></aside></div></li></ul></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="invalidatecachedmapping"><span>invalidate<wbr/>Cached<wbr/>Mapping</span><a href="#invalidatecachedmapping" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="">
+<div class="tsd-signature tsd-anchor-link" id="invalidatecachedmapping-1"><span class="tsd-kind-call-signature">invalidateCachedMapping</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">key</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span><a href="#invalidatecachedmapping-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Drops the in-memory cache entry for a key so the next read goes to KV.</p>
+<p><code>mappingCacheTtlMs</code> is a consistency window, not just a latency knob: until
+it expires, this process keeps routing a key to the shard it last saw.
+Reassignment calls this so the process that performed it is correct
+immediately; other processes still see the old shard until their own entry
+expires.</p>
+</div>
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li><span><span class="tsd-kind-parameter">key</span>: <span class="tsd-signature-type">string</span></span>
+<div class="tsd-comment tsd-typography"><p>Logical key whose cached mapping should be discarded</p>
+</div></li></ul></div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span></h4>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-4">Since<a href="#since-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L332">src/kvmap.ts:332</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="setknownshards"><span>set<wbr/>Known<wbr/>Shards</span><a href="#setknownshards" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -381,12 +458,12 @@ used during system initialization or when shards are added/removed in bulk.</p>
 <h4 class="tsd-anchor-link" id="throws-9">Throws<a href="#throws-9" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If KV write operation fails</p>
 </div>
 <div class="tsd-tag-example">
-<h4 class="tsd-anchor-link" id="example-10">Example<a href="#example-10" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-3">// Update shard list after adding new regions</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">setKnownShards</span><span class="hl-1">([</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-central&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-asia&#39;</span><span class="hl-1">]);</span>
+<h4 class="tsd-anchor-link" id="example-11">Example<a href="#example-11" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-3">// Update shard list after adding new regions</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">setKnownShards</span><span class="hl-1">([</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-central&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-asia&#39;</span><span class="hl-1">]);</span>
 </code><button type="button">Copy</button></pre>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L635">src/kvmap.ts:635</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L710">src/kvmap.ts:710</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="setshardmapping"><span>set<wbr/>Shard<wbr/>Mapping</span><a href="#setshardmapping" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -418,12 +495,37 @@ Use updateShardMapping() if you want to preserve creation timestamp.</p>
 <h4 class="tsd-anchor-link" id="throws-10">Throws<a href="#throws-10" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If KV write operation fails</p>
 </div>
 <div class="tsd-tag-example">
-<h4 class="tsd-anchor-link" id="example-11">Example<a href="#example-11" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-3">// Assign a new user to the west coast shard with multiple lookup keys</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">setShardMapping</span><span class="hl-1">(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;username:john&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;email:john@example.com&#39;</span><span class="hl-1">]);</span>
+<h4 class="tsd-anchor-link" id="example-12">Example<a href="#example-12" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-3">// Assign a new user to the west coast shard with multiple lookup keys</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">setShardMapping</span><span class="hl-1">(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;username:john&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;email:john@example.com&#39;</span><span class="hl-1">]);</span>
 </code><button type="button">Copy</button></pre>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L389">src/kvmap.ts:389</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L464">src/kvmap.ts:464</a></li></ul></aside></div></li></ul></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="setshardmappings"><span>set<wbr/>Shard<wbr/>Mappings</span><a href="#setshardmappings" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="">
+<div class="tsd-signature tsd-anchor-link" id="setshardmappings-1"><span class="tsd-kind-call-signature">setShardMappings</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">entries</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">primaryKey</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span> <span class="tsd-kind-property">shard</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span> <span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span><a href="#setshardmappings-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Writes many single-key shard mappings in one round trip.</p>
+<p>The counterpart to <a href="#getshardmappings" class="tsd-kind-method">getShardMappings</a>, and the same trade: one
+<a href="../interfaces/KVStorage.html#putmany" class="tsd-kind-method">KVStorage.putMany</a> where the store has one, bounded concurrent writes
+where it does not. Only single-key mappings are written; use
+<a href="#setshardmapping" class="tsd-kind-method">setShardMapping</a> when a key needs lookup aliases.</p>
+</div>
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li><span><span class="tsd-kind-parameter">entries</span>: <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">primaryKey</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span> <span class="tsd-kind-property">shard</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span> <span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">[]</span></span>
+<div class="tsd-comment tsd-typography"><p>Key to shard assignments to record</p>
+</div></li></ul></div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span></h4>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-5">Since<a href="#since-5" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L1039">src/kvmap.ts:1039</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="setshardmappingsbatch"><span>set<wbr/>Shard<wbr/>Mappings<wbr/>Batch</span><a href="#setshardmappingsbatch" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -452,10 +554,10 @@ mapping time while avoiding unbounded concurrency spikes.</p>
 
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-2">Since<a href="#since-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
+<h4 class="tsd-anchor-link" id="since-6">Since<a href="#since-6" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L904">src/kvmap.ts:904</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L1091">src/kvmap.ts:1091</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="updateshardmapping"><span>update<wbr/>Shard<wbr/>Mapping</span><a href="#updateshardmapping" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -484,12 +586,12 @@ Works with both single-key and multi-key mappings.</p>
 <h4 class="tsd-anchor-link" id="throws-11">Throws<a href="#throws-11" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If no existing mapping found or KV operation fails</p>
 </div>
 <div class="tsd-tag-example">
-<h4 class="tsd-anchor-link" id="example-12">Example<a href="#example-12" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">  </span><span class="hl-3">// Move user to a different shard for rebalancing</span><br/><span class="hl-1">  </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">updateShardMapping</span><span class="hl-1">(</span><span class="hl-2">&#39;email:user@example.com&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-central&#39;</span><span class="hl-1">);</span><br/><span class="hl-1">  </span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-2">&#39;User successfully moved to central shard&#39;</span><span class="hl-1">);</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">  </span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">error</span><span class="hl-1">(</span><span class="hl-2">&#39;Failed to update mapping:&#39;</span><span class="hl-1">, </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">message</span><span class="hl-1">);</span><br/><span class="hl-1">}</span>
+<h4 class="tsd-anchor-link" id="example-13">Example<a href="#example-13" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">  </span><span class="hl-3">// Move user to a different shard for rebalancing</span><br/><span class="hl-1">  </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">updateShardMapping</span><span class="hl-1">(</span><span class="hl-2">&#39;email:user@example.com&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-central&#39;</span><span class="hl-1">);</span><br/><span class="hl-1">  </span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-2">&#39;User successfully moved to central shard&#39;</span><span class="hl-1">);</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">  </span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">error</span><span class="hl-1">(</span><span class="hl-2">&#39;Failed to update mapping:&#39;</span><span class="hl-1">, </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">message</span><span class="hl-1">);</span><br/><span class="hl-1">}</span>
 </code><button type="button">Copy</button></pre>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/kvmap.ts#L466">src/kvmap.ts:466</a></li></ul></aside></div></li></ul></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/kvmap.ts#L541">src/kvmap.ts:541</a></li></ul></aside></div></li></ul></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
@@ -508,7 +610,7 @@ Works with both single-key and multi-key mappings.</p>
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Constructors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Constructors</summary>
 <div><a href="#constructor"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Constructor"><use href="../assets/icons.svg#icon-512"></use></svg><span>constructor</span></a></div></details>
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Methods"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Methods</summary>
-<div><a href="#addknownshard"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Known<wbr/>Shard</span></a><a href="#addlookupkeys"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Lookup<wbr/>Keys</span></a><a href="#clearallmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>clear<wbr/>All<wbr/>Mappings</span></a><a href="#deleteshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>delete<wbr/>Shard<wbr/>Mapping</span></a><a href="#getalllookupkeys"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>All<wbr/>Lookup<wbr/>Keys</span></a><a href="#getkeysforshard"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Keys<wbr/>For<wbr/>Shard</span></a><a href="#getknownshards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Known<wbr/>Shards</span></a><a href="#getshardkeycounts"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Key<wbr/>Counts</span></a><a href="#getshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Mapping</span></a><a href="#hashkey"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>hash<wbr/>Key</span></a><a href="#setknownshards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Known<wbr/>Shards</span></a><a href="#setshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mapping</span></a><a href="#setshardmappingsbatch"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mappings<wbr/>Batch</span></a><a href="#updateshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>update<wbr/>Shard<wbr/>Mapping</span></a></div></details></div></details></div>
+<div><a href="#addknownshard"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Known<wbr/>Shard</span></a><a href="#addlookupkeys"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>add<wbr/>Lookup<wbr/>Keys</span></a><a href="#clearallmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>clear<wbr/>All<wbr/>Mappings</span></a><a href="#clearmappingcache"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>clear<wbr/>Mapping<wbr/>Cache</span></a><a href="#deleteshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>delete<wbr/>Shard<wbr/>Mapping</span></a><a href="#getalllookupkeys"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>All<wbr/>Lookup<wbr/>Keys</span></a><a href="#getkeysforshard"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Keys<wbr/>For<wbr/>Shard</span></a><a href="#getknownshards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Known<wbr/>Shards</span></a><a href="#getshardkeycounts"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Key<wbr/>Counts</span></a><a href="#getshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Mapping</span></a><a href="#getshardmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>get<wbr/>Shard<wbr/>Mappings</span></a><a href="#hashkey"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>hash<wbr/>Key</span></a><a href="#invalidatecachedmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>invalidate<wbr/>Cached<wbr/>Mapping</span></a><a href="#setknownshards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Known<wbr/>Shards</span></a><a href="#setshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mapping</span></a><a href="#setshardmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mappings</span></a><a href="#setshardmappingsbatch"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>set<wbr/>Shard<wbr/>Mappings<wbr/>Batch</span></a><a href="#updateshardmapping"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>update<wbr/>Shard<wbr/>Mapping</span></a></div></details></div></details></div>
 <div class="site-menu">
 <nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
 <ul class="tsd-small-nested-navigation" id="tsd-nav-container">

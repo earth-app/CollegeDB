@@ -13,7 +13,7 @@
 <section class="tsd-panel">
 <ul class="tsd-signatures">
 <li class="">
-<div class="tsd-signature tsd-anchor-link" id="dropschema"><span class="tsd-kind-call-signature">dropSchema</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">d1</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-symbol">...</span><span class="tsd-kind-parameter">tables</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span><a href="#dropschema" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-signature tsd-anchor-link" id="dropschema"><span class="tsd-kind-call-signature">dropSchema</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">db</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-symbol">...</span><span class="tsd-kind-parameter">tables</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span><a href="#dropschema" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Removes all tables that are part of the default CollegeDB schema from
 the specified database. This is a destructive operation that cannot be undone.</p>
@@ -23,8 +23,8 @@ tables. Only use during development, testing, or complete system resets.</p>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
 <ul class="tsd-parameter-list">
-<li><span><span class="tsd-kind-parameter">d1</span>: <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a></span>
-<div class="tsd-comment tsd-typography"><p>The D1 database instance to drop tables from</p>
+<li><span><span class="tsd-kind-parameter">db</span>: <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a></span>
+<div class="tsd-comment tsd-typography"><p>The database instance to drop tables from</p>
 </div></li>
 <li><span><span class="tsd-signature-symbol">...</span><span class="tsd-kind-parameter">tables</span>: <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span></span>
 <div class="tsd-comment tsd-typography"><p>The table schemas to drop</p>
@@ -38,7 +38,7 @@ tables. Only use during development, testing, or complete system resets.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/migrations.ts#L234">src/migrations.ts:234</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/migrations.ts#L251">src/migrations.ts:251</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

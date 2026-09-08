@@ -13,9 +13,9 @@
 <section class="tsd-panel tsd-comment">
 <div class="tsd-comment tsd-typography"><p>Configuration for the collegedb sharded database</p>
 </div></section>
-<div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">CollegeDBConfig</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#coordinator">coordinator</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DurableObjectNamespace</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#debug">debug</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#disableautomigration">disableAutoMigration</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#hashshardmappings">hashShardMappings</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#knownshardscachettlms">knownShardsCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#kv">kv</a><span class="tsd-signature-symbol">:</span> <a href="KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#mappingcachettlms">mappingCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#maxdatabasesize">maxDatabaseSize</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#migrationconcurrency">migrationConcurrency</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#shardlocations">shardLocations</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a> <span class="tsd-signature-symbol">|</span> <a href="ShardLocation.html" class="tsd-signature-type tsd-kind-interface">ShardLocation</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#shards">shards</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#sizecachettlms">sizeCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#strategy">strategy</a><span class="tsd-signature-symbol">?:</span> <a href="../types/ShardingStrategy.html" class="tsd-signature-type tsd-kind-type-alias">ShardingStrategy</a> <span class="tsd-signature-symbol">|</span> <a href="MixedShardingStrategy.html" class="tsd-signature-type tsd-kind-interface">MixedShardingStrategy</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#targetregion">targetRegion</a><span class="tsd-signature-symbol">?:</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
+<div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">CollegeDBConfig</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#allocateonread">allocateOnRead</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#coordinator">coordinator</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DurableObjectNamespace</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#debug">debug</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#disableautomigration">disableAutoMigration</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#hashshardmappings">hashShardMappings</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#keycolumns">keyColumns</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#knownshardscachettlms">knownShardsCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#kv">kv</a><span class="tsd-signature-symbol">:</span> <a href="KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#legacymultikeylookup">legacyMultiKeyLookup</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#mappingcachettlms">mappingCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#maxdatabasesize">maxDatabaseSize</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#migrationconcurrency">migrationConcurrency</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#onphase">onPhase</a><span class="tsd-signature-symbol">?:</span> <a href="../types/PhaseObserver.html" class="tsd-signature-type tsd-kind-type-alias">PhaseObserver</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#onunroutable">onUnroutable</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">&quot;throw&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;fanout&quot;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#placement">placement</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">&quot;computed&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;kv&quot;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#shardlocations">shardLocations</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a> <span class="tsd-signature-symbol">|</span> <a href="ShardLocation.html" class="tsd-signature-type tsd-kind-interface">ShardLocation</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#shards">shards</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#sizecachettlms">sizeCacheTtlMs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#strategy">strategy</a><span class="tsd-signature-symbol">?:</span> <a href="../types/ShardingStrategy.html" class="tsd-signature-type tsd-kind-type-alias">ShardingStrategy</a> <span class="tsd-signature-symbol">|</span> <a href="MixedShardingStrategy.html" class="tsd-signature-type tsd-kind-interface">MixedShardingStrategy</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#targetregion">targetRegion</a><span class="tsd-signature-symbol">?:</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#waituntil">waitUntil</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">promise</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">unknown</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L198">src/types.ts:198</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L275">src/types.ts:275</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -23,35 +23,38 @@
 <div class="tsd-accordion-details">
 <section class="tsd-index-section">
 <h3 class="tsd-index-heading tsd-anchor-link" id="properties">Properties<a href="#properties" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-index-list"><a href="#coordinator" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>coordinator?</span></a>
+<div class="tsd-index-list"><a href="#allocateonread" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>allocate<wbr/>On<wbr/>Read?</span></a>
+<a href="#coordinator" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>coordinator?</span></a>
 <a href="#debug" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>debug?</span></a>
 <a href="#disableautomigration" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>disable<wbr/>Auto<wbr/>Migration?</span></a>
 <a href="#hashshardmappings" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>hash<wbr/>Shard<wbr/>Mappings?</span></a>
+<a href="#keycolumns" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>key<wbr/>Columns?</span></a>
 <a href="#knownshardscachettlms" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>known<wbr/>Shards<wbr/>Cache<wbr/>Ttl<wbr/>Ms?</span></a>
 <a href="#kv" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>kv</span></a>
+<a href="#legacymultikeylookup" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>legacy<wbr/>Multi<wbr/>Key<wbr/>Lookup?</span></a>
 <a href="#mappingcachettlms" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>mapping<wbr/>Cache<wbr/>Ttl<wbr/>Ms?</span></a>
 <a href="#maxdatabasesize" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>max<wbr/>Database<wbr/>Size?</span></a>
 <a href="#migrationconcurrency" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>migration<wbr/>Concurrency?</span></a>
+<a href="#onphase" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>on<wbr/>Phase?</span></a>
+<a href="#onunroutable" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>on<wbr/>Unroutable?</span></a>
+<a href="#placement" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>placement?</span></a>
 <a href="#shardlocations" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shard<wbr/>Locations?</span></a>
 <a href="#shards" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shards</span></a>
 <a href="#sizecachettlms" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>size<wbr/>Cache<wbr/>Ttl<wbr/>Ms?</span></a>
 <a href="#strategy" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>strategy?</span></a>
 <a href="#targetregion" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>target<wbr/>Region?</span></a>
+<a href="#waituntil" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>wait<wbr/>Until?</span></a>
 </div></section></div></details></section></section>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Properties"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="properties-1">Properties<a href="#properties-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
 <section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="coordinator"><code class="tsd-tag">Optional</code><span>coordinator</span><a href="#coordinator" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">coordinator</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DurableObjectNamespace</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">&gt;</span></div>
-<div class="tsd-comment tsd-typography"><p>Shard coordinator Durable Object</p>
-</div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L202">src/types.ts:202</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="debug"><code class="tsd-tag">Optional</code><span>debug</span><a href="#debug" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">debug</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
-<div class="tsd-comment tsd-typography"><p>Enable debug logging for development and troubleshooting</p>
+<h3 class="tsd-anchor-link" id="allocateonread"><code class="tsd-tag">Optional</code><span>allocate<wbr/>On<wbr/>Read</span><a href="#allocateonread" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">allocateOnRead</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
+<div class="tsd-comment tsd-typography"><p>Whether a read that finds no mapping should record one.</p>
+<p>When <code>false</code> a read resolves a shard and returns it without writing to KV,
+so looking up a key that has no row costs no KV write and leaves no
+mapping behind. Writes always record their mapping.</p>
 </div>
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-default">
@@ -60,10 +63,33 @@
 
 </div>
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.6</p>
+<h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L229">src/types.ts:229</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L369">src/types.ts:369</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="coordinator"><code class="tsd-tag">Optional</code><span>coordinator</span><a href="#coordinator" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">coordinator</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DurableObjectNamespace</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">&gt;</span></div>
+<div class="tsd-comment tsd-typography"><p>Shard coordinator Durable Object</p>
+</div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L279">src/types.ts:279</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="debug"><code class="tsd-tag">Optional</code><span>debug</span><a href="#debug" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">debug</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
+<div class="tsd-comment tsd-typography"><p>Enable debug logging for development and troubleshooting</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-default">
+<h4 class="tsd-anchor-link" id="default-1">Default<a href="#default-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-6">false</span>
+</code><button type="button">Copy</button></pre>
+
+</div>
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-1">Since<a href="#since-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.6</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L306">src/types.ts:306</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="disableautomigration"><code class="tsd-tag">Optional</code><span>disable<wbr/>Auto<wbr/>Migration</span><a href="#disableautomigration" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">disableAutoMigration</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -71,10 +97,10 @@
 </div>
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-1">Since<a href="#since-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.2</p>
+<h4 class="tsd-anchor-link" id="since-2">Since<a href="#since-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.2</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L215">src/types.ts:215</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L292">src/types.ts:292</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="hashshardmappings"><code class="tsd-tag">Optional</code><span>hash<wbr/>Shard<wbr/>Mappings</span><a href="#hashshardmappings" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">hashShardMappings</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -84,15 +110,27 @@ sensitive data like emails from being visible in KV keys.</p>
 </div>
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-default">
-<h4 class="tsd-anchor-link" id="default-1">Default<a href="#default-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-6">true</span>
+<h4 class="tsd-anchor-link" id="default-2">Default<a href="#default-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-6">true</span>
 </code><button type="button">Copy</button></pre>
 
 </div>
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-2">Since<a href="#since-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.3</p>
+<h4 class="tsd-anchor-link" id="since-3">Since<a href="#since-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.3</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L223">src/types.ts:223</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L300">src/types.ts:300</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="keycolumns"><code class="tsd-tag">Optional</code><span>key<wbr/>Columns</span><a href="#keycolumns" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">keyColumns</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span></div>
+<div class="tsd-comment tsd-typography"><p>Primary-key column per table, used by the query planner to recover the
+routing key from a statement. Tables absent from the map use <code>id</code>.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-4">Since<a href="#since-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L386">src/types.ts:386</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="knownshardscachettlms"><code class="tsd-tag">Optional</code><span>known<wbr/>Shards<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span><a href="#knownshardscachettlms" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">knownShardsCacheTtlMs</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
@@ -100,86 +138,46 @@ sensitive data like emails from being visible in KV keys.</p>
 </div>
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-default">
-<h4 class="tsd-anchor-link" id="default-2">Default<a href="#default-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">10000</span>
+<h4 class="tsd-anchor-link" id="default-3">Default<a href="#default-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">10000</span>
 </code><button type="button">Copy</button></pre>
 
 </div>
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-3">Since<a href="#since-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
+<h4 class="tsd-anchor-link" id="since-5">Since<a href="#since-5" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L250">src/types.ts:250</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L327">src/types.ts:327</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="kv"><span>kv</span><a href="#kv" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">kv</span><span class="tsd-signature-symbol">:</span> <a href="KVStorage.html" class="tsd-signature-type tsd-kind-interface">KVStorage</a></div>
 <div class="tsd-comment tsd-typography"><p>Key-value provider for storing shard mappings</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L200">src/types.ts:200</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L277">src/types.ts:277</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="legacymultikeylookup"><code class="tsd-tag">Optional</code><span>legacy<wbr/>Multi<wbr/>Key<wbr/>Lookup</span><a href="#legacymultikeylookup" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">legacyMultiKeyLookup</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
+<div class="tsd-comment tsd-typography"><p>Whether a mapping miss should also probe the legacy multi-key record.</p>
+<p>Every writer since 1.0.3 stores a single-key record for each lookup key
+alongside the multi-key record, so this second read cannot succeed for
+data this version wrote and doubles the KV cost of every true miss. Enable
+it only while migrating mappings written before 1.0.3.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-default">
+<h4 class="tsd-anchor-link" id="default-4">Default<a href="#default-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-6">false</span>
+</code><button type="button">Copy</button></pre>
+
+</div>
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-6">Since<a href="#since-6" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L380">src/types.ts:380</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="mappingcachettlms"><code class="tsd-tag">Optional</code><span>mapping<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span><a href="#mappingcachettlms" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">mappingCacheTtlMs</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>In-memory TTL for primary key to shard mapping cache.</p>
-</div>
-<div class="tsd-comment tsd-typography">
-<div class="tsd-tag-default">
-<h4 class="tsd-anchor-link" id="default-3">Default<a href="#default-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">30000</span>
-</code><button type="button">Copy</button></pre>
-
-</div>
-<div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-4">Since<a href="#since-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
-</div></div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L244">src/types.ts:244</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="maxdatabasesize"><code class="tsd-tag">Optional</code><span>max<wbr/>Database<wbr/>Size</span><a href="#maxdatabasesize" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">maxDatabaseSize</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
-<div class="tsd-comment tsd-typography"><p>Maximum database size in bytes. When set, shards that exceed this size are
-excluded from new allocations (existing mappings remain intact).</p>
-<p>When omitted, size-based filtering is disabled to avoid extra sizing queries.
-This significantly reduces routing latency for write-heavy workloads.</p>
-</div>
-<div class="tsd-comment tsd-typography">
-<div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-5">Since<a href="#since-5" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.8</p>
-</div></div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L238">src/types.ts:238</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="migrationconcurrency"><code class="tsd-tag">Optional</code><span>migration<wbr/>Concurrency</span><a href="#migrationconcurrency" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">migrationConcurrency</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
-<div class="tsd-comment tsd-typography"><p>Concurrency limit for migration mapping operations.</p>
-</div>
-<div class="tsd-comment tsd-typography">
-<div class="tsd-tag-default">
-<h4 class="tsd-anchor-link" id="default-4">Default<a href="#default-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">25</span>
-</code><button type="button">Copy</button></pre>
-
-</div>
-<div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since-6">Since<a href="#since-6" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
-</div></div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L262">src/types.ts:262</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="shardlocations"><code class="tsd-tag">Optional</code><span>shard<wbr/>Locations</span><a href="#shardlocations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">shardLocations</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a> <span class="tsd-signature-symbol">|</span> <a href="ShardLocation.html" class="tsd-signature-type tsd-kind-interface">ShardLocation</a><span class="tsd-signature-symbol">&gt;</span></div>
-<div class="tsd-comment tsd-typography"><p>Geographic locations of each shard (required for location strategy)</p>
-</div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L210">src/types.ts:210</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="shards"><span>shards</span><a href="#shards" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">shards</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">&gt;</span></div>
-<div class="tsd-comment tsd-typography"><p>Available SQL shard providers</p>
-</div><aside class="tsd-sources">
-<ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L204">src/types.ts:204</a></li></ul></aside></section>
-<section class="tsd-panel tsd-member">
-<h3 class="tsd-anchor-link" id="sizecachettlms"><code class="tsd-tag">Optional</code><span>size<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span><a href="#sizecachettlms" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
-<div class="tsd-signature"><span class="tsd-kind-property">sizeCacheTtlMs</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
-<div class="tsd-comment tsd-typography"><p>In-memory TTL for shard size checks when <code>maxDatabaseSize</code> is enabled.</p>
 </div>
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-default">
@@ -191,21 +189,156 @@ This significantly reduces routing latency for write-heavy workloads.</p>
 <h4 class="tsd-anchor-link" id="since-7">Since<a href="#since-7" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L256">src/types.ts:256</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L321">src/types.ts:321</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="maxdatabasesize"><code class="tsd-tag">Optional</code><span>max<wbr/>Database<wbr/>Size</span><a href="#maxdatabasesize" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">maxDatabaseSize</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
+<div class="tsd-comment tsd-typography"><p>Maximum database size in bytes. When set, shards that exceed this size are
+excluded from new allocations (existing mappings remain intact).</p>
+<p>When omitted, size-based filtering is disabled to avoid extra sizing queries.
+This significantly reduces routing latency for write-heavy workloads.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-8">Since<a href="#since-8" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.8</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L315">src/types.ts:315</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="migrationconcurrency"><code class="tsd-tag">Optional</code><span>migration<wbr/>Concurrency</span><a href="#migrationconcurrency" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">migrationConcurrency</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
+<div class="tsd-comment tsd-typography"><p>Concurrency limit for migration mapping operations.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-default">
+<h4 class="tsd-anchor-link" id="default-6">Default<a href="#default-6" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">25</span>
+</code><button type="button">Copy</button></pre>
+
+</div>
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-9">Since<a href="#since-9" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L339">src/types.ts:339</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="onphase"><code class="tsd-tag">Optional</code><span>on<wbr/>Phase</span><a href="#onphase" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">onPhase</span><span class="tsd-signature-symbol">?:</span> <a href="../types/PhaseObserver.html" class="tsd-signature-type tsd-kind-type-alias">PhaseObserver</a></div>
+<div class="tsd-comment tsd-typography"><p>Per-phase timing observer. When set, CollegeDB reports the cost of hashing,
+each KV round trip, shard selection, coordinator calls, and SQL execution.
+Unset, the instrumentation allocates nothing.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-10">Since<a href="#since-10" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L406">src/types.ts:406</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="onunroutable"><code class="tsd-tag">Optional</code><span>on<wbr/>Unroutable</span><a href="#onunroutable" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">onUnroutable</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">&quot;throw&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;fanout&quot;</span></div>
+<div class="tsd-comment tsd-typography"><p>What the query planner does with a statement whose routing key it cannot
+prove.</p>
+<ul>
+<li><code>throw</code> - reject the call and point the caller at the explicit-key API.</li>
+<li><code>fanout</code> - run the statement on every shard.</li>
+</ul>
+<p><code>throw</code> is the default because a mis-routed write lands a row where no
+reader will look, while a thrown error is visible immediately.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-default">
+<h4 class="tsd-anchor-link" id="default-7">Default<a href="#default-7" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-2">&#39;throw&#39;</span>
+</code><button type="button">Copy</button></pre>
+
+</div>
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-11">Since<a href="#since-11" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L399">src/types.ts:399</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="placement"><code class="tsd-tag">Optional</code><span>placement</span><a href="#placement" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">placement</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">&quot;computed&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;kv&quot;</span></div>
+<div class="tsd-comment tsd-typography"><p>How a primary key is resolved to a shard.</p>
+<ul>
+<li><code>computed</code> - derive the shard from the key with rendezvous hashing and
+consult KV only for keys that were explicitly reassigned or placed by an
+older algorithm. Removes one KV read per operation and one KV write per
+new key.</li>
+<li><code>kv</code> - read the mapping from KV, allocating and recording on a miss.</li>
+</ul>
+<p>Only meaningful for the <code>hash</code> strategy. <code>round-robin</code> and <code>random</code> are not
+functions of the key, and <code>location</code> depends on the requesting region
+rather than the key, so all three force <code>kv</code>.</p>
+<p>Defaults to <code>computed</code> for the <code>hash</code> strategy on a deployment CollegeDB
+has not seen before, and to <code>kv</code> when existing mappings are detected, so
+an upgrade never starts computing placements for keys another algorithm
+placed. Call <code>rebalance()</code> to migrate such a deployment.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-12">Since<a href="#since-12" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L359">src/types.ts:359</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="shardlocations"><code class="tsd-tag">Optional</code><span>shard<wbr/>Locations</span><a href="#shardlocations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">shardLocations</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a> <span class="tsd-signature-symbol">|</span> <a href="ShardLocation.html" class="tsd-signature-type tsd-kind-interface">ShardLocation</a><span class="tsd-signature-symbol">&gt;</span></div>
+<div class="tsd-comment tsd-typography"><p>Geographic locations of each shard (required for location strategy)</p>
+</div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L287">src/types.ts:287</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="shards"><span>shards</span><a href="#shards" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">shards</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <a href="SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">&gt;</span></div>
+<div class="tsd-comment tsd-typography"><p>Available SQL shard providers</p>
+</div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L281">src/types.ts:281</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="sizecachettlms"><code class="tsd-tag">Optional</code><span>size<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span><a href="#sizecachettlms" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">sizeCacheTtlMs</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
+<div class="tsd-comment tsd-typography"><p>In-memory TTL for shard size checks when <code>maxDatabaseSize</code> is enabled.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-default">
+<h4 class="tsd-anchor-link" id="default-8">Default<a href="#default-8" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-9">30000</span>
+</code><button type="button">Copy</button></pre>
+
+</div>
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-13">Since<a href="#since-13" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L333">src/types.ts:333</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="strategy"><code class="tsd-tag">Optional</code><span>strategy</span><a href="#strategy" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">strategy</span><span class="tsd-signature-symbol">?:</span> <a href="../types/ShardingStrategy.html" class="tsd-signature-type tsd-kind-type-alias">ShardingStrategy</a> <span class="tsd-signature-symbol">|</span> <a href="MixedShardingStrategy.html" class="tsd-signature-type tsd-kind-interface">MixedShardingStrategy</a></div>
 <div class="tsd-comment tsd-typography"><p>Default shard allocation strategy (can be single strategy or mixed strategy object)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L206">src/types.ts:206</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L283">src/types.ts:283</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="targetregion"><code class="tsd-tag">Optional</code><span>target<wbr/>Region</span><a href="#targetregion" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">targetRegion</span><span class="tsd-signature-symbol">?:</span> <a href="../types/D1Region.html" class="tsd-signature-type tsd-kind-type-alias">D1Region</a></div>
 <div class="tsd-comment tsd-typography"><p>Target region for location-based sharding</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/types.ts#L208">src/types.ts:208</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L285">src/types.ts:285</a></li></ul></aside></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="waituntil"><code class="tsd-tag">Optional</code><span>wait<wbr/>Until</span><a href="#waituntil" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<div class="tsd-signature"><span class="tsd-kind-property">waitUntil</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">promise</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">unknown</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span></div>
+<div class="tsd-comment tsd-typography"><p>Extends the lifetime of CollegeDB's background work past the current
+request. Pass <code>ctx.waitUntil</code> from a Worker: without it, the background
+known-shard sync and auto-migration started by <a href="../functions/initialize.html" class="tsd-kind-function">initialize</a> are
+cancelled when the request that triggered them ends.</p>
+</div>
+<div class="tsd-comment tsd-typography">
+<div class="tsd-tag-since">
+<h4 class="tsd-anchor-link" id="since-14">Since<a href="#since-14" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+</div></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/types.ts#L414">src/types.ts:414</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
@@ -222,7 +355,7 @@ This significantly reduces routing latency for write-heavy workloads.</p>
 <h3>On This Page</h3></summary>
 <div class="tsd-accordion-details">
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Properties"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Properties</summary>
-<div><a href="#coordinator"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>coordinator</span></a><a href="#debug"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>debug</span></a><a href="#disableautomigration"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>disable<wbr/>Auto<wbr/>Migration</span></a><a href="#hashshardmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>hash<wbr/>Shard<wbr/>Mappings</span></a><a href="#knownshardscachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>known<wbr/>Shards<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#kv"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>kv</span></a><a href="#mappingcachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>mapping<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#maxdatabasesize"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>max<wbr/>Database<wbr/>Size</span></a><a href="#migrationconcurrency"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>migration<wbr/>Concurrency</span></a><a href="#shardlocations"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shard<wbr/>Locations</span></a><a href="#shards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shards</span></a><a href="#sizecachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>size<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#strategy"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>strategy</span></a><a href="#targetregion"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>target<wbr/>Region</span></a></div></details></div></details></div>
+<div><a href="#allocateonread"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>allocate<wbr/>On<wbr/>Read</span></a><a href="#coordinator"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>coordinator</span></a><a href="#debug"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>debug</span></a><a href="#disableautomigration"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>disable<wbr/>Auto<wbr/>Migration</span></a><a href="#hashshardmappings"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>hash<wbr/>Shard<wbr/>Mappings</span></a><a href="#keycolumns"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>key<wbr/>Columns</span></a><a href="#knownshardscachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>known<wbr/>Shards<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#kv"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>kv</span></a><a href="#legacymultikeylookup"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>legacy<wbr/>Multi<wbr/>Key<wbr/>Lookup</span></a><a href="#mappingcachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>mapping<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#maxdatabasesize"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>max<wbr/>Database<wbr/>Size</span></a><a href="#migrationconcurrency"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>migration<wbr/>Concurrency</span></a><a href="#onphase"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>on<wbr/>Phase</span></a><a href="#onunroutable"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>on<wbr/>Unroutable</span></a><a href="#placement"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>placement</span></a><a href="#shardlocations"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shard<wbr/>Locations</span></a><a href="#shards"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>shards</span></a><a href="#sizecachettlms"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>size<wbr/>Cache<wbr/>Ttl<wbr/>Ms</span></a><a href="#strategy"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>strategy</span></a><a href="#targetregion"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>target<wbr/>Region</span></a><a href="#waituntil"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>wait<wbr/>Until</span></a></div></details></div></details></div>
 <div class="site-menu">
 <nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
 <ul class="tsd-small-nested-navigation" id="tsd-nav-container">

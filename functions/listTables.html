@@ -13,7 +13,7 @@
 <section class="tsd-panel">
 <ul class="tsd-signatures">
 <li class="">
-<div class="tsd-signature tsd-anchor-link" id="listtables"><span class="tsd-kind-call-signature">listTables</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">d1</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">&gt;</span><a href="#listtables" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-signature tsd-anchor-link" id="listtables"><span class="tsd-kind-call-signature">listTables</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">db</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">&gt;</span><a href="#listtables" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Queries the SQLite system catalog to retrieve all user-created tables
 in the database. This is useful for schema inspection, validation,
@@ -22,8 +22,8 @@ and debugging purposes.</p>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
 <ul class="tsd-parameter-list">
-<li><span><span class="tsd-kind-parameter">d1</span>: <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a></span>
-<div class="tsd-comment tsd-typography"><p>The D1 database instance to inspect</p>
+<li><span><span class="tsd-kind-parameter">db</span>: <a href="../interfaces/SQLDatabase.html" class="tsd-signature-type tsd-kind-interface">SQLDatabase</a></span>
+<div class="tsd-comment tsd-typography"><p>The database instance to inspect</p>
 </div></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">&gt;</span></h4><p>Promise resolving to array of table names, sorted alphabetically</p>
 
@@ -37,7 +37,7 @@ and debugging purposes.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/3183f0d2e4ba041c7b76189acad63a1d5473eaa2/src/migrations.ts#L264">src/migrations.ts:264</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/666a766b2cc67b65117f6f99c95b123023787d25/src/migrations.ts#L281">src/migrations.ts:281</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
