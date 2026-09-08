@@ -549,3 +549,38 @@ describe('Router Helper APIs', () => {
 		expect(row).toBeNull();
 	});
 });
+
+describe('Key hashing', () => {
+	const mapper = new KVShardMapper(createInMemoryKVProvider());
+
+	it('derives KV keys as plain SHA-256 hex', async () => {
+		// These are the stored KV key suffixes for every existing deployment. The
+		// hex encoding was rewritten for speed, so a golden value is what proves
+		// the rewrite did not silently move every mapping out of reach.
+		expect(await mapper.hashKey('user-123')).toBe('fcdec6df4d44dbc637c7c5b58efface52a7f8a88535423430255be0bb89bedd8');
+		expect(await mapper.hashKey('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+		expect(await mapper.hashKey('ユーザー-1')).toBe('b4e4569ca2618ee8861abffe5b6cc5d181ccb3cf92f2956ed4225edfa1463338');
+	});
+
+	it('pads every byte to two hex characters', async () => {
+		// The previous encoder padded each byte explicitly; a loop over a lookup
+		// table only stays correct if the table itself is padded, and a byte below
+		// 0x10 is where that breaks.
+		for (const key of ['a', 'b', 'c', 'zzz', 'user-1', 'user-2', 'key-with-a-longer-name']) {
+			const hashed = await mapper.hashKey(key);
+			expect(hashed).toMatch(/^[0-9a-f]{64}$/);
+		}
+	});
+
+	it('returns the key unchanged when hashing is disabled', async () => {
+		const plain = new KVShardMapper(createInMemoryKVProvider(), { hashShardMappings: false });
+		expect(await plain.hashKey('user-123')).toBe('user-123');
+	});
+
+	it('returns the same value on the cached and uncached path', async () => {
+		const fresh = new KVShardMapper(createInMemoryKVProvider());
+		const cold = await fresh.hashKey('repeat-me');
+		const warm = await fresh.hashKey('repeat-me');
+		expect(warm).toBe(cold);
+	});
+});
