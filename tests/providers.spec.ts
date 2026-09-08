@@ -1156,3 +1156,279 @@ describe('createWorkersKVProvider', () => {
 		await expect(provider.get('bad', 'json')).rejects.toThrow('Failed to parse JSON from Workers KV');
 	});
 });
+
+describe('Transactional batches', () => {
+	/** Records every statement in order, so BEGIN/COMMIT placement is visible. */
+	function recorder() {
+		const statements: string[] = [];
+		return {
+			statements,
+			query: async (sql: string, _bindings?: any[]) => {
+				statements.push(sql);
+				if (sql === 'BOOM') {
+					throw new Error('statement failed');
+				}
+				return { rows: [] as any[], rowCount: 0 };
+			}
+		};
+	}
+
+	it('leases a connection from a pg pool and returns it', async () => {
+		const leased = recorder();
+		let released = 0;
+		let connects = 0;
+
+		// `pg.Pool` is recognized by its counters; `Client` has `connect` too but
+		// resolves it to nothing, so the counters are what tell them apart.
+		const pool = {
+			totalCount: 1,
+			idleCount: 1,
+			async query() {
+				throw new Error('the batch must not run on the pool itself');
+			},
+			async connect() {
+				connects++;
+				return { query: leased.query, release: () => released++ };
+			}
+		};
+
+		const provider = createPostgreSQLProvider(pool as any);
+		expect(provider.runBatch).toBeDefined();
+
+		const results = await provider.runBatch!([
+			{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] },
+			{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['b'] }
+		]);
+
+		expect(results).toHaveLength(2);
+		expect(connects).toBe(1);
+		expect(released).toBe(1);
+		expect(leased.statements[0]).toBe('BEGIN');
+		expect(leased.statements.at(-1)).toBe('COMMIT');
+		expect(leased.statements.filter((sql) => sql.startsWith('INSERT'))).toHaveLength(2);
+	});
+
+	it('rolls back and releases when a statement in the group fails', async () => {
+		const leased = recorder();
+		let released = 0;
+
+		const pool = {
+			totalCount: 1,
+			idleCount: 1,
+			async connect() {
+				return { query: leased.query, release: () => released++ };
+			}
+		};
+
+		const provider = createPostgreSQLProvider(pool as any);
+
+		await expect(provider.runBatch!([{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] }, { sql: 'BOOM' }])).rejects.toThrow(
+			'statement failed'
+		);
+
+		expect(leased.statements).toContain('ROLLBACK');
+		expect(leased.statements).not.toContain('COMMIT');
+		// A leaked connection is worse than a failed batch.
+		expect(released).toBe(1);
+	});
+
+	it('leases from a mysql2 pool through getConnection', async () => {
+		const leased = recorder();
+		let released = 0;
+
+		const pool = {
+			async getConnection() {
+				return {
+					execute: async (sql: string) => {
+						await leased.query(sql);
+						return [[], []];
+					},
+					release: () => released++
+				};
+			}
+		};
+
+		const provider = createMySQLProvider(pool as any);
+		await provider.runBatch!([{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] }]);
+
+		expect(leased.statements[0]).toBe('BEGIN');
+		expect(leased.statements.at(-1)).toBe('COMMIT');
+		expect(released).toBe(1);
+	});
+
+	it('sends mysql transaction control through query, not the prepared protocol', async () => {
+		const executed: string[] = [];
+		const queried: string[] = [];
+
+		// This is what mysql2 actually does: execute() is the prepared-statement
+		// protocol and answers BEGIN with "This command is not supported in the
+		// prepared statement protocol yet". The sandbox lane found it; a mock that
+		// accepts everything on execute() did not.
+		const pool = {
+			async getConnection() {
+				return {
+					execute: async (sql: string) => {
+						if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql)) {
+							throw new Error('This command is not supported in the prepared statement protocol yet');
+						}
+						executed.push(sql);
+						return [{ affectedRows: 1 }, []];
+					},
+					query: async (sql: string) => {
+						queried.push(sql);
+						return [{ affectedRows: 0 }, []];
+					},
+					release: () => {}
+				};
+			}
+		};
+
+		const provider = createMySQLProvider(pool as any);
+		const results = await provider.runBatch!([
+			{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] },
+			{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['b'] }
+		]);
+
+		expect(results).toHaveLength(2);
+		expect(queried).toEqual(['BEGIN', 'COMMIT']);
+		expect(executed).toHaveLength(2);
+	});
+
+	it('refuses to batch a handle it cannot prove is a single connection', async () => {
+		// Only `query`, which is all a pool wrapped in a thin adapter exposes.
+		// Guessing here would send BEGIN down a different connection than the
+		// statements, so the adapter declines instead.
+		const provider = createPostgreSQLProvider({ query: async () => ({ rows: [], rowCount: 0 }) });
+		expect(provider.runBatch).toBeUndefined();
+	});
+
+	it('batches through a handle the caller declares single', async () => {
+		const client = recorder();
+		const provider = createPostgreSQLProvider(client as any, { singleConnection: true });
+
+		expect(provider.runBatch).toBeDefined();
+		await provider.runBatch!([{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] }]);
+
+		expect(client.statements).toEqual(['BEGIN', 'INSERT INTO users (id) VALUES ($1)', 'COMMIT']);
+	});
+
+	it('takes a caller-supplied lease over autodetection', async () => {
+		const leased = recorder();
+		let released = 0;
+
+		// The handle looks like a pg pool, but an explicit lease wins so a caller
+		// with its own pooling can always override what autodetection decided.
+		const pool = {
+			totalCount: 1,
+			idleCount: 1,
+			async connect() {
+				throw new Error('autodetected lease must not be used');
+			}
+		};
+
+		const provider = createPostgreSQLProvider(pool as any, {
+			lease: async () => ({
+				client: { query: leased.query },
+				release: () => {
+					released++;
+				}
+			})
+		});
+
+		await provider.runBatch!([{ sql: 'SELECT 1' }]);
+		expect(leased.statements).toEqual(['BEGIN', 'SELECT 1', 'COMMIT']);
+		expect(released).toBe(1);
+	});
+
+	it('batches a sqlite handle when told it is one connection', async () => {
+		const statements: string[] = [];
+		const db = {
+			prepare(sql: string) {
+				statements.push(sql);
+				return { run: () => ({ changes: 1, lastInsertRowid: 1 }), all: () => [], get: () => null };
+			}
+		};
+
+		const provider = createSQLiteProvider(db as any, { singleConnection: true });
+		await provider.runBatch!([{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] }]);
+
+		expect(statements[0]).toBe('BEGIN');
+		expect(statements.at(-1)).toBe('COMMIT');
+	});
+
+	it('returns an empty result set without opening a transaction', async () => {
+		const client = recorder();
+		const provider = createPostgreSQLProvider(client as any, { singleConnection: true });
+
+		expect(await provider.runBatch!([])).toEqual([]);
+		expect(client.statements).toEqual([]);
+	});
+
+	it('keeps the drizzle overload working', async () => {
+		const provider = createPostgreSQLProvider({ execute: async () => ({ rows: [] }) } as any, drizzleSql);
+		expect(provider.dialect).toBe('postgres');
+	});
+});
+
+describe('Drizzle batches', () => {
+	function drizzleClient(overrides: Record<string, unknown> = {}) {
+		const ran: string[] = [];
+		const client: any = {
+			async run(query: any) {
+				ran.push(String(query?.text ?? query?.sql ?? query));
+				return { rows: [], rowsAffected: 1 };
+			},
+			async all() {
+				return { rows: [] };
+			},
+			...overrides
+		};
+		return { client, ran };
+	}
+
+	it('wraps a group in drizzle transaction when the driver has one', async () => {
+		const inner = drizzleClient();
+		let transactions = 0;
+
+		inner.client.transaction = async (callback: (tx: unknown) => Promise<unknown>) => {
+			transactions++;
+			return await callback(inner.client);
+		};
+
+		const provider = createDrizzleSQLProvider(inner.client, drizzleSql, 'postgres');
+		expect(provider.runBatch).toBeDefined();
+
+		const results = await provider.runBatch!([{ sql: 'INSERT INTO users (id) VALUES (?)', bindings: ['a'] }, { sql: 'SELECT 1' }]);
+
+		expect(results).toHaveLength(2);
+		expect(transactions).toBe(1);
+		// Drizzle issues its own BEGIN and COMMIT, so the group carries neither.
+		expect(inner.ran.some((sql) => /begin|commit/i.test(sql))).toBe(false);
+	});
+
+	it('leaves a native-batch driver on the sequential path', async () => {
+		const inner = drizzleClient({
+			batch: async () => [],
+			transaction: async (callback: (tx: unknown) => Promise<unknown>) => await callback(null)
+		});
+
+		// D1 through Drizzle: `transaction()` is present but a real D1 answers the
+		// `begin` it emits with `Failed query: begin`, which the Cloudflare lane
+		// reported before this guard existed.
+		const provider = createDrizzleSQLProvider(inner.client, drizzleSql, 'sqlite');
+		expect(provider.runBatch).toBeUndefined();
+	});
+
+	it('returns an empty result without opening a transaction', async () => {
+		const inner = drizzleClient();
+		let transactions = 0;
+		inner.client.transaction = async (callback: (tx: unknown) => Promise<unknown>) => {
+			transactions++;
+			return await callback(inner.client);
+		};
+
+		const provider = createDrizzleSQLProvider(inner.client, drizzleSql, 'mysql');
+		expect(await provider.runBatch!([])).toEqual([]);
+		expect(transactions).toBe(0);
+	});
+});
