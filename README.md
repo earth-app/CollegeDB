@@ -1405,6 +1405,42 @@ shard when that matters. The result is reported per shard for the same reason.
 D1 caps a Worker invocation at 1,000 queries on the paid plan and 50 on the free plan, so a bulk
 write of one statement per row is not merely slow there.
 
+Routing the batch costs one KV read for the whole set and one KV write for the keys that were not
+mapped yet, rather than a read and a write per key, on any store that implements `getMany` and
+`putMany`. The Redis, Valkey and in-memory adapters do; the rest fall back to bounded concurrent
+single-key calls and return the same answer.
+
+#### Transactions Inside a Batch
+
+A shard runs its group in one transaction when its provider can give the batch a connection to
+run on. D1 and Drizzle-on-D1 use the native `batch`. The PostgreSQL, MySQL and SQLite adapters
+need to know where a connection comes from, because `BEGIN`, the statements, and `COMMIT` are only
+one transaction if they travel down the same connection:
+
+```typescript
+// A pool is recognized and leased from per batch.
+createPostgreSQLProvider(new Pool({ connectionString }));
+createMySQLProvider(mysql.createPool({ uri }));
+
+// A single connection has to say so; a pool must not.
+createPostgreSQLProvider(new Client({ connectionString }), { singleConnection: true });
+createSQLiteProvider(new Database('app.db'), { singleConnection: true });
+
+// Anything else supplies its own lease.
+createPostgreSQLProvider(handle, {
+	lease: async () => {
+		const client = await myPool.acquire();
+		return { client, release: () => myPool.release(client) };
+	}
+});
+```
+
+A handle CollegeDB cannot place runs its statements one at a time, exactly as before. It never
+guesses: `pg`'s `Client` and `Pool` both expose `connect()`, and either can be wrapped in
+something that exposes only `query()`, so sending `BEGIN` to an unidentified handle risks
+bracketing a different connection than the statements it is meant to cover. A failed statement
+rolls the group back and rethrows.
+
 ### Computed Placement
 
 For the `hash` strategy the shard is already a function of the key, so `placement: 'computed'`
@@ -3112,7 +3148,7 @@ Per routed operation, counted from the call graph rather than estimated:
 | `placement: 'computed'`     | 0        | 0         | 1               |
 | `nextId()`, sequence seeded | 0        | 0         | 0               |
 | `nextId()`, first call      | 0        | 0         | N               |
-| `batch()` of M statements   | 0        | up to M   | one per shard   |
+| `batch()` of M statements   | 1        | 1         | one per shard   |
 | `paginate()`                | 0        | 0         | N               |
 
 `N` is the shard count. A read that finds no row no longer writes a mapping; set
