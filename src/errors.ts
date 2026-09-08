@@ -12,7 +12,7 @@
  * throw new CollegeDBError('Failed to allocate shard', 'SHARD_ALLOCATION_ERROR');
  * ```
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.0.2
  */
 
@@ -54,9 +54,12 @@ export class CollegeDBError extends Error {
 		this.name = 'CollegeDBError';
 		this.code = code;
 
-		// Maintains proper stack trace for where our error was thrown (only available on V8)
-		if (Error.captureStackTrace) {
-			Error.captureStackTrace(this, CollegeDBError);
-		}
+		// Trims the constructor frames off the stack. V8 provides this in Node, Bun
+		// and workerd, but it is not part of the language, so it is read off a
+		// narrowed view of the constructor rather than assumed to exist.
+		const v8Error = Error as ErrorConstructor & {
+			captureStackTrace?: (target: object, constructorOpt?: Function) => void;
+		};
+		v8Error.captureStackTrace?.(this, CollegeDBError);
 	}
 }
