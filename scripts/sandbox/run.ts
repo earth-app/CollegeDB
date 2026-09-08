@@ -913,6 +913,16 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 
 		scenarios.shard_fanout = await scenarioCloudflareFanout(Math.max(6, Math.floor(plan.fanout / 2)), profile);
 
+		// The only place the batch API runs against D1, which is the backend it
+		// exists for: D1 caps a Worker invocation at 1000 queries on the paid plan
+		// and 50 on the free one.
+		await resetCloudflareBenchmarkData(profile);
+		scenarios.batch_write = await scenarioCloudflareBatchWrite(
+			Math.max(3, Math.floor(plan.bulk / 2)),
+			Math.max(40, Math.floor(options.bulkSize / 2)),
+			profile
+		);
+
 		await resetCloudflareBenchmarkData(profile);
 		scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
 
@@ -2010,6 +2020,20 @@ async function scenarioCloudflareFanout(iterations: number, profile: AdapterProf
 	});
 }
 
+async function scenarioCloudflareBatchWrite(iterations: number, records: number, profile: AdapterProfile): Promise<ScenarioStats> {
+	return measureScenario('batch_write', iterations, async (i) => {
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/batch-write',
+			{ prefix: `cf-batch-${Date.now()}-${i}`, records },
+			profile
+		);
+		const body = (await response.json()) as { success?: boolean; statements?: number };
+		if (!body?.success || body.statements !== records) {
+			throw new Error(`Cloudflare batch endpoint wrote ${body?.statements ?? 0} of ${records} statements`);
+		}
+	});
+}
+
 async function scenarioCloudflareReassignment(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
 	return measureScenario('reassignment', iterations, async (i) => {
 		const response = await postCloudflareBenchmark(
@@ -2321,7 +2345,11 @@ async function createSQLiteRuntime(runId: string, profile: AdapterProfile, shard
 			continue;
 		}
 
-		shards[binding] = useDrizzle ? createSQLiteProvider(drizzleBunSQLite({ client: db }), drizzleSql) : createSQLiteProvider(db);
+		// A SQLite handle is one connection by definition, which is what lets a
+		// batch group run inside a single transaction.
+		shards[binding] = useDrizzle
+			? createSQLiteProvider(drizzleBunSQLite({ client: db }), drizzleSql)
+			: createSQLiteProvider(db, { singleConnection: true });
 	}
 
 	return {

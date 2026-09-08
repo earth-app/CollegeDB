@@ -6,6 +6,7 @@ import {
 	all,
 	allAllShards,
 	allShard,
+	batch,
 	createHyperdrivePostgresProvider,
 	createMappingsForExistingKeys,
 	createNuxtHubKVProvider,
@@ -493,6 +494,39 @@ export default {
 					await run(id, INSERT_USER_SQL, [id, `Seed ${i}`, `${id}@seed.local`, Date.now()]);
 				}
 				return json({ success: true, inserted: records });
+			}
+
+			if (pathname === '/api/benchmark/batch-write' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const prefix = String(body.prefix ?? `batch-${Date.now()}`);
+				const records = toBoundedInt(body.records, 50, 1, 1000);
+
+				const entries = new Array(records).fill(null).map((_, index) => {
+					const id = `${prefix}-${index}`;
+					return {
+						key: id,
+						sql: INSERT_USER_SQL,
+						bindings: [id, `Batch ${index}`, `${id}@batch.local`, Date.now()]
+					};
+				});
+
+				const groups = await batch(entries);
+				const failed = groups.filter((group) => group.error);
+				if (failed.length > 0) {
+					return json(
+						{
+							success: false,
+							error: `Batch failed on ${failed.map((group) => group.shard).join(', ')}: ${failed[0]?.error}`
+						},
+						500
+					);
+				}
+
+				return json({
+					success: true,
+					shards: groups.length,
+					statements: groups.reduce((sum, group) => sum + group.results.length, 0)
+				});
 			}
 
 			if (pathname === '/api/benchmark/auto-increment' && request.method === 'POST') {
