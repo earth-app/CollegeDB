@@ -95,11 +95,12 @@
     "prettier-plugin-organize-imports": "4.3.0",
     "redis": "^6.2.1",
     "typedoc": "^0.28.20",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.11",
     "wrangler": "^4.129.1"
   },
   "peerDependencies": {
-    "typescript": "^5.8.3 || ^7.0.0"
+    "typescript": "^5.8.3 || ^6.0.0"
   },
   "lint-staged": {
     "*.{js,ts,css,md,json,yml,jsonc}": "prettier --write"

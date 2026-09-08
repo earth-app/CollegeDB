@@ -23,6 +23,9 @@ SQL backends: Cloudflare D1, PostgreSQL, MySQL, MariaDB, SQLite, and any Drizzle
 - [Sandbox Benchmarks (Docker Compose)](#sandbox-benchmarks-docker-compose)
 - [In-Memory Providers for Testing & Development](#in-memory-providers-for-testing--development)
 - [Basic Usage](#basic-usage)
+- [Sharding Strategies](#sharding-strategies)
+- [Auto-Generated Primary Keys](#auto-generated-primary-keys)
+- [Utility Helpers](#utility-helpers)
 - [Multi-Key Shard Mappings](#multi-key-shard-mappings)
 - [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
 - [Troubleshooting](#troubleshooting)
@@ -72,16 +75,21 @@ This allows you to:
 ## Features
 
 - Automatic query routing (primary key to shard mapping)
+- Routing straight from the statement via `query` / `queryFirst` / `queryAll`, with no separate key argument
 - Provider adapters for Redis/Valkey/NuxtHub/Workers KV plus PostgreSQL/MySQL/SQLite SQL
 - Drizzle interop through existing SQL providers (`createPostgreSQLProvider`, `createMySQLProvider`, `createSQLiteProvider`)
 - Auto-allocated generated-id inserts via `insert()` and direct-shard inserts via `insertShard()` for AUTOINCREMENT / RETURNING workflows
 - Object-shaped CRUD helpers (`insertInto`, `patch`, `updateRow`, `deleteById`, `upsert`) so you never hand-align columns and bindings
 - Cross-shard-safe id generation (`nextId`), one-call setup from a Worker `env` (`initializeFromEnv`), and pagination with totals (`paginate`)
+- Shard-grouped batch writes (`batch`) that cost one round trip per shard instead of one per statement
+- Rendezvous hashing, so adding a shard relocates about `1/N` of keys instead of nearly all of them
+- Optional computed placement that resolves a shard with no KV read and no mapping write
+- Per-phase timing (`onPhase`, `PhaseCollector`) that separates hashing, KV, and SQL costs
 - KV read-through cache (`cached` / `invalidate`) and secondary-index lookups (`setLookup` / `getLookup` / `deleteLookup`)
 - Hyperdrive helpers for PostgreSQL and MySQL
 - Multiple allocation strategies: round-robin, random, hash, location-aware, and mixed read/write strategies
 - Durable Object shard coordination and shard statistics
-- Migration helpers for integrating existing datasets and rebalancing mappings
+- Migration helpers for integrating existing datasets, plus `rebalance` for redistributing them
 
 ## Getting Started
 
@@ -711,7 +719,7 @@ For production use, migrate to appropriate providers (D1, Redis, PostgreSQL, etc
 
 ### Advanced In-Memory Example: `run`, `all`, `insert`, and Aggregates
 
-The in-memory SQL emulator supports a useful subset of SQLite syntax — enough to drive routing tests for real-world ORM-style code. The example below exercises the full routing stack (`run`, `all`, `first`, `insert`, `insertShard`, `runShard`, `countAllShards`, `allAllShardsGlobal`) entirely in-process without spinning up a database container.
+The in-memory SQL emulator supports a useful subset of SQLite syntax, enough to drive routing tests for ORM-style code. The example below exercises the full routing stack (`run`, `all`, `first`, `insert`, `insertShard`, `runShard`, `countAllShards`, `allAllShardsGlobal`) entirely in-process without spinning up a database container.
 
 ```typescript
 import {
@@ -877,6 +885,94 @@ collegedb(
 );
 ```
 
+## Sharding Strategies
+
+The strategy decides which shard a key lands on the **first** time it is written. After that the
+key stays put: every later read and write goes to the shard it was assigned, whatever the strategy
+says. So a strategy shapes distribution, not per-query routing.
+
+| Strategy      | New key goes to                            | Recomputable from the key | Needs a coordinator        |
+| ------------- | ------------------------------------------ | ------------------------- | -------------------------- |
+| `hash`        | Rendezvous hash of the key over the shards | Yes                       | No                         |
+| `round-robin` | The next shard in order                    | No                        | For cross-isolate fairness |
+| `random`      | A uniformly random shard                   | No                        | No                         |
+| `location`    | The shard nearest `targetRegion`           | No                        | No                         |
+
+`hash` is the default and the only one that supports [computed placement](#computed-placement),
+because it is the only one that is a function of the key.
+
+```typescript
+import { getShardStats, initialize, run } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-a': env['db-a'], 'db-b': env['db-b'], 'db-c': env['db-c'] },
+	strategy: 'hash'
+});
+
+for (let i = 0; i < 300; i++) {
+	await run(`user-${i}`, 'INSERT INTO users (id, name) VALUES (?, ?)', [`user-${i}`, `User ${i}`]);
+}
+
+// Roughly 100 keys per shard
+console.log(await getShardStats());
+```
+
+### Choosing Between Them
+
+`hash` spreads keys deterministically and needs nothing else running. Distribution is even in
+aggregate but not exact, since it is a hash: expect a few percent of variance across shards.
+
+`round-robin` is the only strategy that produces an exactly even split, which is why it is worth
+using when shard sizes must track each other closely. Without a coordinator the counter is
+per-isolate, so a Worker that starts many isolates gets even distribution per isolate rather than
+globally. Configure a coordinator to share one counter.
+
+`random` needs no shared state and converges on even over enough keys, at the cost of more variance
+than `hash` at low key counts.
+
+`location` sends new keys to the shard nearest `targetRegion`, which concentrates rather than
+spreads. That is the point when data residency or write locality matters, but it means one shard
+absorbs everything for a given region. On D1 specifically, read latency is a weaker reason to
+reach for it than it looks: D1 already creates read replicas in every supported region, so
+`location` earns its place on write locality and residency rather than read speed. Pair it with a
+mixed strategy when you want placement by region and even reads.
+
+### Adding or Removing a Shard
+
+Existing keys keep their recorded mapping, so adding a shard only affects keys written afterwards.
+Nothing needs to be migrated for reads to keep working:
+
+```typescript
+// Before: two shards. After: three. Existing rows stay where they are.
+initialize({
+	kv: env.KV,
+	shards: { 'db-a': env['db-a'], 'db-b': env['db-b'], 'db-c': env['db-c'] },
+	strategy: 'hash'
+});
+```
+
+To move existing keys onto the distribution the new shard set implies, run `rebalance`. It reports
+what it would do before it does anything:
+
+```typescript
+import { rebalance } from '@earth-app/collegedb';
+
+const preview = await rebalance('users', { dryRun: true });
+console.log(`${preview.moved} of ${preview.examined} keys would move`);
+
+const applied = await rebalance('users', { concurrency: 10 });
+console.log(`moved ${applied.moved}, failed ${applied.failed.length}`);
+```
+
+`rebalance` moves rows as well as mappings, one key at a time, so it is safe to interrupt and
+re-run. Keys it fails to move are listed in `failed` with the reason rather than aborting the pass.
+
+Because `hash` uses rendezvous hashing, adding an Nth shard relocates about `1/N` of the keyspace
+and leaves the rest alone. The scheme it replaced (`hash(key) % shardCount`) relocated nearly
+everything on any change in shard count, so a `rebalance` after adding a shard is now a small
+operation rather than a full reshuffle.
+
 ### Geographic Distribution Example
 
 ```typescript
@@ -965,27 +1061,87 @@ This approach provides:
 - **Optimal read performance**: Queries use `hash` strategy for consistent, high-performance routing
 - **Flexibility**: Each operation type can use the most appropriate routing strategy
 
-### Auto-Generated Primary Keys
+## Auto-Generated Primary Keys
 
 When your table assigns the primary key during insert, use `insert()` for the automatic shard-allocation path or `insertShard()` when you already know the target shard. Both helpers capture the generated id from provider metadata or `RETURNING` rows, then store the generated-id mapping so the normal routed `first()` / `all()` helpers can read the row back.
 
 **A database-generated id is only unique within its own shard.** Every shard runs its own
-`AUTOINCREMENT` or `SERIAL` sequence, so a generated-key table spread across shards eventually
-mints the same id twice. CollegeDB throws `GENERATED_KEY_COLLISION` at that point rather than
-overwriting the first mapping and stranding its row. Two ways to avoid it:
+`AUTOINCREMENT` or `SERIAL` sequence, so `db-a` and `db-b` both hand out 1, then 2, then 3. Spread
+a generated-key table across shards and the same id eventually arrives twice; the second mapping
+would overwrite the first and leave that row on a shard nothing routes to.
 
-- Allocate the id with `nextId()` and pass it explicitly, which is cluster-unique across shards.
-- Keep the table on one shard with `insertShard()`, which keeps the database's own sequence
-  authoritative.
-
-If the primary key column is not named `id` or `rowid`, name it, because CollegeDB will not guess
-which returned column is the key:
+CollegeDB throws `GENERATED_KEY_COLLISION` when it sees that instead:
 
 ```typescript
-const created = await insert('INSERT INTO things (uuid, label) VALUES (?, ?) RETURNING uuid', ['abc', 'Widget'], {
-	idColumn: 'uuid'
+import { CollegeDBError, insertShard } from '@earth-app/collegedb';
+
+await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Ada']); // id 1 on db-a
+
+try {
+	await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Grace']); // also id 1
+} catch (error) {
+	if (error instanceof CollegeDBError && error.code === 'GENERATED_KEY_COLLISION') {
+		// The row was written to db-b, but id 1 already routes to db-a. Reconcile
+		// it with a cluster-unique id rather than leaving it unreachable.
+	}
+}
+```
+
+### Three Ways to Key a Generated-Id Table
+
+| Approach                     | Spans shards | Concurrency-safe                | Cost per id          |
+| ---------------------------- | ------------ | ------------------------------- | -------------------- |
+| `nextId()` + explicit id     | Yes          | With a coordinator              | One coordinator call |
+| `insertShard()` on one shard | No           | Yes, the database guarantees it | None                 |
+| `insert()` across shards     | Yes          | No, throws on collision         | None                 |
+
+**`nextId()` for a table that spans shards.** The id is allocated before the insert, so it is
+unique across the cluster and you route on it directly:
+
+```typescript
+import { insertInto, nextId } from '@earth-app/collegedb';
+
+const id = await nextId('tickets');
+
+await insertInto(String(id), 'tickets', {
+	id,
+	title: 'Printer is on fire',
+	created_at: Math.floor(Date.now() / 1000)
 });
 ```
+
+**`insertShard()` to keep the database's own sequence.** Pin the table to one shard and its
+`AUTOINCREMENT` stays authoritative, with no coordinator and no extra round trip. This is the right
+call for an append-only table that does not need to scale past one instance:
+
+```typescript
+import { first, insertShard } from '@earth-app/collegedb';
+
+const created = await insertShard('db-east', 'INSERT INTO audit_log (action, at) VALUES (?, ?)', ['login', Date.now()]);
+const row = await first(String(created.generatedId), 'SELECT * FROM audit_log WHERE id = ?', [created.generatedId]);
+```
+
+**`insert()` when a single shard holds the table anyway.** Convenient while there is one shard, and
+it fails loudly rather than silently the moment there are two.
+
+### Naming the Id Column
+
+CollegeDB looks for `id` or `rowid` in the returned row, then for the driver's own last-insert
+metadata. If your primary key is called something else, say so, because it will not guess which
+returned column is the key:
+
+```typescript
+const created = await insert('INSERT INTO things (uuid, label) VALUES (?, ?) RETURNING uuid, label', ['abc', 'Widget'], {
+	idColumn: 'uuid'
+});
+
+console.log(created.generatedId); // 'abc'
+```
+
+Without `idColumn`, a statement whose `RETURNING` row contains no recognizable id column throws
+`GENERATED_KEY_UNAVAILABLE`. It does not fall back to the row's first value or to the driver's
+rowid, because for a `TEXT PRIMARY KEY` table the rowid is a different value than the key and
+routing on it puts the row out of reach.
 
 ```typescript
 import { first, insert, insertShard } from '@earth-app/collegedb';
@@ -1137,6 +1293,21 @@ await insertInto(String(id), 'tickets', { id, title, created_at: nowSeconds });
 
 > With a coordinator the sequence is race-free across concurrent callers and isolates. Without one, `nextId` returns a cross-shard-correct `MAX + 1` that is not concurrency-safe on its own; pair it with a coordinator or a unique constraint when writers race.
 
+The cross-shard `MAX` is only paid once. With a coordinator, `nextId` asks the sequence first, and
+the coordinator answers directly whenever the sequence already exists, which it does after the
+first call. Only an unseeded sequence triggers the `MAX` sweep, so a table's first id costs one
+query per shard and every id after it costs one coordinator call and no shard queries.
+
+Options cover a non-default column and a floor:
+
+```typescript
+// Scan a column other than `id`
+const next = await nextId('tickets', { column: 'ticket_number' });
+
+// Never return below a known watermark, for example after importing legacy rows
+const safe = await nextId('tickets', { min: 100_000 });
+```
+
 ### Resilient Reads and Pagination
 
 ```typescript
@@ -1270,6 +1441,215 @@ console.log(`${result.agreed}/${result.examined} keys already agree, ${result.mo
 Once a pass reports no moves and no failures, computed placement resolves every key where the
 stored mapping already pointed. Keys moved by `reassignShard` stay recorded as exceptions and are
 still read from KV.
+
+### Measuring Where Time Goes
+
+`onPhase` reports each cost inside a routed operation separately, so a change to the KV path can be
+judged rather than guessed at. It allocates nothing when unset:
+
+```typescript
+import { PhaseCollector, initialize, run } from '@earth-app/collegedb';
+
+const phases = new PhaseCollector();
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+	strategy: 'hash',
+	onPhase: phases.observer
+});
+
+await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+console.table(phases.stats());
+// phase           count  avgMs  p50Ms  p95Ms  totalMs
+// sql.exec            1   0.21   0.21   0.21     0.21
+// kv.put              1   0.17   0.17   0.17     0.17
+// shard.select        1   0.00   0.00   0.00     0.00
+```
+
+Phases are `hash`, `kv.get`, `kv.put`, `kv.delete`, `kv.list`, `shard.select`,
+`coordinator.fetch`, `sql.prepare`, and `sql.exec`. SQL spans carry the shard binding in `detail`
+and KV spans carry the key prefix, so you can tell which shard or which kind of key is slow.
+
+For a stream rather than a summary, pass a function:
+
+```typescript
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST },
+	onPhase: (span) => {
+		if (span.durationMs > 50) {
+			console.warn(`slow ${span.phase} on ${span.detail}: ${span.durationMs.toFixed(1)}ms`);
+		}
+	}
+});
+```
+
+An observer that throws is swallowed rather than failing the query it was measuring.
+
+### Configuration Edge Cases
+
+#### Reads That Find Nothing
+
+A read for a key with no row does not record a mapping, so looking up something that does not exist
+costs no KV write and leaves nothing behind. That is the common shape for a public API, and it used
+to be the most expensive path in the library.
+
+If you depend on the old behavior, where any routed read pinned its key to a shard, turn it back on:
+
+```typescript
+import { initialize } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST },
+	allocateOnRead: true
+});
+```
+
+#### Reassignment and the Mapping Cache
+
+`mappingCacheTtlMs` (default 30s) is a consistency window, not only a latency knob. The process
+that calls `reassignShard` is correct immediately, because it clears its own cache entry. Other
+processes keep routing that key to its old shard until their own entry expires:
+
+```typescript
+import { reassignShard } from '@earth-app/collegedb';
+
+await reassignShard('user-123', 'db-west', 'users');
+// This isolate now routes user-123 to db-west.
+// Other isolates may route it to db-east for up to mappingCacheTtlMs.
+```
+
+Lower the TTL when reassignment has to take effect quickly across isolates, at the cost of more KV
+reads. Set it to `0` to read the mapping every time:
+
+```typescript
+initialize({ kv: env.KV, shards, mappingCacheTtlMs: 0 });
+```
+
+Under `placement: 'computed'`, a reassignment also bumps the manifest's exception version, so other
+isolates discard their cached exception set on their next manifest refresh.
+
+#### Upgrading Mappings Written Before 1.0.3
+
+A mapping miss reads one KV key. Versions before 1.0.3 stored multi-key mappings in a second record
+that later versions no longer need, and probing for it doubled the cost of every miss. If your KV
+store still holds mappings from that era, enable the probe while you migrate:
+
+```typescript
+initialize({ kv: env.KV, shards, legacyMultiKeyLookup: true });
+```
+
+#### Bulk KV Round Trips
+
+Backends with a native multi-get or multi-set are used automatically when the adapter exposes them,
+which matters for multi-key mappings: those otherwise cost one round trip per lookup key. Redis and
+Valkey clients with `mGet`/`mSet`/`unlink` are detected at adapter construction; adapters without
+them fall back to concurrent single operations, so nothing needs checking at the call site.
+
+```typescript
+import { createRedisKVProvider } from '@earth-app/collegedb';
+
+const kv = createRedisKVProvider(redisClient);
+
+// Present only when the client supports it
+await kv.putMany?.([
+	{ key: 'a', value: '1' },
+	{ key: 'b', value: '2' }
+]);
+```
+
+#### Workers KV Edge Caching
+
+Shard mappings are close to write-once, so the Workers KV adapter asks for a one-hour edge cache by
+default rather than Cloudflare's 60-second default. Override it when reassignments must propagate
+faster, or pass `0` to use Cloudflare's default:
+
+```typescript
+import { createWorkersKVProvider, initialize } from '@earth-app/collegedb';
+
+initialize({
+	kv: createWorkersKVProvider(env.KV, { cacheTtl: 300 }),
+	shards: { 'db-east': env.DB_EAST }
+});
+```
+
+#### Hyperdrive Connection Lifetime
+
+The Hyperdrive adapters create one client per request and reuse it for every statement in that
+request, which is the pattern Cloudflare documents. A client cached in module scope throws in
+Workers, so either give the provider a way to identify the current request, or dispose it yourself.
+
+Scoped, for a configuration shared across requests:
+
+```typescript
+import { Client } from 'pg';
+import { createHyperdrivePostgresProvider } from '@earth-app/collegedb';
+
+let currentRequest: Request | undefined;
+
+const shard = createHyperdrivePostgresProvider(env.HYPERDRIVE, (connectionString) => new Client({ connectionString }), {
+	scope: () => currentRequest
+});
+
+export default {
+	async fetch(request: Request, env: Env) {
+		currentRequest = request; // a new request transparently gets a new client
+		// ... handle the request
+	}
+};
+```
+
+Explicit, when you build the provider per request:
+
+```typescript
+import { Client } from 'pg';
+import { createHyperdrivePostgresProvider } from '@earth-app/collegedb';
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		const shard = createHyperdrivePostgresProvider(env.HYPERDRIVE, (cs) => new Client({ connectionString: cs }));
+		ctx.waitUntil(shard.dispose());
+		// ... handle the request
+	}
+};
+```
+
+Hyperdrive does not support D1, which needs no connection pooling from Workers.
+
+#### Unroutable Statements
+
+The planner throws by default. Switch to a fanout when you would rather query every shard than
+handle the error, accepting that a typo in a column name becomes an N-shard query instead of a
+failure:
+
+```typescript
+import { initialize, query } from '@earth-app/collegedb';
+
+initialize({ kv: env.KV, shards, onUnroutable: 'fanout' });
+
+// Routed on `id`
+await query('SELECT * FROM users WHERE id = ?', ['user-1']);
+
+// Not routable on a key, so this runs on every shard
+await query('SELECT * FROM users WHERE email = ?', ['ada@example.com']);
+```
+
+To decide per call rather than globally, plan it yourself:
+
+```typescript
+import { allAllShards, first, planQuery } from '@earth-app/collegedb';
+
+const plan = planQuery(sql, bindings, { keyColumns: { tickets: 'ticket_id' } });
+
+if (plan?.keys.length === 1) {
+	await first(plan.keys[0]!, sql, bindings);
+} else {
+	await allAllShards(sql, bindings);
+}
+```
 
 ### KV Cache and Secondary-Index Lookups
 
@@ -1821,6 +2201,21 @@ await first('user-123', 'SELECT * FROM users WHERE email = ?', [email]);
 
 The `CollegeDBError` class extends the native `Error` class and includes an optional error code for better error categorization:
 
+| Code                        | Raised when                                                             |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `NOT_INITIALIZED`           | A routed helper ran before `initialize`                                 |
+| `NO_SHARDS`                 | No shards are configured, or none are eligible for allocation           |
+| `SHARD_NOT_FOUND`           | A mapping names a shard this configuration does not hold                |
+| `MAPPING_NOT_FOUND`         | `reassignShard` or `updateShardMapping` found no mapping for the key    |
+| `QUERY_FAILED`              | The backend reported the statement as unsuccessful                      |
+| `GENERATED_KEY_UNAVAILABLE` | An insert returned no recognizable id; pass `idColumn`                  |
+| `GENERATED_KEY_COLLISION`   | A generated id is already mapped to a different shard                   |
+| `UNROUTABLE_QUERY`          | The planner could not prove a routing key and `onUnroutable` is `throw` |
+| `SIZE_QUERY_FAILED`         | No sizing statement worked against the backend                          |
+| `INVALID_IDENTIFIER`        | A table or column name is not a bare SQL identifier                     |
+| `EMPTY_WHERE`               | A built `UPDATE` or `DELETE` had no `WHERE` conditions                  |
+| `KV_JSON_PARSE_FAILED`      | A KV value could not be parsed as JSON                                  |
+
 ```typescript
 try {
 	await run('invalid-key', 'SELECT * FROM users WHERE id = ?', ['invalid-key']);
@@ -1907,8 +2302,25 @@ interface CollegeDBConfig {
 	knownShardsCacheTtlMs?: number; // Default: 10000
 	sizeCacheTtlMs?: number; // Default: 30000
 	migrationConcurrency?: number; // Default: 25
+	placement?: 'computed' | 'kv'; // Default: 'kv'
+	allocateOnRead?: boolean; // Default: false
+	legacyMultiKeyLookup?: boolean; // Default: false
+	keyColumns?: Record<string, string>; // Default: every table keyed on `id`
+	onUnroutable?: 'throw' | 'fanout'; // Default: 'throw'
+	onPhase?: (span: PhaseSpan) => void;
+	waitUntil?: (promise: Promise<unknown>) => void;
 }
 ```
+
+| Option                 | Purpose                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| `placement`            | Resolve the shard by computing it rather than reading KV. `hash` strategy only          |
+| `allocateOnRead`       | Record a mapping when a read finds no row                                               |
+| `legacyMultiKeyLookup` | Probe the pre-1.0.3 multi-key record on a miss, at the cost of a second KV read         |
+| `keyColumns`           | Primary-key column per table, used by the planner to recover the routing key            |
+| `onUnroutable`         | Whether an unprovable routing key throws or fans out                                    |
+| `onPhase`              | Per-phase timing observer. Allocates nothing when unset                                 |
+| `waitUntil`            | Keeps `initialize`'s background work alive past the request that started it, on Workers |
 
 When `hashShardMappings` is enabled (default), original keys cannot be recovered during shard operations like `getKeysForShard()`. This is intentional for privacy but means you'll get fewer results from such operations. For full key recovery, set `hashShardMappings: false`, but be aware this may expose sensitive data in KV keys.
 
