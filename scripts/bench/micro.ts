@@ -66,6 +66,31 @@ function fakeKV(): KVStorage {
 			const prefix = options?.prefix ?? '';
 			const keys = [...store.keys()].filter((key) => key.startsWith(prefix)).map((name) => ({ name }));
 			return { keys, list_complete: true };
+		},
+
+		// Counted as one operation each, because that is what they are on the
+		// stores that implement them: Redis and Valkey issue a single MGET or
+		// MSET. Without these the batch path silently falls back to one key at a
+		// time and the counters would not show it.
+		getMany: (async (keys: string[], type?: 'text' | 'json') => {
+			io.kvGet++;
+			return keys.map((key) => {
+				const raw = store.get(key);
+				if (raw === undefined) return null;
+				return type === 'json' ? JSON.parse(raw) : raw;
+			});
+		}) as KVStorage['getMany'],
+		async putMany(entries: Array<{ key: string; value: string }>): Promise<void> {
+			io.kvPut++;
+			for (const entry of entries) {
+				store.set(entry.key, entry.value);
+			}
+		},
+		async deleteMany(keys: string[]): Promise<void> {
+			io.kvDelete++;
+			for (const key of keys) {
+				store.delete(key);
+			}
 		}
 	};
 }
