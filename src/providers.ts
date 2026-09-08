@@ -1,8 +1,9 @@
 /**
- * @fileoverview Provider adapters for non-Cloudflare backends.
+ * @fileoverview Adapters that map each supported backend onto CollegeDB's
+ * storage contracts.
  *
- * This module defines maintainable adapter factories that allow CollegeDB to run
- * on multiple storage backends while preserving Cloudflare compatibility.
+ * Every adapter produces either a {@link KVStorage} or a {@link SQLDatabase},
+ * so the router never learns which backend it is talking to.
  *
  * Supported KV backends:
  * - Cloudflare KV (native shape)
@@ -18,12 +19,12 @@
  * - Drizzle ORM database instances
  * - Hyperdrive-backed PostgreSQL / MySQL clients
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.1.0
  */
 
 import { CollegeDBError } from './errors';
-import type { KVListResult, KVStorage, PreparedStatement, QueryResult, QueryResultMeta, SQLDatabase } from './types';
+import type { BatchStatement, KVListResult, KVStorage, PreparedStatement, QueryResult, QueryResultMeta, SQLDatabase } from './types';
 
 const DEFAULT_REDIS_SCAN_COUNT = 500;
 
@@ -35,6 +36,16 @@ export interface RedisLikeClient {
 	set(key: string, value: string): unknown | Promise<unknown>;
 	del(key: string): unknown | Promise<unknown>;
 	scan(cursor: string, ...args: any[]): RedisScanResult | Promise<RedisScanResult>;
+	/** Multi-get, present on node-redis and ioredis. Used when available. @since 1.4.0 */
+	mGet?(keys: string[]): Promise<(string | null)[]>;
+	/** ioredis spelling of multi-get. @since 1.4.0 */
+	mget?(keys: string[]): Promise<(string | null)[]>;
+	/** Multi-set, present on node-redis. @since 1.4.0 */
+	mSet?(entries: Array<[string, string]> | Record<string, string>): unknown | Promise<unknown>;
+	/** ioredis spelling of multi-set. @since 1.4.0 */
+	mset?(entries: Record<string, string>): unknown | Promise<unknown>;
+	/** Variadic delete, used to clear many keys in one round trip. @since 1.4.0 */
+	unlink?(...keys: string[]): unknown | Promise<unknown>;
 }
 
 /**
@@ -195,7 +206,26 @@ export interface NuxtHubKVLike {
 export function createRedisKVProvider(client: RedisLikeClient, options: { scanCount?: number } = {}): KVStorage {
 	const scanCount = options.scanCount ?? DEFAULT_REDIS_SCAN_COUNT;
 
-	return {
+	const parse = <T>(raw: string | null, key: string, type: 'text' | 'json'): T | string | null => {
+		if (raw === null) {
+			return null;
+		}
+		if (type !== 'json') {
+			return raw;
+		}
+		try {
+			return JSON.parse(raw) as T;
+		} catch (error) {
+			throw new CollegeDBError(
+				`Failed to parse JSON from Redis for key ${key}: ${error instanceof Error ? error.message : String(error)}`,
+				'KV_JSON_PARSE_FAILED'
+			);
+		}
+	};
+
+	const multiGet = client.mGet ?? client.mget;
+
+	const provider: KVStorage = {
 		async get<T = unknown>(key: string, type: 'text' | 'json' = 'text'): Promise<T | string | null> {
 			const raw = await client.get(key);
 			if (raw === null) {
@@ -227,35 +257,140 @@ export function createRedisKVProvider(client: RedisLikeClient, options: { scanCo
 		async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<KVListResult> {
 			const prefix = options?.prefix ?? '';
 			const pattern = `${prefix}*`;
-			let cursor = options?.cursor ?? '0';
 			const limit = options?.limit;
 			const keys: string[] = [];
 
-			do {
-				const scanResult = await executeRedisScan(client, cursor, pattern, scanCount);
-				cursor = scanResult.cursor;
+			// SCAN hands back a whole batch at a time, so honouring an exact `limit`
+			// means stopping partway through one. The cursor therefore carries both
+			// the SCAN cursor that produced the current batch and how many of that
+			// batch's matching keys have already been returned. Truncating without
+			// recording the offset dropped the rest of the batch, and the plain SCAN
+			// cursor then resumed past it, so a paginating caller lost keys.
+			let { scanCursor, skip } = decodeScanCursor(options?.cursor);
 
+			while (true) {
+				const batchCursor = scanCursor;
+				const scanResult = await executeRedisScan(client, batchCursor, pattern, scanCount);
+				scanCursor = scanResult.cursor;
+
+				let consumed = 0;
 				for (const key of scanResult.keys) {
-					if (!prefix || key.startsWith(prefix)) {
-						keys.push(key);
+					if (prefix && !key.startsWith(prefix)) {
+						continue;
 					}
+
+					consumed++;
+					if (consumed <= skip) {
+						continue;
+					}
+
+					keys.push(key);
+
 					if (limit && keys.length >= limit) {
-						break;
+						const exhausted = consumed === scanResult.keys.filter((k) => !prefix || k.startsWith(prefix)).length;
+
+						// Resuming inside this batch means re-issuing the cursor that
+						// produced it and skipping what has been handed out.
+						if (!exhausted) {
+							return {
+								keys: keys.map((name) => ({ name })),
+								cursor: encodeScanCursor(batchCursor, consumed),
+								list_complete: false
+							};
+						}
+
+						return {
+							keys: keys.map((name) => ({ name })),
+							cursor: scanCursor === '0' ? undefined : encodeScanCursor(scanCursor, 0),
+							list_complete: scanCursor === '0'
+						};
 					}
 				}
 
-				if (limit && keys.length >= limit) {
-					break;
-				}
-			} while (cursor !== '0');
+				skip = 0;
 
-			return {
-				keys: keys.map((name) => ({ name })),
-				cursor,
-				list_complete: cursor === '0'
-			};
+				if (scanCursor === '0') {
+					return {
+						keys: keys.map((name) => ({ name })),
+						cursor: undefined,
+						list_complete: true
+					};
+				}
+			}
 		}
 	};
+
+	if (multiGet) {
+		provider.getMany = async <T = unknown>(keys: string[], type: 'text' | 'json' = 'text'): Promise<any> => {
+			if (keys.length === 0) {
+				return [];
+			}
+
+			const raw = await multiGet.call(client, keys);
+			return keys.map((key, index) => parse<T>(raw[index] ?? null, key, type));
+		};
+	}
+
+	if (client.mSet || client.mset) {
+		provider.putMany = async (entries) => {
+			if (entries.length === 0) {
+				return;
+			}
+
+			if (client.mSet) {
+				await client.mSet(entries.map((entry) => [entry.key, entry.value] as [string, string]));
+				return;
+			}
+
+			const record: Record<string, string> = {};
+			for (const entry of entries) {
+				record[entry.key] = entry.value;
+			}
+			await client.mset!(record);
+		};
+	}
+
+	if (client.unlink) {
+		provider.deleteMany = async (keys) => {
+			if (keys.length > 0) {
+				await client.unlink!(...keys);
+			}
+		};
+	}
+
+	return provider;
+}
+
+/**
+ * Splits a `list` cursor into the SCAN cursor and the in-batch offset.
+ *
+ * Plain numeric cursors from an earlier version are read as a SCAN cursor with
+ * no offset, so an in-flight pagination keeps working across an upgrade.
+ * @private
+ */
+function decodeScanCursor(cursor: string | undefined): { scanCursor: string; skip: number } {
+	if (!cursor) {
+		return { scanCursor: '0', skip: 0 };
+	}
+
+	const separator = cursor.lastIndexOf('|');
+	if (separator === -1) {
+		return { scanCursor: cursor, skip: 0 };
+	}
+
+	const skip = Number.parseInt(cursor.slice(separator + 1), 10);
+	return {
+		scanCursor: cursor.slice(0, separator) || '0',
+		skip: Number.isFinite(skip) && skip > 0 ? skip : 0
+	};
+}
+
+/**
+ * Builds a `list` cursor from a SCAN cursor and an in-batch offset.
+ * @private
+ */
+function encodeScanCursor(scanCursor: string, skip: number): string {
+	return `${scanCursor}|${skip}`;
 }
 
 /**
@@ -415,12 +550,109 @@ export function createNuxtHubKVProvider(client: NuxtHubKVLike): KVStorage {
 		async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<KVListResult> {
 			const prefix = options?.prefix ?? '';
 			const allKeys = await listNuxtHubKVKeys(client, prefix);
-			const limitedKeys = typeof options?.limit === 'number' ? allKeys.slice(0, options.limit) : allKeys;
+
+			// The underlying client has no cursor of its own, so paginate over the
+			// returned key list by offset. Reporting `list_complete: true` while
+			// silently truncating at `limit` made a paginated caller lose keys.
+			const start = decodeOffsetCursor(options?.cursor);
+			const limit = typeof options?.limit === 'number' && options.limit > 0 ? options.limit : undefined;
+			const end = limit === undefined ? allKeys.length : Math.min(allKeys.length, start + limit);
+			const page = allKeys.slice(start, end);
+			const complete = end >= allKeys.length;
 
 			return {
-				keys: limitedKeys.map((name) => ({ name })),
-				list_complete: true
+				keys: page.map((name) => ({ name })),
+				list_complete: complete,
+				cursor: complete ? undefined : String(end)
 			};
+		}
+	};
+}
+
+/**
+ * Reads an offset-style list cursor, treating anything unparseable as the start.
+ * @private
+ */
+function decodeOffsetCursor(cursor: string | undefined): number {
+	if (!cursor) {
+		return 0;
+	}
+
+	const parsed = Number.parseInt(cursor, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
+ * Options controlling how a Hyperdrive-backed provider manages its client.
+ * @since 1.4.0
+ */
+export interface HyperdriveProviderOptions {
+	/**
+	 * Returns an object identifying the current request, typically the `Request`
+	 * itself. The provider keeps one client per distinct token in a `WeakMap`, so
+	 * a new request transparently gets a new client and the old one is released
+	 * without an explicit {@link HyperdriveProvider.dispose} call.
+	 *
+	 * Use this when a single CollegeDB configuration is shared across requests,
+	 * which is what every module-scope `initialize` does.
+	 */
+	scope?: () => object | undefined;
+}
+
+/**
+ * A Hyperdrive-backed provider plus the hook that releases its connection.
+ * @since 1.4.0
+ */
+export interface HyperdriveProvider extends SQLDatabase {
+	/**
+	 * Closes the client held for the current request.
+	 *
+	 * Call it once per request, typically as `ctx.waitUntil(provider.dispose())`.
+	 * Unnecessary when `scope` is configured.
+	 */
+	dispose(): Promise<void>;
+}
+
+/**
+ * Tracks one client per request scope without keeping the scope object alive.
+ * @private
+ */
+function createScopedClientCache<C>(factory: () => C, close: (client: C) => Promise<void>, scope?: () => object | undefined) {
+	const byScope = new WeakMap<object, C>();
+	let unscoped: C | null = null;
+
+	return {
+		acquire(): C {
+			const token = scope?.();
+			if (token) {
+				const existing = byScope.get(token);
+				if (existing) {
+					return existing;
+				}
+				const created = factory();
+				byScope.set(token, created);
+				return created;
+			}
+
+			unscoped ??= factory();
+			return unscoped;
+		},
+		async dispose(): Promise<void> {
+			const token = scope?.();
+			if (token) {
+				const existing = byScope.get(token);
+				if (existing) {
+					byScope.delete(token);
+					await close(existing);
+				}
+				return;
+			}
+
+			if (unscoped) {
+				const client = unscoped;
+				unscoped = null;
+				await close(client);
+			}
 		}
 	};
 }
@@ -428,76 +660,115 @@ export function createNuxtHubKVProvider(client: NuxtHubKVLike): KVStorage {
 /**
  * Creates a PostgreSQL adapter wired to a Hyperdrive binding.
  *
- * The returned provider creates a transient client for each statement execution.
- * Hyperdrive handles connection pooling at the edge, so this pattern remains fast
- * and scalable in Workers.
+ * The client is created once per request and reused for every statement in that
+ * request, which is the pattern Cloudflare documents: Hyperdrive pools the
+ * underlying connection, so creating a client is cheap, but each `connect()`
+ * still acquires a pooled connection and the pooler runs in transaction mode.
+ * Opening one per statement therefore acquires and releases a pooled connection
+ * per statement and forfeits named prepared statements.
+ *
+ * Caching a client in module scope is not the alternative: Workers reject I/O
+ * created by one request and used by another. Either pass `scope` so the
+ * provider can key its client on the current request, or call
+ * {@link HyperdriveProvider.dispose} at the end of each request.
  *
  * @param hyperdrive - Hyperdrive binding
  * @param clientFactory - Client factory (e.g. `connectionString => new Client({ connectionString })`)
- * @returns SQLDatabase-compatible adapter
+ * @param options - Request-scope hook
+ * @returns SQLDatabase-compatible adapter with a `dispose` hook
+ * @since 1.0.0
+ * @example
+ * ```typescript
+ * const shard = createHyperdrivePostgresProvider(env.HYPERDRIVE, (connectionString) => new Client({ connectionString }), {
+ * 	scope: () => currentRequest
+ * });
+ * ```
  */
 export function createHyperdrivePostgresProvider(
 	hyperdrive: HyperdriveBindingLike,
-	clientFactory: HyperdrivePostgresClientFactory
-): SQLDatabase {
+	clientFactory: HyperdrivePostgresClientFactory,
+	options: HyperdriveProviderOptions = {}
+): HyperdriveProvider {
+	const cache = createScopedClientCache<{ client: ReturnType<HyperdrivePostgresClientFactory>; connected: Promise<void> | null }>(
+		() => ({ client: clientFactory(hyperdrive.connectionString), connected: null }),
+		async (entry) => {
+			if (typeof entry.client.release === 'function') {
+				entry.client.release();
+			} else if (typeof entry.client.end === 'function') {
+				await entry.client.end();
+			}
+		},
+		options.scope
+	);
+
 	const delegatedClient: PostgresClientLike = {
 		query: async <T = Record<string, unknown>>(sql: string, bindings: any[] = []) => {
-			const client = clientFactory(hyperdrive.connectionString);
-			if (typeof client.connect === 'function') {
-				await client.connect();
+			const entry = cache.acquire();
+
+			if (typeof entry.client.connect === 'function') {
+				entry.connected ??= Promise.resolve(entry.client.connect()).then(() => undefined);
+				await entry.connected;
 			}
 
-			try {
-				return await client.query<T>(sql, bindings);
-			} finally {
-				if (typeof client.release === 'function') {
-					client.release();
-				} else if (typeof client.end === 'function') {
-					await client.end();
-				}
-			}
+			return await entry.client.query<T>(sql, bindings);
 		}
 	};
 
-	return createPostgreSQLProvider(delegatedClient);
+	const provider = createPostgreSQLProvider(delegatedClient) as HyperdriveProvider;
+	provider.dispose = () => cache.dispose();
+	return provider;
 }
 
 /**
  * Creates a MySQL/MariaDB adapter wired to a Hyperdrive binding.
  *
- * The returned provider creates a transient client for each statement execution.
- * Hyperdrive handles connection pooling under the hood.
+ * The client is created once per request and reused for every statement in that
+ * request. See {@link createHyperdrivePostgresProvider} for why per-statement
+ * clients are the wrong unit and why a module-scoped client is not the fix.
  *
  * @param hyperdrive - Hyperdrive binding
  * @param clientFactory - Client factory (e.g. `connectionString => mysql.createConnection(connectionString)`)
- * @returns SQLDatabase-compatible adapter
+ * @param options - Request-scope hook
+ * @returns SQLDatabase-compatible adapter with a `dispose` hook
+ * @since 1.0.0
  */
-export function createHyperdriveMySQLProvider(hyperdrive: HyperdriveBindingLike, clientFactory: HyperdriveMySQLClientFactory): SQLDatabase {
+export function createHyperdriveMySQLProvider(
+	hyperdrive: HyperdriveBindingLike,
+	clientFactory: HyperdriveMySQLClientFactory,
+	options: HyperdriveProviderOptions = {}
+): HyperdriveProvider {
+	const cache = createScopedClientCache<ReturnType<HyperdriveMySQLClientFactory>>(
+		() => clientFactory(hyperdrive.connectionString),
+		async (client) => {
+			if (typeof client.end === 'function') {
+				await client.end();
+			} else if (typeof client.close === 'function') {
+				await client.close();
+			} else if (typeof client.destroy === 'function') {
+				client.destroy();
+			}
+		},
+		options.scope
+	);
+
 	const delegatedClient: MySQLClientLike = {
 		execute: async (sql: string, bindings: any[] = []) => {
-			const client = clientFactory(hyperdrive.connectionString);
-			try {
-				if (typeof client.execute === 'function') {
-					return await client.execute(sql, bindings);
-				}
-				if (typeof client.query === 'function') {
-					return await client.query(sql, bindings);
-				}
+			const client = cache.acquire();
 
-				throw new CollegeDBError('Hyperdrive MySQL client is missing execute/query methods', 'MYSQL_CLIENT_INVALID');
-			} finally {
-				if (typeof client.end === 'function') {
-					await client.end();
-				} else if (typeof client.close === 'function') {
-					await client.close();
-				} else if (typeof client.destroy === 'function') {
-					client.destroy();
-				}
+			if (typeof client.execute === 'function') {
+				return await client.execute(sql, bindings);
 			}
+			if (typeof client.query === 'function') {
+				return await client.query(sql, bindings);
+			}
+
+			throw new CollegeDBError('Hyperdrive MySQL client is missing execute/query methods', 'MYSQL_CLIENT_INVALID');
 		}
 	};
 
-	return createMySQLProvider(delegatedClient);
+	const provider = createMySQLProvider(delegatedClient) as HyperdriveProvider;
+	provider.dispose = () => cache.dispose();
+	return provider;
 }
 
 /**
@@ -593,14 +864,95 @@ export function toProvider(binding: unknown, options: ToProviderOptions = {}): S
 	}
 
 	if (isSQLDatabase(binding)) {
-		return binding;
+		return withNativeBatch(binding);
 	}
 
 	if (typeof candidate.prepare === 'function') {
-		return createSQLiteProvider(binding as SQLiteClientLike);
+		return withNativeBatch(createSQLiteProvider(binding as SQLiteClientLike), binding);
 	}
 
 	return null;
+}
+
+/**
+ * Shape of a D1-style `batch`, which takes prepared statements rather than SQL.
+ * @private
+ */
+interface NativeBatchCapable {
+	prepare(sql: string): { bind(...bindings: any[]): unknown };
+	batch<T = unknown>(
+		statements: unknown[]
+	): Promise<Array<{ success?: boolean; results?: T[]; meta?: Record<string, unknown>; error?: string }>>;
+}
+
+/**
+ * Adds {@link SQLDatabase.runBatch} when the binding has a native batch.
+ *
+ * Only D1 and the Drizzle drivers built on it are wired up here. The `pg`,
+ * `mysql2` and SQLite adapters are left without `runBatch` on purpose: their
+ * statements already travel over one connection, so grouping saves little, and
+ * wrapping them in `BEGIN`/`COMMIT` through a pool would send the transaction
+ * control statements down a different connection than the statements they are
+ * meant to bracket. CollegeDB falls back to sequential execution for those,
+ * which is what they did before.
+ *
+ * @private
+ */
+function withNativeBatch(provider: SQLDatabase, rawBinding: unknown = provider): SQLDatabase {
+	const candidate = rawBinding as Partial<NativeBatchCapable>;
+	if (typeof candidate.batch !== 'function' || typeof candidate.prepare !== 'function' || provider.runBatch) {
+		return provider;
+	}
+
+	const native = candidate as NativeBatchCapable;
+
+	return {
+		prepare: (sql: string) => provider.prepare(sql),
+		async runBatch<T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> {
+			if (statements.length === 0) {
+				return [];
+			}
+
+			const prepared = statements.map((statement) => {
+				const stmt = native.prepare(statement.sql);
+				return statement.bindings && statement.bindings.length > 0 ? stmt.bind(...statement.bindings) : stmt;
+			});
+
+			const results = await native.batch<T>(prepared);
+
+			return results.map((result) => ({
+				success: result.success ?? true,
+				results: (result.results ?? []) as T[],
+				meta: { duration: 0, ...(result.meta ?? {}) },
+				...(result.error ? { error: result.error } : {})
+			}));
+		}
+	};
+}
+
+/**
+ * Default `cacheTtl` for Workers KV reads, in seconds.
+ *
+ * Cloudflare's guidance is to raise this above the 60 second default, and shard
+ * mappings are close to write-once: a key keeps its shard until something calls
+ * `reassignShard`. CollegeDB already tolerates a stale mapping for
+ * `mappingCacheTtlMs` in process, so a longer edge TTL does not widen the
+ * window in kind, only in duration.
+ * @private
+ */
+const DEFAULT_WORKERS_KV_CACHE_TTL = 3600;
+
+/**
+ * Options for {@link createWorkersKVProvider}.
+ * @since 1.4.0
+ */
+export interface WorkersKVProviderOptions {
+	/**
+	 * Edge cache lifetime for reads, in seconds. Set `0` to send no `cacheTtl`
+	 * and use Cloudflare's own default.
+	 * @default 3600
+	 */
+	cacheTtl?: number;
 }
 
 /**
@@ -624,10 +976,13 @@ export function toProvider(binding: unknown, options: ToProviderOptions = {}): S
  * });
  * ```
  */
-export function createWorkersKVProvider(kv: WorkersKVNamespaceLike): KVStorage {
+export function createWorkersKVProvider(kv: WorkersKVNamespaceLike, options: WorkersKVProviderOptions = {}): KVStorage {
+	const cacheTtl = options.cacheTtl ?? DEFAULT_WORKERS_KV_CACHE_TTL;
+	const getOptions = cacheTtl > 0 ? { type: 'text' as const, cacheTtl } : { type: 'text' as const };
+
 	return {
 		async get<T = unknown>(key: string, type: 'text' | 'json' = 'text'): Promise<T | string | null> {
-			const raw = await kv.get(key, 'text');
+			const raw = await kv.get(key, getOptions as any);
 			if (raw === null || raw === undefined) {
 				return null;
 			}
@@ -681,7 +1036,7 @@ class PostgresPreparedStatement implements PreparedStatement {
 	}
 
 	async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const sql = rewriteQuestionPlaceholders(this.sql);
 		const result = await this.client.query<T>(sql, this.bindings);
 		return {
@@ -695,7 +1050,7 @@ class PostgresPreparedStatement implements PreparedStatement {
 	}
 
 	async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const sql = rewriteQuestionPlaceholders(this.sql);
 		const result = await this.client.query<T>(sql, this.bindings);
 		return {
@@ -731,7 +1086,7 @@ class MySQLPreparedStatement implements PreparedStatement {
 	}
 
 	async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const rows = await executeMySQL(this.client, this.sql, this.bindings);
 
 		if (Array.isArray(rows)) {
@@ -755,7 +1110,7 @@ class MySQLPreparedStatement implements PreparedStatement {
 	}
 
 	async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const rows = await executeMySQL(this.client, this.sql, this.bindings);
 		return {
 			success: true,
@@ -792,7 +1147,7 @@ class SQLitePreparedStatement implements PreparedStatement {
 	}
 
 	async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 
 		if (typeof this.client.execute === 'function') {
 			const result = await this.client.execute(this.sql, this.bindings);
@@ -822,7 +1177,7 @@ class SQLitePreparedStatement implements PreparedStatement {
 	}
 
 	async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 
 		if (typeof this.client.execute === 'function') {
 			const result = await this.client.execute(this.sql, this.bindings);
@@ -895,7 +1250,7 @@ class DrizzlePreparedStatement implements PreparedStatement {
 	}
 
 	async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const query = buildDrizzleQuery(this.sqlTag, this.sqlText, this.bindings);
 		const result = await executeDrizzleRun(this.client, query);
 
@@ -907,7 +1262,7 @@ class DrizzlePreparedStatement implements PreparedStatement {
 	}
 
 	async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-		const startedAt = Date.now();
+		const startedAt = nowMs();
 		const query = buildDrizzleQuery(this.sqlTag, this.sqlText, this.bindings);
 		const result = await executeDrizzleAll(this.client, query);
 
@@ -1339,9 +1694,20 @@ function extractRowsFromSQLiteExecute<T>(result: unknown): T[] {
 	return [];
 }
 
+/**
+ * Reads the monotonic clock used for `meta.duration`.
+ *
+ * `Date.now()` only has millisecond resolution and is coarsened further inside
+ * workerd, which reported every sub-millisecond statement as 0 or 1.
+ * @private
+ */
+function nowMs(): number {
+	return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+}
+
 function createMeta(startedAt: number, extra: Record<string, unknown> = {}): QueryResultMeta {
 	return {
-		duration: Date.now() - startedAt,
+		duration: nowMs() - startedAt,
 		...extra
 	};
 }
