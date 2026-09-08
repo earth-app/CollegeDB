@@ -24,7 +24,16 @@
  */
 
 import { CollegeDBError } from './errors';
-import type { BatchStatement, KVListResult, KVStorage, PreparedStatement, QueryResult, QueryResultMeta, SQLDatabase } from './types';
+import type {
+	BatchStatement,
+	KVListResult,
+	KVStorage,
+	PreparedStatement,
+	QueryResult,
+	QueryResultMeta,
+	SQLDatabase,
+	SQLDialect
+} from './types';
 
 const DEFAULT_REDIS_SCAN_COUNT = 500;
 
@@ -423,10 +432,11 @@ export function createPostgreSQLProvider(client: PostgresClientLike): SQLDatabas
 export function createPostgreSQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
 export function createPostgreSQLProvider(client: PostgresClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
 	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag);
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'postgres');
 	}
 
 	return {
+		dialect: 'postgres',
 		prepare(sql: string): PreparedStatement {
 			return new PostgresPreparedStatement(client as PostgresClientLike, sql);
 		}
@@ -449,10 +459,11 @@ export function createMySQLProvider(client: MySQLClientLike): SQLDatabase;
 export function createMySQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
 export function createMySQLProvider(client: MySQLClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
 	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag);
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'mysql');
 	}
 
 	return {
+		dialect: 'mysql',
 		prepare(sql: string): PreparedStatement {
 			return new MySQLPreparedStatement(client as MySQLClientLike, sql);
 		}
@@ -475,10 +486,11 @@ export function createSQLiteProvider(client: SQLiteClientLike): SQLDatabase;
 export function createSQLiteProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
 export function createSQLiteProvider(client: SQLiteClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
 	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag);
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'sqlite');
 	}
 
 	return {
+		dialect: 'sqlite',
 		prepare(sql: string): PreparedStatement {
 			return new SQLitePreparedStatement(client as SQLiteClientLike, sql);
 		}
@@ -496,8 +508,9 @@ export function createSQLiteProvider(client: SQLiteClientLike | DrizzleClientLik
  * @param sqlTag - Drizzle `sql` helper from `drizzle-orm`
  * @returns SQLDatabase-compatible adapter
  */
-export function createDrizzleSQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase {
+export function createDrizzleSQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike, dialect?: SQLDialect): SQLDatabase {
 	return {
+		dialect,
 		prepare(sql: string): PreparedStatement {
 			return new DrizzlePreparedStatement(client, sqlTag, sql);
 		}
@@ -907,6 +920,7 @@ function withNativeBatch(provider: SQLDatabase, rawBinding: unknown = provider):
 	const native = candidate as NativeBatchCapable;
 
 	return {
+		dialect: provider.dialect,
 		prepare: (sql: string) => provider.prepare(sql),
 		async runBatch<T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> {
 			if (statements.length === 0) {

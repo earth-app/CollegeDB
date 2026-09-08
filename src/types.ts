@@ -148,6 +148,17 @@ export interface PreparedStatement {
 }
 
 /**
+ * SQL dialect of a shard, used to quote identifiers the way that backend
+ * expects.
+ *
+ * MySQL and MariaDB reject double-quoted identifiers unless `ANSI_QUOTES` is in
+ * their `sql_mode`, so a statement built with ANSI quoting fails outright there.
+ * Adapters report their dialect so the builders can pick the right character.
+ * @since 1.4.0
+ */
+export type SQLDialect = 'sqlite' | 'postgres' | 'mysql';
+
+/**
  * A statement plus its bindings, as accepted by {@link SQLDatabase.runBatch}.
  * @since 1.4.0
  */
@@ -164,6 +175,16 @@ export interface BatchStatement {
 export interface SQLDatabase {
 	/** Creates a prepared statement */
 	prepare(sql: string): PreparedStatement;
+	/**
+	 * Which SQL dialect this shard speaks, so generated statements quote
+	 * identifiers correctly.
+	 *
+	 * Optional. The adapter factories set it; a raw binding passed straight to
+	 * {@link initialize} leaves it unset, which is read as ANSI double quoting
+	 * and is correct for D1 and SQLite.
+	 * @since 1.4.0
+	 */
+	dialect?: SQLDialect;
 	/**
 	 * Executes several statements against this shard in one round trip.
 	 *

@@ -58,6 +58,7 @@ export {
 	insertInto,
 	insertReturning,
 	insertShard,
+	invalidateMappingCache,
 	isInitialized,
 	listKnownShards,
 	nextId,
@@ -121,7 +122,7 @@ export { PhaseCollector, isPhaseObserverActive, setPhaseObserver } from './telem
 export type { PhaseName, PhaseObserver, PhaseSpan, PhaseStats } from './telemetry';
 
 // Export deterministic SQL builders
-export { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier } from './query';
+export { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier, validateIdentifier } from './query';
 export type { BuildInsertOptions, BuildUpsertOptions, BuiltQuery, ColumnValues } from './query';
 
 // Export KV read-through cache helpers
@@ -204,6 +205,7 @@ export type {
 	QueryResult,
 	QueryResultMeta,
 	SQLDatabase,
+	SQLDialect,
 	ShardCoordinatorState,
 	ShardLocation,
 	ShardMapping,
