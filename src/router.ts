@@ -36,7 +36,7 @@
  * const result = await first('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
  * ```
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.0.0
  */
 
@@ -44,6 +44,19 @@ import type { Request } from '@cloudflare/workers-types';
 import { CollegeDBError } from './errors';
 import { KVShardMapper } from './kvmap';
 import { createSchemaAcrossShards } from './migrations';
+import {
+	addPlacementException,
+	candidateShards,
+	createManifest,
+	hrwShard,
+	loadPlacementExceptions,
+	loadPlacementManifest,
+	resetPlacementState,
+	savePlacementManifest,
+	withCurrentTopology,
+	type PlacementManifest
+} from './placement';
+import { planQuery, unroutableError } from './planner';
 import { createWorkersKVProvider, isKVStorage, toProvider, type DrizzleSqlTagLike } from './providers';
 import {
 	buildDelete,
@@ -54,6 +67,7 @@ import {
 	type BuildUpsertOptions,
 	type ColumnValues
 } from './query';
+import { instrumentKV, instrumentSQL, phaseEnd, phaseStart, setPhaseObserver } from './telemetry';
 import type {
 	CollegeDBConfig,
 	D1Region,
@@ -97,6 +111,15 @@ const shardSizeCache = new Map<string, { size: number; expiresAt: number }>();
 let generatedInsertRoundRobinIndex = 0;
 
 /**
+ * Cached placement decision for the active configuration. Cleared whenever the
+ * configuration changes, so a reconfigured process never resolves against
+ * another deployment's topology.
+ *
+ * @private
+ */
+let placementDecision: { mode: 'computed' | 'kv'; manifest: PlacementManifest | null } | null = null;
+
+/**
  * Gets the shared mapper for the active configuration.
  * @private
  */
@@ -119,7 +142,7 @@ function getMapper(config: CollegeDBConfig): KVShardMapper {
  *
  * This will also automatically detect and migrate existing databases without requiring
  * additional setup. If shards contain existing data with primary keys, CollegeDB
- * will automatically create the necessary mappings for seamless operation.
+ * will automatically create the necessary mappings so existing rows stay reachable.
  *
  * @param config - Configuration object containing all necessary bindings and settings
  * @throws {Error} If configuration is invalid or required bindings are missing
@@ -150,31 +173,89 @@ function getMapper(config: CollegeDBConfig): KVShardMapper {
  * ```
  */
 export function initialize(config: CollegeDBConfig) {
-	globalConfig = config;
-	globalMapper = new KVShardMapper(config.kv, {
-		hashShardMappings: config.hashShardMappings,
-		mappingCacheTtlMs: config.mappingCacheTtlMs,
-		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
-	});
-	shardSizeCache.clear();
-	generatedInsertRoundRobinIndex = 0;
+	const active = applyConfig(config);
 
 	// Background: sync KV known shards with configured shards
 	try {
-		const mapper = getMapper(config);
-		Promise.resolve()
-			.then(async () => {
-				const existing = await mapper.getKnownShards();
-				const merged = Array.from(new Set([...existing, ...Object.keys(config.shards)]));
-				await mapper.setKnownShards(merged);
-			})
-			.catch(() => void 0);
+		const mapper = getMapper(active);
+		track(
+			active,
+			Promise.resolve()
+				.then(async () => {
+					const existing = await mapper.getKnownShards();
+					const merged = Array.from(new Set([...existing, ...Object.keys(active.shards)]));
+					await mapper.setKnownShards(merged);
+				})
+				.catch(() => void 0)
+		);
 	} catch {}
 
-	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration) {
-		performAutoMigration(config).catch((error) => {
-			console.warn('Background auto-migration failed:', error);
-		});
+	if (active.shards && Object.keys(active.shards).length > 0 && !active.disableAutoMigration) {
+		track(
+			active,
+			performAutoMigration(active).catch((error) => {
+				console.warn('Background auto-migration failed:', error);
+			})
+		);
+	}
+}
+
+/**
+ * Installs a configuration as the active one, wrapping the providers with
+ * timing instrumentation when `onPhase` is set.
+ *
+ * The instrumented providers replace the originals on the stored config rather
+ * than at each call site, so the read-through cache and the lookup helpers are
+ * measured too. When `onPhase` is unset no wrapper is created.
+ *
+ * @private
+ * @returns The configuration that was installed
+ */
+function applyConfig(config: CollegeDBConfig): CollegeDBConfig {
+	setPhaseObserver(config.onPhase ?? null);
+
+	let active = config;
+	if (config.onPhase) {
+		const shards: Record<string, SQLDatabase> = {};
+		for (const [binding, database] of Object.entries(config.shards)) {
+			shards[binding] = database ? instrumentSQL(database, binding) : database;
+		}
+		active = { ...config, kv: instrumentKV(config.kv), shards };
+	}
+
+	globalConfig = active;
+	globalMapper = new KVShardMapper(active.kv, {
+		hashShardMappings: active.hashShardMappings,
+		mappingCacheTtlMs: active.mappingCacheTtlMs,
+		knownShardsCacheTtlMs: active.knownShardsCacheTtlMs,
+		legacyMultiKeyLookup: active.legacyMultiKeyLookup
+	});
+	shardSizeCache.clear();
+	generatedInsertRoundRobinIndex = 0;
+	resetPlacementState();
+	placementDecision = null;
+
+	return active;
+}
+
+/**
+ * Hands a background promise to the host so it outlives the current request.
+ *
+ * On Workers, work not attached to a request is cancelled when that request
+ * ends, which silently abandoned the known-shard sync and the auto-migration
+ * that {@link initialize} starts. Passing `ctx.waitUntil` as `config.waitUntil`
+ * keeps them alive; without it the behavior is unchanged.
+ *
+ * @private
+ */
+function track(config: CollegeDBConfig, promise: Promise<unknown>): void {
+	if (config.waitUntil) {
+		try {
+			config.waitUntil(promise);
+			return;
+		} catch (error) {
+			console.warn('waitUntil rejected the background task:', error);
+		}
 	}
 }
 
@@ -186,7 +267,7 @@ export function initialize(config: CollegeDBConfig) {
  *
  * This will also automatically detect and migrate existing databases without requiring
  * additional setup. If shards contain existing data with primary keys, CollegeDB
- * will automatically create the necessary mappings for seamless operation.
+ * will automatically create the necessary mappings so existing rows stay reachable.
  *
  * Compared to `initialize`, this method waits for the background check to finish.
  *
@@ -219,26 +300,19 @@ export function initialize(config: CollegeDBConfig) {
  * ```
  */
 export async function initializeAsync(config: CollegeDBConfig) {
-	globalConfig = config;
-	globalMapper = new KVShardMapper(config.kv, {
-		hashShardMappings: config.hashShardMappings,
-		mappingCacheTtlMs: config.mappingCacheTtlMs,
-		knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
-	});
-	shardSizeCache.clear();
-	generatedInsertRoundRobinIndex = 0;
+	const active = applyConfig(config);
 
 	// Sync KV known shards with configured shards (awaited in async init)
 	try {
-		const mapper = getMapper(config);
+		const mapper = getMapper(active);
 		const existing = await mapper.getKnownShards();
-		const merged = Array.from(new Set([...existing, ...Object.keys(config.shards)]));
+		const merged = Array.from(new Set([...existing, ...Object.keys(active.shards)]));
 		await mapper.setKnownShards(merged);
 	} catch {}
 
-	if (config.shards && Object.keys(config.shards).length > 0 && !config.disableAutoMigration)
+	if (active.shards && Object.keys(active.shards).length > 0 && !active.disableAutoMigration)
 		try {
-			await performAutoMigration(config);
+			await performAutoMigration(active);
 		} catch (error) {
 			console.warn('Auto migration failed:', error);
 		}
@@ -344,6 +418,9 @@ export function resetConfig(): void {
 	shardSizeCache.clear();
 	generatedInsertRoundRobinIndex = 0;
 	ensuredSchemaFingerprints.clear();
+	resetPlacementState();
+	placementDecision = null;
+	setPhaseObserver(null);
 }
 
 /**
@@ -404,13 +481,19 @@ function getConfig(): CollegeDBConfig {
 function getOperationType(sql: string): OperationType {
 	const sql0 = sql.trim().toUpperCase();
 
+	// A statement can open with WITH and still be a write: SQLite and PostgreSQL
+	// both accept `WITH x AS (...) INSERT/UPDATE/DELETE ...`. Treating those as
+	// reads picked the read strategy to allocate a shard for a write.
+	if (sql0.startsWith('WITH')) {
+		return /\b(INSERT|UPDATE|DELETE|REPLACE|MERGE|UPSERT)\b/.test(sql0) ? 'write' : 'read';
+	}
+
 	if (
 		sql0.startsWith('SELECT') ||
 		sql0.startsWith('VALUES') ||
 		sql0.startsWith('TABLE') ||
 		sql0.startsWith('PRAGMA') ||
 		sql0.startsWith('EXPLAIN') ||
-		sql0.startsWith('WITH') ||
 		sql0.startsWith('SHOW')
 	) {
 		return 'read';
@@ -641,33 +724,139 @@ function parseRegion(location: ShardLocation | D1Region): D1Region {
 }
 
 /**
- * Gets the approximate size of a D1 database in bytes using an efficient SQL query.
- * Uses SQLite's page_count and page_size pragmas for accurate size calculation.
+ * Gets the approximate size of a shard's database in bytes.
  *
  * @private
  * @param database - The SQL database instance to measure
  * @returns Promise resolving to the database size in bytes
  * @throws {CollegeDBError} If the size query fails
  */
-async function getDatabaseSize(database: SQLDatabase): Promise<number> {
-	try {
-		// Get page count and page size efficiently
-		const [pageCountResult, pageSizeResult] = await Promise.all([
-			database.prepare('PRAGMA page_count').first<{ page_count: number }>(),
-			database.prepare('PRAGMA page_size').first<{ page_size: number }>()
-		]);
+/**
+ * Sizing statements per backend family, tried in order until one answers.
+ *
+ * Sizing used to be two SQLite pragmas for every backend, which throws on
+ * PostgreSQL and MySQL. `filterShardsBySize` swallowed the rejection through
+ * `Promise.allSettled`, so `maxDatabaseSize` silently did nothing outside
+ * SQLite and D1, and the public sizing helpers threw outright.
+ *
+ * The SQLite entry is a single statement using the pragma table-valued
+ * functions; the two-pragma form follows it for backends that expose `PRAGMA`
+ * as a statement but not as a function.
+ * @private
+ */
+interface SizeQuery {
+	/** Backend family this statement set targets */
+	family: string;
+	/** Statements to run, with the result column each one must produce */
+	steps: Array<{ sql: string; column: string }>;
+}
 
-		if (!pageCountResult?.page_count || !pageSizeResult?.page_size) {
-			throw new CollegeDBError('Failed to retrieve database size information', 'SIZE_QUERY_FAILED');
-		}
-
-		return pageCountResult.page_count * pageSizeResult.page_size;
-	} catch (error) {
-		throw new CollegeDBError(
-			`Failed to get database size: ${error instanceof Error ? error.message : 'Unknown error'}`,
-			'SIZE_QUERY_FAILED'
-		);
+const SIZE_QUERIES: SizeQuery[] = [
+	{
+		family: 'sqlite-pragma',
+		steps: [
+			{ sql: 'PRAGMA page_count', column: 'page_count' },
+			{ sql: 'PRAGMA page_size', column: 'page_size' }
+		]
+	},
+	{
+		family: 'sqlite',
+		steps: [
+			{
+				sql: 'SELECT (SELECT * FROM pragma_page_count()) * (SELECT * FROM pragma_page_size()) AS collegedb_size_bytes',
+				column: 'collegedb_size_bytes'
+			}
+		]
+	},
+	{
+		family: 'postgres',
+		steps: [{ sql: 'SELECT pg_database_size(current_database()) AS collegedb_size_bytes', column: 'collegedb_size_bytes' }]
+	},
+	{
+		family: 'mysql',
+		steps: [
+			{
+				sql: 'SELECT COALESCE(SUM(data_length + index_length), 0) AS collegedb_size_bytes FROM information_schema.tables WHERE table_schema = DATABASE()',
+				column: 'collegedb_size_bytes'
+			}
+		]
 	}
+];
+
+/**
+ * Which sizing statement worked for a given provider, so the probe runs once.
+ * @private
+ */
+const sizeQueryByDatabase = new WeakMap<SQLDatabase, SizeQuery>();
+
+/**
+ * Reads a named numeric column out of a result row.
+ *
+ * The column has to be named rather than positional. Some providers answer a
+ * statement they do not understand with unrelated rows instead of raising, and
+ * accepting the first number in such a row would report a confident wrong size
+ * and silently mis-filter shards under `maxDatabaseSize`.
+ * @private
+ */
+function namedNumeric(row: Record<string, unknown> | null, column: string): number | undefined {
+	if (!row || !(column in row)) {
+		return undefined;
+	}
+
+	const value = row[column];
+	const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+	return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+/**
+ * Runs one candidate sizing statement set and multiplies its results.
+ * @private
+ */
+async function runSizeQuery(database: SQLDatabase, query: SizeQuery): Promise<number | undefined> {
+	let product = 1;
+
+	for (const step of query.steps) {
+		const row = await database.prepare(step.sql).first<Record<string, unknown>>();
+		const value = namedNumeric(row, step.column);
+		if (value === undefined) {
+			return undefined;
+		}
+		product *= value;
+	}
+
+	return product;
+}
+
+async function getDatabaseSize(database: SQLDatabase): Promise<number> {
+	const known = sizeQueryByDatabase.get(database);
+	if (known) {
+		try {
+			const size = await runSizeQuery(database, known);
+			if (size !== undefined) {
+				return size;
+			}
+		} catch {
+			// the provider stopped answering the statement that used to work
+		}
+		sizeQueryByDatabase.delete(database);
+	}
+
+	const failures: string[] = [];
+
+	for (const candidate of SIZE_QUERIES) {
+		try {
+			const size = await runSizeQuery(database, candidate);
+			if (size !== undefined) {
+				sizeQueryByDatabase.set(database, candidate);
+				return size;
+			}
+			failures.push(`${candidate.family}: no ${candidate.steps.map((step) => step.column).join('/')} column`);
+		} catch (error) {
+			failures.push(`${candidate.family}: ${error instanceof Error ? error.message : 'unknown error'}`);
+		}
+	}
+
+	throw new CollegeDBError(`Failed to get database size. Tried ${failures.join('; ')}`, 'SIZE_QUERY_FAILED');
 }
 
 /**
@@ -772,14 +961,7 @@ function selectShardByLocation(
 
 	if (locatedShards.length === 0) {
 		// Fallback to hash if no location info available
-		let hash = 0;
-		for (let i = 0; i < primaryKey.length; i++) {
-			const char = primaryKey.charCodeAt(i);
-			hash = (hash << 5) - hash + char;
-			hash = hash & hash;
-		}
-		const index = Math.abs(hash) % availableShards.length;
-		return availableShards[index]!;
+		return hrwShard(primaryKey, availableShards);
 	}
 
 	// Calculate distances and priorities
@@ -804,14 +986,10 @@ function selectShardByLocation(
 	}
 
 	// Consistent selection among best candidates
-	let hash = 0;
-	for (let i = 0; i < primaryKey.length; i++) {
-		const char = primaryKey.charCodeAt(i);
-		hash = (hash << 5) - hash + char;
-		hash = hash & hash;
-	}
-	const index = Math.abs(hash) % bestShards.length;
-	return bestShards[index]!.shard;
+	return hrwShard(
+		primaryKey,
+		bestShards.map((candidate) => candidate.shard)
+	);
 }
 
 /**
@@ -825,29 +1003,32 @@ function selectShardByStrategy(
 	availableShards: string[],
 	config: CollegeDBConfig
 ): string {
-	switch (effectiveStrategy) {
-		case 'hash': {
-			let hash = 0;
-			for (let i = 0; i < primaryKey.length; i++) {
-				const char = primaryKey.charCodeAt(i);
-				hash = (hash << 5) - hash + char;
-				hash = hash & hash;
+	const started = phaseStart();
+	try {
+		switch (effectiveStrategy) {
+			case 'hash': {
+				return hrwShard(primaryKey, availableShards);
 			}
-			const index = Math.abs(hash) % availableShards.length;
-			return availableShards[index] || availableShards[0]!;
-		}
-		case 'location': {
-			if (!config.targetRegion) {
-				return selectShardByStrategy('hash', primaryKey, availableShards, config);
+			case 'location': {
+				if (!config.targetRegion) {
+					return hrwShard(primaryKey, availableShards);
+				}
+				return selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
 			}
-			return selectShardByLocation(config.targetRegion, availableShards, config.shardLocations || {}, primaryKey);
+			case 'random': {
+				return availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
+			}
+			case 'round-robin': {
+				const shard = availableShards[generatedInsertRoundRobinIndex % availableShards.length]!;
+				generatedInsertRoundRobinIndex = (generatedInsertRoundRobinIndex + 1) % availableShards.length;
+				return shard;
+			}
+			default: {
+				return hrwShard(primaryKey, availableShards);
+			}
 		}
-		case 'random': {
-			return availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
-		}
-		default: {
-			return selectShardByStrategy('hash', primaryKey, availableShards, config);
-		}
+	} finally {
+		phaseEnd('shard.select', started, effectiveStrategy);
 	}
 }
 
@@ -881,6 +1062,112 @@ function selectShardByStrategy(
  * console.log(`User 123 reads from: ${readShard}, writes to: ${writeShard}`);
  * ```
  */
+/**
+ * Decides whether placement is computed or read from KV, once per configuration.
+ *
+ * Computed placement is opt-in through `placement: 'computed'`. It is not the
+ * default because it does not store mappings, and three shipped capabilities
+ * read the keyspace back out of those mappings: `getShardStats` key counts,
+ * `KVShardMapper.getKeysForShard`, and the migration helpers that enumerate
+ * mapped keys. Under computed placement the assignment is implied by the hash
+ * over a keyspace nobody enumerates, so those cannot answer. That is a
+ * capability trade, not a latency one, and it belongs to the caller.
+ *
+ * Only the `hash` strategy can be computed. `round-robin` and `random` are not
+ * functions of the key, and `location` depends on the requesting region rather
+ * than the key, so any of them forces the KV path.
+ *
+ * @private
+ */
+async function resolvePlacement(config: CollegeDBConfig): Promise<{ mode: 'computed' | 'kv'; manifest: PlacementManifest | null }> {
+	if (placementDecision) {
+		return placementDecision;
+	}
+
+	const shards = Object.keys(config.shards);
+	const strategyIsHash = resolveStrategy(config, 'read') === 'hash' && resolveStrategy(config, 'write') === 'hash';
+
+	if (config.placement !== 'computed' || !strategyIsHash || shards.length === 0) {
+		placementDecision = { mode: 'kv', manifest: null };
+		return placementDecision;
+	}
+
+	try {
+		const stored = await loadPlacementManifest(config.kv);
+		const base = stored ?? createManifest(shards, 'hrw');
+		const refreshed = withCurrentTopology(base, shards, 'hrw');
+
+		if (!stored || refreshed !== base) {
+			await savePlacementManifest(config.kv, refreshed);
+		}
+
+		placementDecision = { mode: 'computed', manifest: refreshed };
+		return placementDecision;
+	} catch (error) {
+		if (config.debug) {
+			console.warn('Placement manifest unavailable, falling back to KV mappings:', error);
+		}
+		placementDecision = { mode: 'kv', manifest: null };
+		return placementDecision;
+	}
+}
+
+/**
+ * Every shard a key could be on, in resolution order.
+ *
+ * In computed mode the first entry is where a write goes and where a read looks
+ * first, and any remaining entries are the epoch walk for keys placed under an
+ * earlier topology. In KV mode the list is whatever the mapping says, or empty
+ * when there is no mapping yet.
+ *
+ * @private
+ */
+async function resolveCandidates(primaryKey: string, operationType: OperationType = 'write'): Promise<string[]> {
+	const config = getConfig();
+	const decision = await resolvePlacement(config);
+
+	if (decision.mode !== 'computed' || !decision.manifest) {
+		return [await getShardForKey(primaryKey, operationType)];
+	}
+
+	const mapper = getMapper(config);
+	const hashedKey = await mapper.hashKey(primaryKey);
+	const exceptions = await loadPlacementExceptions(config.kv, decision.manifest.exceptionsVersion);
+
+	if (exceptions.has(hashedKey)) {
+		return [await getShardForKey(primaryKey, operationType)];
+	}
+
+	const candidates = candidateShards(primaryKey, decision.manifest, Object.keys(config.shards));
+	return candidates.length > 0 ? candidates : [await getShardForKey(primaryKey, operationType)];
+}
+
+/**
+ * Records that a key lives somewhere its placement function would not compute,
+ * so later operations resolve it through KV instead of walking epochs.
+ *
+ * @private
+ */
+async function memoizePlacementException(primaryKey: string, shard: string): Promise<void> {
+	const config = getConfig();
+	const decision = await resolvePlacement(config);
+	if (decision.mode !== 'computed' || !decision.manifest) {
+		return;
+	}
+
+	const mapper = getMapper(config);
+
+	try {
+		await mapper.setShardMapping(primaryKey, shard);
+		const updated = await addPlacementException(config.kv, decision.manifest, await mapper.hashKey(primaryKey));
+		placementDecision = { mode: 'computed', manifest: updated };
+	} catch (error) {
+		if (config.debug) {
+			console.warn(`Failed to record placement exception for ${primaryKey}:`, error);
+		}
+	}
+}
+
 async function getShardForKey(primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
 	const config = getConfig();
 	const mapper = getMapper(config);
@@ -906,6 +1193,7 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 
 	// Use coordinator if available for allocation
 	if (config.coordinator) {
+		const started = phaseStart();
 		try {
 			const coordinatorId = config.coordinator.idFromName('default');
 			const coordinator = config.coordinator.get(coordinatorId);
@@ -932,33 +1220,41 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 		} catch (error) {
 			console.warn('Coordinator allocation failed, falling back to local strategy:', error);
 			selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
+		} finally {
+			phaseEnd('coordinator.fetch', started, 'allocate');
 		}
 	} else {
 		selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
 	}
 
-	// Store the mapping
-	await mapper.setShardMapping(primaryKey, selectedShard);
+	// A read that finds no mapping does not need to leave one behind. Recording
+	// it costs a KV write and pins a key that may have no row at all, which is
+	// what a lookup for something that does not exist looks like.
+	if (operationType === 'write' || config.allocateOnRead === true) {
+		await mapper.setShardMapping(primaryKey, selectedShard);
+	}
+
 	return selectedShard;
 }
 
 /**
- * Gets the D1 database instance for a primary key with operation-specific routing
+ * Gets the database instance for a primary key with operation-specific routing
  *
  * Resolves the primary key to its assigned shard and returns the corresponding
- * D1 database instance. This function handles the complete routing process
+ * database instance. This function handles the complete routing process
  * from primary key to database connection, with support for different strategies
  * based on operation type.
  *
  * @private
  * @param primaryKey - The primary key to route
  * @param operationType - The type of operation (read/write) for mixed strategy support
- * @returns Promise resolving to the D1 database instance
+ * @returns Promise resolving to the database instance
  * @throws {Error} If shard routing fails or database instance not found
  */
 async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<SQLDatabase> {
 	const config = getConfig();
-	const shard = await getShardForKey(primaryKey, operationType);
+	const candidates = await resolveCandidates(primaryKey, operationType);
+	const shard = candidates[0]!;
 	const database = config.shards[shard];
 
 	if (!database) {
@@ -969,9 +1265,9 @@ async function getDatabase(primaryKey: string, operationType: OperationType = 'w
 }
 
 /**
- * Creates the database schema in the specified D1 database
+ * Creates the database schema in the specified shard
  *
- * @param d1 - The D1 database instance to create schema in
+ * @param db - The database instance to create schema in
  * @param schema - The SQL schema definition to execute
  * @returns Promise that resolves when schema creation is complete
  * @throws {Error} If schema creation fails
@@ -987,9 +1283,9 @@ async function getDatabase(primaryKey: string, operationType: OperationType = 'w
  * await createSchema(env.DB_NEW_SHARD, userSchema);
  * ```
  */
-export async function createSchema(d1: SQLDatabase, schema: string): Promise<void> {
+export async function createSchema(db: SQLDatabase, schema: string): Promise<void> {
 	const { createSchema: createSchemaImpl } = await import('./migrations');
-	await createSchemaImpl(d1, schema);
+	await createSchemaImpl(db, schema);
 }
 
 /**
@@ -1005,6 +1301,61 @@ export async function prepare(key: string, sql: string): Promise<PreparedStateme
 	const db = await getDatabase(key, operationType);
 	const result = db.prepare(sql);
 	return result;
+}
+
+/**
+ * Runs a read against each shard a key could be on, newest placement first,
+ * and returns the first non-empty answer.
+ *
+ * With one candidate this is a single query, which is the steady state. More
+ * than one only happens after a shard is added or removed, or while a
+ * deployment still holds keys placed by an earlier algorithm: the row is where
+ * an older epoch put it, so it is found there and then recorded as an exception
+ * so the walk never repeats for that key.
+ *
+ * @private
+ */
+async function readAcrossCandidates<T>(
+	key: string,
+	sql: string,
+	bindings: any[],
+	execute: (database: SQLDatabase) => Promise<T>,
+	isEmpty: (value: T) => boolean
+): Promise<T> {
+	const config = getConfig();
+	const candidates = await resolveCandidates(key, getOperationType(sql));
+
+	let firstResult: T | undefined;
+
+	for (let i = 0; i < candidates.length; i++) {
+		const binding = candidates[i]!;
+		const database = config.shards[binding];
+		if (!database) continue;
+
+		const result = await execute(database);
+
+		if (!isEmpty(result)) {
+			if (i > 0) {
+				await memoizePlacementException(key, binding);
+			}
+			return result;
+		}
+
+		if (firstResult === undefined) {
+			firstResult = result;
+		}
+	}
+
+	if (firstResult !== undefined) {
+		return firstResult;
+	}
+
+	const fallback = config.shards[candidates[0] ?? ''];
+	if (!fallback) {
+		throw new CollegeDBError(`Shard ${candidates[0] ?? '<none>'} not found in configuration`, 'SHARD_NOT_FOUND');
+	}
+
+	return await execute(fallback);
 }
 
 /**
@@ -1098,9 +1449,16 @@ export interface InsertResult<T = Record<string, unknown>> extends QueryResult<T
 	generatedId: number | string;
 }
 
-function extractGeneratedId<T = Record<string, unknown>>(result: QueryResult<T>): number | string | undefined {
+function extractGeneratedId<T = Record<string, unknown>>(result: QueryResult<T>, idColumn?: string): number | string | undefined {
 	const firstRow = result.results[0] as Record<string, unknown> | undefined;
 	if (firstRow && typeof firstRow === 'object') {
+		// An explicitly named column wins outright, and its absence is an error
+		// rather than a reason to start guessing.
+		if (idColumn) {
+			const value = firstRow[idColumn];
+			return value === undefined || value === null ? undefined : (value as number | string);
+		}
+
 		// Prefer explicit RETURNING rows over provider metadata when available.
 		for (const key of ['id', 'ID', 'Id', 'rowid', 'ROWID', 'RowId', 'last_row_id', 'lastInsertId', 'insertId']) {
 			const value = firstRow[key];
@@ -1116,11 +1474,13 @@ function extractGeneratedId<T = Record<string, unknown>>(result: QueryResult<T>)
 			}
 		}
 
-		for (const value of Object.values(firstRow)) {
-			if (typeof value === 'number' || typeof value === 'string') {
-				return value;
-			}
-		}
+		// Deliberately no "first scalar column" fallback, and deliberately no
+		// fall-through to `meta.last_row_id` either. The statement returned a row
+		// and none of its columns is an id, so the caller named columns that do
+		// not include the primary key. `last_row_id` there is the backend's
+		// internal rowid, which for a TEXT primary key is a different value than
+		// the key, and routing on it puts the row somewhere no reader looks.
+		return undefined;
 	}
 
 	const metaId = result.meta.last_row_id;
@@ -1178,19 +1538,14 @@ async function allocateInsertShard(): Promise<string> {
 		}
 	}
 
-	if (effectiveStrategy === 'round-robin') {
-		const shard = eligibleShards[generatedInsertRoundRobinIndex % eligibleShards.length]!;
-		generatedInsertRoundRobinIndex = (generatedInsertRoundRobinIndex + 1) % eligibleShards.length;
-		return shard;
-	}
-
 	return selectShardByStrategy(effectiveStrategy, allocatorKey, eligibleShards, config);
 }
 
 async function executeInsertOnShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
-	bindings: any[] = []
+	bindings: any[] = [],
+	options: IdColumnOptions = {}
 ): Promise<InsertResult<T>> {
 	const config = getConfig();
 	if (!config.shards[shardBinding]) {
@@ -1199,14 +1554,36 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 
 	const returning = /\breturning\b/i.test(sql);
 	const result = returning ? await allShard<T>(shardBinding, sql, bindings) : await runShard<T>(shardBinding, sql, bindings);
-	const generatedId = extractGeneratedId(result);
+	const generatedId = extractGeneratedId(result, options.idColumn);
 
 	if (generatedId === undefined) {
-		throw new CollegeDBError('Insert did not return a generated primary key', 'GENERATED_KEY_UNAVAILABLE');
+		throw new CollegeDBError(
+			options.idColumn
+				? `Insert did not return a value for the id column "${options.idColumn}"`
+				: 'Insert did not return a generated primary key. Pass { idColumn } when the primary key is not named id or rowid.',
+			'GENERATED_KEY_UNAVAILABLE'
+		);
 	}
 
 	const mapper = getMapper(config);
-	await mapper.setShardMapping(String(generatedId), shardBinding);
+	const idKey = String(generatedId);
+
+	// Each shard mints its own sequence, so two shards both hand out 1, then 2,
+	// and so on. Storing the second mapping would overwrite the first and leave
+	// the earlier row on a shard nothing routes to. Refusing here turns silent
+	// unreachability into an error at the point the collision happens.
+	const existing = await mapper.getShardMapping(idKey);
+	if (existing && existing.shard !== shardBinding) {
+		throw new CollegeDBError(
+			`Generated id ${idKey} is already mapped to shard ${existing.shard}, but this insert ran on ${shardBinding}. ` +
+				'Per-shard AUTOINCREMENT and SERIAL sequences repeat across shards, so a database-generated id is not unique ' +
+				'cluster-wide. Use nextId() to allocate a cluster-unique id and pass it explicitly, or confine the table to one ' +
+				'shard with insertShard().',
+			'GENERATED_KEY_COLLISION'
+		);
+	}
+
+	await mapper.setShardMapping(idKey, shardBinding);
 
 	return {
 		...result,
@@ -1220,6 +1597,15 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
  * This is the default helper for generated-key tables. CollegeDB picks a shard
  * using the configured allocation strategy, then stores the generated primary
  * key -> shard mapping so routed reads can find the row later.
+ *
+ * **A database-generated id is only unique within its own shard.** Every shard
+ * runs its own `AUTOINCREMENT` or `SERIAL` sequence, so spreading a
+ * generated-key table across shards eventually mints the same id twice. When
+ * that happens this throws `GENERATED_KEY_COLLISION` rather than overwriting the
+ * first mapping and stranding its row. For a generated-key table that spans
+ * shards, allocate the id with {@link nextId} and pass it explicitly; to keep
+ * using the database's own sequence, confine the table to one shard with
+ * {@link insertShard}.
  *
  * @template T - Type of returned rows when the insert uses `RETURNING`
  * @param sql - The INSERT statement to execute
@@ -1237,9 +1623,13 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
  * const row = await first(String(created.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [created.generatedId]);
  * ```
  */
-export async function insert<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<InsertResult<T>> {
+export async function insert<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: IdColumnOptions = {}
+): Promise<InsertResult<T>> {
 	const shardBinding = await allocateInsertShard();
-	return await executeInsertOnShard<T>(shardBinding, sql, bindings);
+	return await executeInsertOnShard<T>(shardBinding, sql, bindings, options);
 }
 
 /**
@@ -1276,9 +1666,10 @@ export async function insert<T = Record<string, unknown>>(sql: string, bindings:
 export async function insertShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
-	bindings: any[] = []
+	bindings: any[] = [],
+	options: IdColumnOptions = {}
 ): Promise<InsertResult<T>> {
-	return await executeInsertOnShard<T>(shardBinding, sql, bindings);
+	return await executeInsertOnShard<T>(shardBinding, sql, bindings, options);
 }
 
 /**
@@ -1313,8 +1704,17 @@ export async function insertShard<T = Record<string, unknown>>(
  * ```
  */
 export async function all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
-	const prepared = await prepare(key, sql);
-	const result = await prepared.bind(...bindings).all<T>();
+	const result = await readAcrossCandidates<QueryResult<T>>(
+		key,
+		sql,
+		bindings,
+		(database) =>
+			database
+				.prepare(sql)
+				.bind(...bindings)
+				.all<T>(),
+		(value) => value.success && value.results.length === 0
+	);
 
 	if (!result.success) {
 		throw new CollegeDBError(`Query failed: ${result.error || 'Unknown error'}`, 'QUERY_FAILED');
@@ -1355,9 +1755,17 @@ export async function all<T = Record<string, unknown>>(key: string, sql: string,
  * }
  */
 export async function first<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<T | null> {
-	const prepared = await prepare(key, sql);
-	const result = await prepared.bind(...bindings).first<T>();
-	return result;
+	return await readAcrossCandidates<T | null>(
+		key,
+		sql,
+		bindings,
+		(database) =>
+			database
+				.prepare(sql)
+				.bind(...bindings)
+				.first<T>(),
+		(value) => value === null
+	);
 }
 
 /**
@@ -1484,15 +1892,23 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 
 	const mapper = getMapper(config);
 	const currentMapping = await mapper.getShardMapping(primaryKey);
+	const decision = await resolvePlacement(config);
 
-	if (!currentMapping) {
+	// Under computed placement there is no stored mapping to read, so the current
+	// shard comes from the placement function instead of being an error.
+	let currentShard = currentMapping?.shard;
+	if (!currentShard && decision.mode === 'computed' && decision.manifest) {
+		currentShard = candidateShards(primaryKey, decision.manifest, Object.keys(config.shards))[0];
+	}
+
+	if (!currentShard) {
 		throw new CollegeDBError(`No existing mapping found for primary key: ${primaryKey}`, 'MAPPING_NOT_FOUND');
 	}
 
 	// Migrate data if different shard
-	if (currentMapping.shard !== newBinding) {
+	if (currentShard !== newBinding) {
 		const { migrateRecord } = await import('./migrations');
-		const sourceDb = config.shards[currentMapping.shard];
+		const sourceDb = config.shards[currentShard];
 		const targetDb = config.shards[newBinding];
 
 		if (!sourceDb || !targetDb) {
@@ -1502,8 +1918,55 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 		await migrateRecord(sourceDb, targetDb, primaryKey, tableName);
 	}
 
-	// Update mapping
-	await mapper.updateShardMapping(primaryKey, newBinding);
+	// Update mapping. A key moved off the shard its placement function computes
+	// has to be recorded as an exception, or the next read would look at the
+	// computed shard and find nothing there.
+	if (currentMapping) {
+		await mapper.updateShardMapping(primaryKey, newBinding);
+	} else {
+		await mapper.setShardMapping(primaryKey, newBinding);
+	}
+
+	if (decision.mode === 'computed' && decision.manifest) {
+		placementDecision = {
+			mode: 'computed',
+			manifest: await addPlacementException(config.kv, decision.manifest, await mapper.hashKey(primaryKey))
+		};
+	}
+
+	// Drop any coordinator-recorded allocation so a later first touch of this key
+	// is not handed the shard it has just been moved off.
+	await forgetCoordinatorAllocation(config, primaryKey);
+
+	mapper.invalidateCachedMapping(primaryKey);
+}
+
+/**
+ * Asks the coordinator to forget a recorded allocation, ignoring failures.
+ *
+ * Best effort on purpose: the KV mapping is authoritative, so a coordinator
+ * that is unreachable must not fail a reassignment.
+ *
+ * @private
+ */
+async function forgetCoordinatorAllocation(config: CollegeDBConfig, primaryKey: string): Promise<void> {
+	if (!config.coordinator) {
+		return;
+	}
+
+	try {
+		const coordinatorId = config.coordinator.idFromName('default');
+		const coordinator = config.coordinator.get(coordinatorId);
+		await coordinator.fetch('http://coordinator/forget', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ primaryKey })
+		});
+	} catch (error) {
+		if (config.debug) {
+			console.warn(`Coordinator did not forget the allocation for ${primaryKey}:`, error);
+		}
+	}
 }
 
 /**
@@ -1999,6 +2462,59 @@ function mergeAllShardQueryResults<T = Record<string, unknown>>(shardResults: Qu
  * @returns Promise resolving to one globally-processed query result
  * @since 1.1.4
  */
+/**
+ * Bounds each shard's result set when the global page can be satisfied from the
+ * top `offset + limit` rows of every shard.
+ *
+ * Without this, a global page pulls every matching row from every shard into
+ * one isolate and then throws almost all of them away, which on Workers runs
+ * into the 128 MB isolate ceiling long before the query is slow. With it, each
+ * shard returns at most as many rows as the page could possibly need.
+ *
+ * Deliberately conservative. The rewrite only applies when the caller sorts by
+ * a column name that SQL can order by, is not filtering in JavaScript, is not
+ * asking for a total, and the statement carries no `LIMIT`, `OFFSET`, or set
+ * operator of its own. Anything else keeps the original statement, because a
+ * JavaScript `filter` or `comparator` can promote a row this rewrite would have
+ * discarded, and `includeTotal` has to count rows the page does not contain.
+ *
+ * @private
+ */
+function pushDownGlobalLimit<T>(sql: string, options: GlobalAllShardsOptions<T>, offset: number, limit: number | undefined): string {
+	if (limit === undefined || options.filter || options.comparator || options.includeTotal) {
+		return sql;
+	}
+
+	if (typeof options.sortBy !== 'string' && options.sortBy !== undefined) {
+		return sql;
+	}
+
+	const upper = sql.toUpperCase();
+	if (/\bLIMIT\b|\bOFFSET\b|\bUNION\b|\bINTERSECT\b|\bEXCEPT\b/.test(upper)) {
+		return sql;
+	}
+
+	if (!upper.trimStart().startsWith('SELECT')) {
+		return sql;
+	}
+
+	// Each shard only has to surrender enough rows to fill the page, since the
+	// merge takes the globally best `offset + limit` and no shard can contribute
+	// more than that.
+	const perShard = offset + limit;
+	const trimmed = sql.replace(/;\s*$/, '');
+
+	if (typeof options.sortBy === 'string') {
+		const direction = options.sortDirection === 'desc' ? 'DESC' : 'ASC';
+		const alreadyOrdered = /\bORDER\s+BY\b/.test(upper);
+		if (!alreadyOrdered) {
+			return `${trimmed} ORDER BY ${quoteIdentifier(options.sortBy)} ${direction} LIMIT ${perShard}`;
+		}
+	}
+
+	return `${trimmed} LIMIT ${perShard}`;
+}
+
 export async function allAllShardsGlobal<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
@@ -2008,7 +2524,8 @@ export async function allAllShardsGlobal<T = Record<string, unknown>>(
 	const offset = normalizeOffset(options.offset);
 	const limit = normalizeLimit(options.limit);
 
-	const merged = mergeAllShardQueryResults(await allAllShards<T>(sql, bindings, batchSize));
+	const effectiveSql = pushDownGlobalLimit(sql, options, offset, limit);
+	const merged = mergeAllShardQueryResults(await allAllShards<T>(effectiveSql, bindings, batchSize));
 	let rows = merged.results;
 
 	if (options.filter) {
@@ -2159,7 +2676,7 @@ export async function flush(): Promise<void> {
 }
 
 /**
- * Gets the size of a specific D1 database in bytes.
+ * Gets the size of a specific shard's database in bytes.
  * Uses efficient SQLite pragma queries to determine database size.
  *
  * @param shardBinding - The shard binding name to check the size of
@@ -2645,6 +3162,255 @@ export async function firstResilient<T = Record<string, unknown>>(key: string, s
 }
 
 /**
+ * Executes a statement, taking the routing key from the statement itself.
+ *
+ * This is {@link run} without the duplicated key argument. The planner reads
+ * the primary key out of the statement, so
+ * `query('INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada'])`
+ * routes exactly as `run('user-1', ...)` would.
+ *
+ * Recognized shapes are `INSERT INTO t (cols) VALUES (...)` including multi-row
+ * inserts, and `UPDATE`/`DELETE`/`SELECT` whose entire `WHERE` clause is
+ * `key = ?` or `key IN (?, ?, ...)`. The key column comes from `keyColumns` in
+ * the configuration and defaults to `id`.
+ *
+ * A statement whose key cannot be proven is not guessed at. By default it
+ * throws and names the explicit-key alternative; set `onUnroutable: 'fanout'`
+ * to run it on every shard instead.
+ *
+ * A statement that resolves to several keys is grouped by shard and executed
+ * with one round trip per shard, so `WHERE id IN (...)` spanning three shards is
+ * three statements rather than one per id.
+ *
+ * @template T - Type of the result records
+ * @param sql - Statement text using `?` placeholders
+ * @param bindings - Positional bindings for the statement
+ * @returns The result, merged across shards when the statement routes to several
+ * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * await query('INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+ * await query('UPDATE users SET name = ? WHERE id = ?', ['Ada L.', 'user-1']);
+ * await query('DELETE FROM users WHERE id IN (?, ?)', ['user-1', 'user-2']);
+ * ```
+ */
+export async function query<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	const config = getConfig();
+	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
+
+	if (!plan) {
+		if ((config.onUnroutable ?? 'throw') === 'throw') {
+			throw unroutableError(sql);
+		}
+		return mergeAllShardQueryResults(await allAllShards<T>(sql, bindings));
+	}
+
+	if (plan.keys.length === 1) {
+		return plan.readOnly ? await all<T>(plan.keys[0]!, sql, bindings) : await run<T>(plan.keys[0]!, sql, bindings);
+	}
+
+	const grouped = await batch<T>(plan.keys.map((key) => ({ key, sql, bindings })));
+	return mergeAllShardQueryResults(grouped.flatMap((group) => group.results));
+}
+
+/**
+ * Reads the first matching row, taking the routing key from the statement.
+ *
+ * @template T - Type of the result record
+ * @param sql - Statement text using `?` placeholders
+ * @param bindings - Positional bindings for the statement
+ * @returns The first matching row, or `null`
+ * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const user = await queryFirst<User>('SELECT * FROM users WHERE id = ?', ['user-1']);
+ * ```
+ */
+export async function queryFirst<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<T | null> {
+	const config = getConfig();
+	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
+
+	if (!plan) {
+		if ((config.onUnroutable ?? 'throw') === 'throw') {
+			throw unroutableError(sql);
+		}
+		const rows = await firstAllShards<T>(sql, bindings);
+		return rows.find((row): row is T => row !== null) ?? null;
+	}
+
+	if (plan.keys.length === 1) {
+		return await first<T>(plan.keys[0]!, sql, bindings);
+	}
+
+	for (const key of plan.keys) {
+		const row = await first<T>(key, sql, bindings);
+		if (row !== null) {
+			return row;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Reads every matching row, taking the routing key from the statement.
+ *
+ * @template T - Type of the result records
+ * @param sql - Statement text using `?` placeholders
+ * @param bindings - Positional bindings for the statement
+ * @returns Rows from every shard the statement routes to
+ * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const { results } = await queryAll<User>('SELECT * FROM users WHERE id IN (?, ?)', ['user-1', 'user-2']);
+ * ```
+ */
+export async function queryAll<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	const config = getConfig();
+	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
+
+	if (!plan) {
+		if ((config.onUnroutable ?? 'throw') === 'throw') {
+			throw unroutableError(sql);
+		}
+		return mergeAllShardQueryResults(await allAllShards<T>(sql, bindings));
+	}
+
+	if (plan.keys.length === 1) {
+		return await all<T>(plan.keys[0]!, sql, bindings);
+	}
+
+	const perKey = await Promise.all(plan.keys.map((key) => all<T>(key, sql, bindings)));
+	return mergeAllShardQueryResults(perKey);
+}
+
+/**
+ * One routed statement in a {@link batch}.
+ * @since 1.4.0
+ */
+export interface BatchEntry {
+	/** Primary key used to choose the shard */
+	key: string;
+	/** SQL text using `?` placeholders */
+	sql: string;
+	/** Positional bindings for the statement */
+	bindings?: any[];
+}
+
+/**
+ * Result of a routed {@link batch}, grouped by the shard that ran it.
+ *
+ * There is no combined success flag on purpose: a batch spanning three shards is
+ * three independent transactions, so "did it work" is a per-shard question.
+ * @since 1.4.0
+ */
+export interface BatchShardResult<T = Record<string, unknown>> {
+	/** Shard the statements ran against */
+	shard: string;
+	/** Indices into the original `entries` array, in execution order */
+	indices: number[];
+	/** Result per statement, in the same order as `indices` */
+	results: QueryResult<T>[];
+	/** Set when the whole group failed before producing per-statement results */
+	error?: string;
+}
+
+/**
+ * Executes many routed statements with one round trip per shard.
+ *
+ * Every statement is resolved to a shard, grouped with the others that landed on
+ * the same shard, and the groups are executed concurrently. A shard whose
+ * provider implements {@link SQLDatabase.runBatch} runs its group in a single
+ * call; the rest fall back to sequential statements, which is what a loop of
+ * {@link run} did before.
+ *
+ * On D1 this is the difference between one HTTP round trip per statement and one
+ * per shard, and Cloudflare caps a Worker invocation at 1000 D1 queries on the
+ * paid plan and 50 on the free plan, so a few hundred single-row writes is not
+ * merely slow there but impossible.
+ *
+ * **There is no cross-shard atomicity.** Statements sharing a shard share that
+ * shard's transaction and execute in submission order. Statements on different
+ * shards do not, so a batch can leave one shard updated and another not. When
+ * that matters, key the whole unit of work to one shard.
+ *
+ * @template T - Type of returned rows
+ * @param entries - Routed statements to execute
+ * @returns One entry per shard that ran statements
+ * @throws {CollegeDBError} If CollegeDB is not initialized
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const results = await batch([
+ * 	{ key: 'user-1', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['user-1', 'Ada'] },
+ * 	{ key: 'user-2', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['user-2', 'Grace'] }
+ * ]);
+ *
+ * for (const group of results) {
+ * 	console.log(`${group.shard} ran ${group.results.length} statements`);
+ * }
+ * ```
+ */
+export async function batch<T = Record<string, unknown>>(entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
+	const config = getConfig();
+
+	if (entries.length === 0) {
+		return [];
+	}
+
+	const groups = new Map<string, number[]>();
+
+	// Resolution is per key and independent, so it runs concurrently rather than
+	// serially in front of the statements it is routing.
+	const shards = await Promise.all(entries.map((entry) => getShardForKey(entry.key, getOperationType(entry.sql))));
+
+	shards.forEach((shard, index) => {
+		const existing = groups.get(shard);
+		if (existing) {
+			existing.push(index);
+		} else {
+			groups.set(shard, [index]);
+		}
+	});
+
+	return await Promise.all(
+		[...groups.entries()].map(async ([shard, indices]): Promise<BatchShardResult<T>> => {
+			const database = config.shards[shard];
+			if (!database) {
+				return { shard, indices, results: [], error: `Shard ${shard} not found in configuration` };
+			}
+
+			const statements = indices.map((index) => {
+				const entry = entries[index]!;
+				return { sql: entry.sql, bindings: entry.bindings ?? [] };
+			});
+
+			try {
+				if (database.runBatch) {
+					return { shard, indices, results: await database.runBatch<T>(statements) };
+				}
+
+				const results: QueryResult<T>[] = [];
+				for (const statement of statements) {
+					results.push(
+						await database
+							.prepare(statement.sql)
+							.bind(...statement.bindings)
+							.run<T>()
+					);
+				}
+				return { shard, indices, results };
+			} catch (error) {
+				return { shard, indices, results: [], error: error instanceof Error ? error.message : String(error) };
+			}
+		})
+	);
+}
+
+/**
  * Options for {@link paginate}.
  * @since 1.2.4
  */
@@ -2723,6 +3489,90 @@ export async function paginate<T = Record<string, unknown>>(
 }
 
 /**
+ * Outcome of a {@link rebalance} pass.
+ * @since 1.4.0
+ */
+export interface RebalanceResult {
+	/** Keys examined */
+	examined: number;
+	/** Keys whose stored shard already matched their computed shard */
+	agreed: number;
+	/** Keys moved onto their computed shard */
+	moved: number;
+	/** Keys that could not be moved, with the reason */
+	failed: Array<{ key: string; error: string }>;
+}
+
+/**
+ * Moves stored mappings onto the shard the placement function computes.
+ *
+ * This is the migration for a deployment whose keys were placed before 1.4.0.
+ * Once it reports `moved: 0` with no failures, the stored mappings agree with
+ * the placement function and `placement: 'computed'` can drop the KV read
+ * without changing where any key resolves.
+ *
+ * It is also the measurement that decides whether computed placement is worth
+ * enabling: a keyspace that still disagrees after a pass is a keyspace whose
+ * exceptions are the mapping.
+ *
+ * @param table - Table whose rows move with their mapping
+ * @param options - Concurrency and a dry-run switch
+ * @returns Counts of agreed, moved, and failed keys
+ * @throws {CollegeDBError} If CollegeDB is not initialized
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const result = await rebalance('users', { dryRun: true });
+ * console.log(`${result.agreed}/${result.examined} keys already agree`);
+ * ```
+ */
+export async function rebalance(table: string, options: { concurrency?: number; dryRun?: boolean } = {}): Promise<RebalanceResult> {
+	const config = getConfig();
+	const mapper = getMapper(config);
+	const shards = Object.keys(config.shards);
+
+	if (shards.length === 0) {
+		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
+	}
+
+	const counts = await mapper.getShardKeyCounts();
+	const keysByShard = await Promise.all(Object.keys(counts).map(async (shard) => await mapper.getKeysForShard(shard)));
+	const keys = keysByShard.flat();
+
+	const result: RebalanceResult = { examined: keys.length, agreed: 0, moved: 0, failed: [] };
+	const concurrency = Math.max(1, options.concurrency ?? config.migrationConcurrency ?? 25);
+
+	let cursor = 0;
+	const workers = new Array(Math.min(concurrency, keys.length || 1)).fill(null).map(async () => {
+		while (cursor < keys.length) {
+			const key = keys[cursor++];
+			if (key === undefined) continue;
+
+			try {
+				const mapping = await mapper.getShardMapping(key);
+				const target = hrwShard(key, shards);
+
+				if (!mapping || mapping.shard === target) {
+					result.agreed++;
+					continue;
+				}
+
+				if (!options.dryRun) {
+					await reassignShard(key, target, table);
+				}
+				result.moved++;
+			} catch (error) {
+				result.failed.push({ key, error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+	});
+
+	await Promise.all(workers);
+
+	return result;
+}
+
+/**
  * Options for {@link nextId}.
  * @since 1.2.4
  */
@@ -2782,31 +3632,79 @@ async function maxColumnAcrossShards(table: string, column: string): Promise<num
 export async function nextId(table: string, options: NextIdOptions = {}): Promise<number> {
 	const config = getConfig();
 	const column = options.column ?? 'id';
-	const base = await maxColumnAcrossShards(table, column);
-	const floor = Math.max(base + 1, Math.floor(options.min ?? 0));
+	const min = Math.floor(options.min ?? 0);
 
 	if (config.coordinator) {
-		try {
-			const coordinatorId = config.coordinator.idFromName('default');
-			const coordinator = config.coordinator.get(coordinatorId);
-			const response = await coordinator.fetch('http://coordinator/sequence', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name: table, min: floor })
-			});
+		// Ask the sequence first. Once it is seeded it is already ahead of every
+		// row in every shard, so computing the cross-shard MAX to seed it again
+		// would spend one query per shard on every id.
+		const seeded = await requestSequence(config, table, min, false);
+		if (seeded !== undefined) {
+			return seeded;
+		}
 
-			if (response.ok) {
-				const result = (await response.json()) as { value: number };
-				if (typeof result.value === 'number' && Number.isFinite(result.value)) {
-					return result.value;
-				}
+		try {
+			const base = await maxColumnAcrossShards(table, column);
+			const floor = Math.max(base + 1, min);
+			const value = await requestSequence(config, table, floor, true);
+			if (value !== undefined) {
+				return value;
 			}
+			return floor;
 		} catch (error) {
 			console.warn('Coordinator sequence allocation failed, falling back to cross-shard MAX:', error);
 		}
 	}
 
-	return floor;
+	const base = await maxColumnAcrossShards(table, column);
+	return Math.max(base + 1, min);
+}
+
+/**
+ * Requests the next value of a coordinator sequence.
+ *
+ * `seed` distinguishes the two calls this makes. The first asks for a value
+ * without a floor and is answered only if the sequence already exists, which is
+ * the steady state and costs no shard queries. If it does not exist the
+ * coordinator says so, and the second call supplies the cross-shard maximum as
+ * the floor.
+ *
+ * @private
+ * @returns The allocated value, or `undefined` when the sequence needs seeding
+ */
+async function requestSequence(config: CollegeDBConfig, table: string, min: number, seed: boolean): Promise<number | undefined> {
+	if (!config.coordinator) {
+		return undefined;
+	}
+
+	const started = phaseStart();
+	try {
+		const coordinatorId = config.coordinator.idFromName('default');
+		const coordinator = config.coordinator.get(coordinatorId);
+		const response = await coordinator.fetch('http://coordinator/sequence', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(seed ? { name: table, min } : { name: table, requireExisting: true })
+		});
+
+		if (!response.ok) {
+			return undefined;
+		}
+
+		const result = (await response.json()) as { value?: number; needsSeed?: boolean };
+		if (result.needsSeed) {
+			return undefined;
+		}
+
+		return typeof result.value === 'number' && Number.isFinite(result.value) ? result.value : undefined;
+	} catch (error) {
+		if (config.debug) {
+			console.warn('Coordinator sequence request failed:', error);
+		}
+		return undefined;
+	} finally {
+		phaseEnd('coordinator.fetch', started, 'sequence');
+	}
 }
 
 /**
