@@ -21,6 +21,7 @@
  */
 
 import { CollegeDBError } from './errors';
+import type { SQLDialect } from './types';
 
 /**
  * A built statement: the parameterized SQL text and its positional bindings.
@@ -42,6 +43,8 @@ export type ColumnValues = Record<string, unknown>;
  * Options accepted by {@link buildInsert}.
  */
 export interface BuildInsertOptions {
+	/** Dialect of the target shard, used to quote identifiers @since 1.4.0 */
+	dialect?: SQLDialect;
 	/** Emit `INSERT OR REPLACE` (SQLite) instead of a plain `INSERT` */
 	orReplace?: boolean;
 	/** Emit `INSERT OR IGNORE` (SQLite) instead of a plain `INSERT` */
@@ -54,6 +57,8 @@ export interface BuildInsertOptions {
  * Options accepted by {@link buildUpsert}.
  */
 export interface BuildUpsertOptions {
+	/** Dialect of the target shard, used to quote identifiers @since 1.4.0 */
+	dialect?: SQLDialect;
 	/**
 	 * Columns to overwrite on conflict. Defaults to every inserted column that
 	 * is not part of `conflictColumns`.
@@ -66,16 +71,68 @@ export interface BuildUpsertOptions {
 const SQL_IDENTIFIER_PART_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Validates and double-quotes a SQL identifier (optionally schema-qualified).
- * Rejects anything that is not a bare identifier so object keys and table
- * names can never smuggle SQL into the generated statement.
+ * Memoized {@link quoteIdentifier} results, keyed by identifier and dialect.
+ *
+ * Every generated statement quotes at least a table name, and the cross-shard
+ * helpers quote the same one once per shard on every call. The set of table and
+ * column names an application uses is small and fixed, so this converts the
+ * validation and the string building into a map lookup after first use.
+ * @private
+ */
+const quotedIdentifiers = new Map<string, string>();
+
+/** Bound on the quote cache, since a caller can pass generated names. @private */
+const QUOTE_CACHE_LIMIT = 1000;
+
+/**
+ * Validates and quotes a SQL identifier (optionally schema-qualified).
+ *
+ * Rejects anything that is not a bare identifier, so object keys and table names
+ * can never smuggle SQL into the generated statement. The quote character
+ * follows `dialect`: backticks for MySQL and MariaDB, which reject ANSI double
+ * quotes unless `ANSI_QUOTES` is set, and double quotes everywhere else.
  *
  * @param identifier - Table or column name (may be `schema.name`)
- * @returns The double-quoted identifier
+ * @param dialect - Dialect of the target shard; omitted means ANSI double quotes
+ * @returns The quoted identifier
  * @throws {CollegeDBError} If the identifier is empty or not a bare SQL identifier
  * @since 1.2.4
  */
-export function quoteIdentifier(identifier: string): string {
+export function quoteIdentifier(identifier: string, dialect?: SQLDialect): string {
+	const cacheKey = dialect === undefined ? identifier : `${identifier}:${dialect}`;
+	const cached = quotedIdentifiers.get(cacheKey);
+	if (cached !== undefined) {
+		return cached;
+	}
+
+	const quote = dialect === 'mysql' ? '`' : '"';
+	const quoted = validateIdentifier(identifier)
+		.map((part) => `${quote}${part}${quote}`)
+		.join('.');
+
+	// An invalid identifier throws above and is never cached, so a rejection
+	// stays a rejection on every later call.
+	if (quotedIdentifiers.size >= QUOTE_CACHE_LIMIT) {
+		quotedIdentifiers.clear();
+	}
+	quotedIdentifiers.set(cacheKey, quoted);
+
+	return quoted;
+}
+
+/**
+ * Validates a SQL identifier and returns its parts unquoted.
+ *
+ * The validation is what makes an object key safe to interpolate: anything that
+ * is not a bare identifier is rejected outright, so no quoting style can be
+ * escaped. Use this where a bare name is required, such as a `COLLATE` clause.
+ *
+ * @param identifier - Table or column name (may be `schema.name`)
+ * @returns The validated identifier parts
+ * @throws {CollegeDBError} If the identifier is empty or not a bare SQL identifier
+ * @since 1.4.0
+ */
+export function validateIdentifier(identifier: string): string[] {
 	const trimmed = identifier.trim();
 	if (!trimmed) {
 		throw new CollegeDBError('Identifier cannot be empty', 'INVALID_IDENTIFIER');
@@ -86,7 +143,7 @@ export function quoteIdentifier(identifier: string): string {
 		throw new CollegeDBError(`Invalid SQL identifier: ${identifier}`, 'INVALID_IDENTIFIER');
 	}
 
-	return parts.map((part) => `"${part}"`).join('.');
+	return parts;
 }
 
 /**
@@ -103,7 +160,7 @@ function definedEntries(values: ColumnValues): Array<[string, unknown]> {
  * `returning` option. Returns an empty string when returning is falsy.
  * @private
  */
-function buildReturningClause(returning: boolean | string | string[] | undefined): string {
+function buildReturningClause(returning: boolean | string | string[] | undefined, dialect?: SQLDialect): string {
 	if (!returning) {
 		return '';
 	}
@@ -112,7 +169,7 @@ function buildReturningClause(returning: boolean | string | string[] | undefined
 		return ' RETURNING *';
 	}
 
-	const columns = (Array.isArray(returning) ? returning : [returning]).map((column) => quoteIdentifier(column));
+	const columns = (Array.isArray(returning) ? returning : [returning]).map((column) => quoteIdentifier(column, dialect));
 	return ` RETURNING ${columns.join(', ')}`;
 }
 
@@ -128,7 +185,7 @@ function buildReturningClause(returning: boolean | string | string[] | undefined
  * @throws {CollegeDBError} If `where` has no usable conditions
  * @private
  */
-function buildWhereClause(where: ColumnValues): BuiltQuery {
+function buildWhereClause(where: ColumnValues, dialect?: SQLDialect): BuiltQuery {
 	const entries = definedEntries(where);
 	if (entries.length === 0) {
 		throw new CollegeDBError('A WHERE condition is required', 'EMPTY_WHERE');
@@ -136,7 +193,7 @@ function buildWhereClause(where: ColumnValues): BuiltQuery {
 
 	const bindings: any[] = [];
 	const clauses = entries.map(([column, value]) => {
-		const quoted = quoteIdentifier(column);
+		const quoted = quoteIdentifier(column, dialect);
 		if (value === null) {
 			return `${quoted} IS NULL`;
 		}
@@ -172,13 +229,13 @@ export function buildInsert(table: string, values: ColumnValues, options: BuildI
 		throw new CollegeDBError('At least one column value is required for INSERT', 'EMPTY_INSERT');
 	}
 
-	const quotedTable = quoteIdentifier(table);
-	const columns = entries.map(([column]) => quoteIdentifier(column));
+	const quotedTable = quoteIdentifier(table, options.dialect);
+	const columns = entries.map(([column]) => quoteIdentifier(column, options.dialect));
 	const placeholders = entries.map(() => '?');
 	const bindings = entries.map(([, value]) => value);
 
 	const prefix = options.orReplace ? 'INSERT OR REPLACE' : options.orIgnore ? 'INSERT OR IGNORE' : 'INSERT';
-	const returning = buildReturningClause(options.returning);
+	const returning = buildReturningClause(options.returning, options.dialect);
 
 	return {
 		sql: `${prefix} INTO ${quotedTable} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})${returning}`,
@@ -210,18 +267,18 @@ export function buildUpdate(
 	table: string,
 	values: ColumnValues,
 	where: ColumnValues,
-	options: { returning?: boolean | string | string[] } = {}
+	options: { returning?: boolean | string | string[]; dialect?: SQLDialect } = {}
 ): BuiltQuery {
 	const entries = definedEntries(values);
 	if (entries.length === 0) {
 		throw new CollegeDBError('At least one column value is required for UPDATE', 'EMPTY_UPDATE');
 	}
 
-	const quotedTable = quoteIdentifier(table);
-	const setClauses = entries.map(([column]) => `${quoteIdentifier(column)} = ?`);
+	const quotedTable = quoteIdentifier(table, options.dialect);
+	const setClauses = entries.map(([column]) => `${quoteIdentifier(column, options.dialect)} = ?`);
 	const setBindings = entries.map(([, value]) => value);
-	const whereClause = buildWhereClause(where);
-	const returning = buildReturningClause(options.returning);
+	const whereClause = buildWhereClause(where, options.dialect);
+	const returning = buildReturningClause(options.returning, options.dialect);
 
 	return {
 		sql: `UPDATE ${quotedTable} SET ${setClauses.join(', ')} WHERE ${whereClause.sql}${returning}`,
@@ -246,9 +303,9 @@ export function buildUpdate(
  * // bindings: ['u1']
  * ```
  */
-export function buildDelete(table: string, where: ColumnValues): BuiltQuery {
-	const quotedTable = quoteIdentifier(table);
-	const whereClause = buildWhereClause(where);
+export function buildDelete(table: string, where: ColumnValues, options: { dialect?: SQLDialect } = {}): BuiltQuery {
+	const quotedTable = quoteIdentifier(table, options.dialect);
+	const whereClause = buildWhereClause(where, options.dialect);
 	return {
 		sql: `DELETE FROM ${quotedTable} WHERE ${whereClause.sql}`,
 		bindings: whereClause.bindings
@@ -285,13 +342,13 @@ export function buildUpsert(
 		throw new CollegeDBError('At least one conflict column is required for upsert', 'EMPTY_CONFLICT');
 	}
 
-	const insert = buildInsert(table, values);
+	const insert = buildInsert(table, values, { dialect: options.dialect });
 	const conflictSet = new Set(conflicts.map((column) => column.trim()));
 
 	const updateColumns = (options.update ?? definedEntries(values).map(([column]) => column)).filter((column) => !conflictSet.has(column));
 
-	const conflictClause = conflicts.map((column) => quoteIdentifier(column)).join(', ');
-	const returning = buildReturningClause(options.returning);
+	const conflictClause = conflicts.map((column) => quoteIdentifier(column, options.dialect)).join(', ');
+	const returning = buildReturningClause(options.returning, options.dialect);
 
 	if (updateColumns.length === 0) {
 		// Nothing to overwrite; degrade to DO NOTHING so the insert stays idempotent.
@@ -302,7 +359,7 @@ export function buildUpsert(
 	}
 
 	const assignments = updateColumns.map((column) => {
-		const quoted = quoteIdentifier(column);
+		const quoted = quoteIdentifier(column, options.dialect);
 		return `${quoted} = excluded.${quoted}`;
 	});
 

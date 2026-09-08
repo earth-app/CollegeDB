@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier } from '../src/index';
+import { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier, validateIdentifier } from '../src/index';
 
 describe('SQL builders', () => {
 	describe('buildInsert', () => {
@@ -99,5 +99,71 @@ describe('SQL builders', () => {
 			expect(() => quoteIdentifier('')).toThrow('Identifier cannot be empty');
 			expect(() => quoteIdentifier('a b')).toThrow('Invalid SQL identifier');
 		});
+
+		it('keeps rejecting an invalid identifier after a valid one is cached', () => {
+			// The result is memoized, so the branch that throws must not be able to
+			// leave anything behind that a later call could read as an answer.
+			expect(quoteIdentifier('users')).toBe('"users"');
+
+			for (let attempt = 0; attempt < 3; attempt++) {
+				expect(() => quoteIdentifier('users; DROP TABLE users')).toThrow('Invalid SQL identifier');
+				expect(() => quoteIdentifier('')).toThrow('Identifier cannot be empty');
+			}
+
+			expect(quoteIdentifier('users')).toBe('"users"');
+		});
+
+		it('caches per dialect, so the same name quotes differently per backend', () => {
+			expect(quoteIdentifier('accounts', 'postgres')).toBe('"accounts"');
+			expect(quoteIdentifier('accounts', 'mysql')).toBe('`accounts`');
+			expect(quoteIdentifier('accounts', 'postgres')).toBe('"accounts"');
+			expect(quoteIdentifier('accounts')).toBe('"accounts"');
+		});
+
+		it('survives more distinct identifiers than the cache holds', () => {
+			for (let i = 0; i < 1200; i++) {
+				expect(quoteIdentifier(`col_${i}`)).toBe(`"col_${i}"`);
+			}
+
+			expect(quoteIdentifier('col_0')).toBe('"col_0"');
+			expect(quoteIdentifier('col_1199')).toBe('"col_1199"');
+		});
+	});
+});
+
+describe('Dialect-aware identifier quoting', () => {
+	it('uses backticks for MySQL and double quotes elsewhere', () => {
+		expect(quoteIdentifier('users')).toBe('"users"');
+		expect(quoteIdentifier('users', 'sqlite')).toBe('"users"');
+		expect(quoteIdentifier('users', 'postgres')).toBe('"users"');
+
+		// MySQL and MariaDB reject ANSI double quotes unless ANSI_QUOTES is set, so
+		// a statement built with them fails outright there.
+		expect(quoteIdentifier('users', 'mysql')).toBe('`users`');
+		expect(quoteIdentifier('app.users', 'mysql')).toBe('`app`.`users`');
+	});
+
+	it('validates without quoting, for places that need a bare name', () => {
+		expect(validateIdentifier('users')).toEqual(['users']);
+		expect(validateIdentifier('app.users')).toEqual(['app', 'users']);
+		expect(() => validateIdentifier('users; DROP TABLE t')).toThrow(/Invalid SQL identifier/);
+		expect(() => validateIdentifier('  ')).toThrow(/cannot be empty/);
+	});
+
+	it('builds MySQL-safe statements from every builder', () => {
+		const dialect = 'mysql' as const;
+
+		expect(buildInsert('users', { id: 'u1', name: 'Ada' }, { dialect }).sql).toBe('INSERT INTO `users` (`id`, `name`) VALUES (?, ?)');
+		expect(buildUpdate('users', { name: 'Ada' }, { id: 'u1' }, { dialect }).sql).toBe('UPDATE `users` SET `name` = ? WHERE `id` = ?');
+		expect(buildDelete('users', { id: 'u1' }, { dialect }).sql).toBe('DELETE FROM `users` WHERE `id` = ?');
+		expect(buildUpsert('kv', { k: 'a', v: '1' }, 'k', { dialect }).sql).toBe(
+			'INSERT INTO `kv` (`k`, `v`) VALUES (?, ?) ON CONFLICT (`k`) DO UPDATE SET `v` = excluded.`v`'
+		);
+		expect(buildInsert('users', { id: 'u1' }, { dialect, returning: ['id'] }).sql).toContain('RETURNING `id`');
+	});
+
+	it('leaves the default output unchanged when no dialect is given', () => {
+		expect(buildInsert('users', { id: 'u1' }).sql).toBe('INSERT INTO "users" ("id") VALUES (?)');
+		expect(buildDelete('users', { id: 'u1' }).sql).toBe('DELETE FROM "users" WHERE "id" = ?');
 	});
 });
