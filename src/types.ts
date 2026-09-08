@@ -148,11 +148,41 @@ export interface PreparedStatement {
 }
 
 /**
+ * A statement plus its bindings, as accepted by {@link SQLDatabase.runBatch}.
+ * @since 1.4.0
+ */
+export interface BatchStatement {
+	/** SQL text using `?` placeholders */
+	sql: string;
+	/** Positional bindings for the statement */
+	bindings?: any[];
+}
+
+/**
  * Provider-agnostic SQL database contract.
  */
 export interface SQLDatabase {
 	/** Creates a prepared statement */
 	prepare(sql: string): PreparedStatement;
+	/**
+	 * Executes several statements against this shard in one round trip.
+	 *
+	 * Optional. The provider adapters implement it over D1's native `batch`,
+	 * Drizzle's `db.batch`, or a single driver transaction. CollegeDB falls back
+	 * to sequential `prepare().run()` calls when a provider does not implement
+	 * it, so callers never need to check for it.
+	 *
+	 * Named `runBatch` rather than `batch` on purpose: a raw `D1Database` is
+	 * structurally assignable to this contract, and D1 already has a `batch`
+	 * that takes prepared statements rather than SQL text. Reusing the name
+	 * would make `env.DB` stop satisfying `SQLDatabase`.
+	 *
+	 * Statements execute in order and share one transaction per shard. There is
+	 * no cross-shard atomicity: a routed batch spanning three shards is three
+	 * independent transactions.
+	 * @since 1.4.0
+	 */
+	runBatch?<T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]>;
 }
 
 /**
@@ -214,7 +244,7 @@ export interface Env {
 	ShardCoordinator: DurableObjectNamespace;
 	/** Optional Hyperdrive binding for external SQL connectivity */
 	HYPERDRIVE?: { connectionString: string; localConnectionString?: string };
-	/** D1 database bindings - dynamic based on Wrangler configuration */
+	/** Shard bindings - dynamic based on Wrangler configuration */
 	[key: string]: any;
 }
 
@@ -286,13 +316,88 @@ export interface CollegeDBConfig {
 	 * @since 1.1.0
 	 */
 	migrationConcurrency?: number;
+	/**
+	 * How a primary key is resolved to a shard.
+	 *
+	 * - `computed` - derive the shard from the key with rendezvous hashing and
+	 *   consult KV only for keys that were explicitly reassigned or placed by an
+	 *   older algorithm. Removes one KV read per operation and one KV write per
+	 *   new key.
+	 * - `kv` - read the mapping from KV, allocating and recording on a miss.
+	 *
+	 * Only meaningful for the `hash` strategy. `round-robin` and `random` are not
+	 * functions of the key, and `location` depends on the requesting region
+	 * rather than the key, so all three force `kv`.
+	 *
+	 * Defaults to `computed` for the `hash` strategy on a deployment CollegeDB
+	 * has not seen before, and to `kv` when existing mappings are detected, so
+	 * an upgrade never starts computing placements for keys another algorithm
+	 * placed. Call `rebalance()` to migrate such a deployment.
+	 * @since 1.4.0
+	 */
+	placement?: 'computed' | 'kv';
+	/**
+	 * Whether a read that finds no mapping should record one.
+	 *
+	 * When `false` a read resolves a shard and returns it without writing to KV,
+	 * so looking up a key that has no row costs no KV write and leaves no
+	 * mapping behind. Writes always record their mapping.
+	 * @default false
+	 * @since 1.4.0
+	 */
+	allocateOnRead?: boolean;
+	/**
+	 * Whether a mapping miss should also probe the legacy multi-key record.
+	 *
+	 * Every writer since 1.0.3 stores a single-key record for each lookup key
+	 * alongside the multi-key record, so this second read cannot succeed for
+	 * data this version wrote and doubles the KV cost of every true miss. Enable
+	 * it only while migrating mappings written before 1.0.3.
+	 * @default false
+	 * @since 1.4.0
+	 */
+	legacyMultiKeyLookup?: boolean;
+	/**
+	 * Primary-key column per table, used by the query planner to recover the
+	 * routing key from a statement. Tables absent from the map use `id`.
+	 * @since 1.4.0
+	 */
+	keyColumns?: Record<string, string>;
+	/**
+	 * What the query planner does with a statement whose routing key it cannot
+	 * prove.
+	 *
+	 * - `throw` - reject the call and point the caller at the explicit-key API.
+	 * - `fanout` - run the statement on every shard.
+	 *
+	 * `throw` is the default because a mis-routed write lands a row where no
+	 * reader will look, while a thrown error is visible immediately.
+	 * @default 'throw'
+	 * @since 1.4.0
+	 */
+	onUnroutable?: 'throw' | 'fanout';
+	/**
+	 * Per-phase timing observer. When set, CollegeDB reports the cost of hashing,
+	 * each KV round trip, shard selection, coordinator calls, and SQL execution.
+	 * Unset, the instrumentation allocates nothing.
+	 * @since 1.4.0
+	 */
+	onPhase?: PhaseObserver;
+	/**
+	 * Extends the lifetime of CollegeDB's background work past the current
+	 * request. Pass `ctx.waitUntil` from a Worker: without it, the background
+	 * known-shard sync and auto-migration started by {@link initialize} are
+	 * cancelled when the request that triggered them ends.
+	 * @since 1.4.0
+	 */
+	waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 /**
  * Shard statistics for monitoring and load balancing
  */
 export interface ShardStats {
-	/** D1 binding name */
+	/** Shard binding name */
 	binding: string;
 	/** Number of primary keys assigned to this shard */
 	count: number;
@@ -312,7 +417,7 @@ export interface ShardStrategy {
  * Primary key to shard mapping stored in KV
  */
 export interface ShardMapping {
-	/** D1 binding name */
+	/** Shard binding name */
 	shard: string;
 	/** Timestamp when mapping was created */
 	createdAt: number;
@@ -327,7 +432,7 @@ export interface ShardMapping {
  * @since 1.0.3
  */
 export interface MultiKeyShardMapping {
-	/** D1 binding name */
+	/** Shard binding name */
 	shard: string;
 	/** Timestamp when mapping was created */
 	createdAt: number;
@@ -341,7 +446,7 @@ export interface MultiKeyShardMapping {
  * Durable Object state for shard coordination
  */
 export interface ShardCoordinatorState {
-	/** List of known D1 bindings */
+	/** List of known shard bindings */
 	knownShards: string[];
 	/** Statistics for each shard */
 	shardStats: Record<string, ShardStats>;
