@@ -35,7 +35,7 @@ Purpose of this file
 - Commands to exercise the sandbox locally (from repo root):
   - `bun run test:memory` — in-memory quick run
   - `bun run test:sandbox` — run sandbox benchmarks (CI also runs this)
-  - For specific profiles: `bun run test:sandbox:drizzle`, `bun run test:sandbox:nuxthub`, etc.
+  - For specific profiles: `bun run test:sandbox:drizzle`, `bun run test:sandbox:per-statement-connection`, etc.
 
 **Tests**
 

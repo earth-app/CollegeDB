@@ -1,18 +1,18 @@
 /**
  * @fileoverview Advanced usage example for CollegeDB
  *
- * This comprehensive example demonstrates advanced features and patterns for
+ * This example demonstrates advanced features and patterns for
  * production usage of CollegeDB. It includes sophisticated shard management,
  * monitoring, cross-shard operations, and administrative functions.
  *
  * Advanced features demonstrated:
- * - Comprehensive shard statistics and monitoring
+ * - Shard statistics and monitoring
  * - Cross-shard analytical queries
  * - Dynamic shard reassignment for load balancing
  * - Error handling and recovery strategies
  * - Administrative operations and maintenance
  * - Custom routing and query strategies
- * - Production-ready patterns and best practices
+ * - Patterns for production deployments
  *
  * Use cases covered:
  * - Load balancing and capacity management
@@ -277,7 +277,7 @@ async function handleRebalance(): Promise<Response> {
 }
 
 async function handleStats(): Promise<Response> {
-	console.log('📈 Gathering comprehensive statistics...');
+	console.log('📈 Gathering statistics...');
 
 	const [shards, stats] = await Promise.all([listKnownShards(), getShardStats()]);
 

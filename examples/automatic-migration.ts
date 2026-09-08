@@ -7,7 +7,7 @@
  *
  * Features demonstrated:
  * - Zero-configuration automatic migration
- * - Seamless integration with existing databases
+ * - Integration with existing databases
  * - Immediate access to existing data
  * - Transparent routing for new and existing records
  *

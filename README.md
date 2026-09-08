@@ -8,7 +8,9 @@ Universal Database Horizontal Sharding Router
 [![GitHub License](https://img.shields.io/github/license/earth-app/CollegeDB)](LICENSE)
 ![NPM Version](https://img.shields.io/npm/v/%40earth-app%2Fcollegedb)
 
-A TypeScript library for **true horizontal scaling** of SQLite-style databases primarily for Cloudflare using D1 and KV, with additional provider adapters for Redis/Valkey KV and PostgreSQL/MySQL/SQLite SQL backends, plus Drizzle ORM interop across those SQL providers. CollegeDB distributes your data across multiple database shards, with each table's records split by primary key across different database instances.
+A TypeScript library for **horizontal scaling** of SQL databases. CollegeDB splits a single logical table across many database instances by primary key, and routes each query to the instance that owns its key.
+
+SQL backends: Cloudflare D1, PostgreSQL, MySQL, MariaDB, SQLite, and any Drizzle ORM instance over them. Key mappings live in Cloudflare Workers KV, Redis, Valkey, or NuxtHub KV. Runs on Cloudflare Workers, Node, and Bun.
 
 ## Table of Contents
 
@@ -25,7 +27,7 @@ A TypeScript library for **true horizontal scaling** of SQLite-style databases p
 - [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
 - [Troubleshooting](#troubleshooting)
 - [Cross-Shard Pagination Behavior](#cross-shard-pagination-behavior)
-- [Database Query Best Practices](#database-query-best-practices)
+- [Query Guidance](#query-guidance)
 - [API Reference](#api-reference)
 - [Architecture](#architecture)
 - [Cloudflare Setup](#cloudflare-setup)
@@ -189,12 +191,27 @@ CollegeDB includes a benchmark runner that executes each SQL+KV combination acro
 
 ### Adapter Profiles
 
-| Profile    | Purpose                                                                 |
-| ---------- | ----------------------------------------------------------------------- |
-| native     | Direct provider clients (Cloudflare bindings or driver-native adapters) |
-| drizzle    | Drizzle interop through SQL provider adapters                           |
-| hyperdrive | Hyperdrive connection-string wrappers for PostgreSQL/MySQL              |
-| nuxthub    | NuxtHub-style KV adapter with SQL provider interop                      |
+| Profile                  | Lane       | Purpose                                                                         |
+| ------------------------ | ---------- | ------------------------------------------------------------------------------- |
+| native                   | both       | Direct provider clients (Cloudflare bindings or driver-native adapters)         |
+| drizzle                  | both       | Drizzle interop through SQL provider adapters                                   |
+| hyperdrive               | Cloudflare | A real `env.HYPERDRIVE` binding, supplied by `wrangler dev` from local Postgres |
+| per-statement-connection | local      | A fresh driver connection per statement, off by default                         |
+
+The `hyperdrive` profile only runs in the Cloudflare lane, because a Hyperdrive binding needs a
+Workers runtime. `wrangler dev` supplies one from `localConnectionString`, which exercises the
+driver path, the binding shape, and the per-request connection lifecycle. Local Hyperdrive does
+no query caching or edge pooling, so that cell checks correctness and connection count rather
+than pooling latency; a pooling measurement needs `wrangler dev --remote` against a real
+Hyperdrive configuration.
+
+`per-statement-connection` measures opening a connection per statement against a local server.
+It is not a Hyperdrive measurement and is excluded from the default matrix, where it accounted
+for 40.6% of the wall time.
+
+KV adapters are not a profile axis, because the adapter wrapper is one function call per
+operation and the measured difference was indistinguishable from run-to-run variance. Adapter
+behaviour is covered by the `KVStorage` conformance spec instead.
 
 ### Scenario Catalog
 
@@ -228,7 +245,7 @@ Each generated report includes:
 ```bash
 bun run test:sandbox
 bun run test:sandbox:drizzle
-bun run test:sandbox:nuxthub
+bun run test:sandbox:per-statement-connection
 bun run test:sandbox:hyperdrive
 ```
 
@@ -418,7 +435,7 @@ bun run test:sandbox:valkey
 
 # Run all SQL x KV combinations for one adapter profile
 bun run test:sandbox:drizzle
-bun run test:sandbox:nuxthub
+bun run test:sandbox:per-statement-connection
 bun run test:sandbox:hyperdrive
 
 # Explicit pairwise combinations
@@ -653,7 +670,7 @@ CollegeDB includes a ready-made sandbox example demonstrating multiple scenarios
 bun run test:memory
 ```
 
-This runs comprehensive benchmarks including:
+This runs benchmarks covering:
 
 - Basic CRUD operations
 - Multi-shard data distribution
@@ -952,6 +969,24 @@ This approach provides:
 
 When your table assigns the primary key during insert, use `insert()` for the automatic shard-allocation path or `insertShard()` when you already know the target shard. Both helpers capture the generated id from provider metadata or `RETURNING` rows, then store the generated-id mapping so the normal routed `first()` / `all()` helpers can read the row back.
 
+**A database-generated id is only unique within its own shard.** Every shard runs its own
+`AUTOINCREMENT` or `SERIAL` sequence, so a generated-key table spread across shards eventually
+mints the same id twice. CollegeDB throws `GENERATED_KEY_COLLISION` at that point rather than
+overwriting the first mapping and stranding its row. Two ways to avoid it:
+
+- Allocate the id with `nextId()` and pass it explicitly, which is cluster-unique across shards.
+- Keep the table on one shard with `insertShard()`, which keeps the database's own sequence
+  authoritative.
+
+If the primary key column is not named `id` or `rowid`, name it, because CollegeDB will not guess
+which returned column is the key:
+
+```typescript
+const created = await insert('INSERT INTO things (uuid, label) VALUES (?, ?) RETURNING uuid', ['abc', 'Widget'], {
+	idColumn: 'uuid'
+});
+```
+
 ```typescript
 import { first, insert, insertShard } from '@earth-app/collegedb';
 
@@ -1012,6 +1047,30 @@ If your SQL dialect uses `RETURNING`, include it in the insert statement. The he
 ## Utility Helpers
 
 CollegeDB ships helpers that remove the boilerplate most consumers otherwise rewrite per table. Every helper routes through the same shard map as `run`/`first`, and every generated statement uses positional bindings with validated, quoted identifiers.
+
+### Initialization on Workers
+
+`initialize()` starts two background tasks: a known-shard sync and, unless
+`disableAutoMigration` is set, auto-migration detection. On Workers, work not attached to a
+request is cancelled when that request ends, so pass `ctx.waitUntil` to let them finish:
+
+```typescript
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		initialize({
+			kv: env.KV,
+			shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+			strategy: 'hash',
+			waitUntil: (promise) => ctx.waitUntil(promise)
+		});
+
+		// ... handle the request
+	}
+};
+```
+
+`initializeAsync()` awaits both tasks instead, which suits a script or a test but adds their
+latency to the request that calls it.
 
 ### One-Call Setup From a Worker `env`
 
@@ -1110,6 +1169,107 @@ await ensureSchema(
 	{ versionKey: 'schema:version', version: '3' }
 );
 ```
+
+### Routing Without a Key Argument
+
+`query`, `queryFirst`, and `queryAll` read the primary key out of the statement, so you do not
+pass it twice:
+
+```typescript
+import { query, queryFirst } from '@earth-app/collegedb';
+
+await query('INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+await query('UPDATE users SET name = ? WHERE id = ?', ['Ada L.', 'user-1']);
+
+const user = await queryFirst<User>('SELECT * FROM users WHERE id = ?', ['user-1']);
+```
+
+A statement whose key spans shards is grouped and issued once per shard:
+
+```typescript
+await query('DELETE FROM users WHERE id IN (?, ?, ?)', ['user-1', 'user-2', 'user-3']);
+```
+
+Recognized shapes are `INSERT INTO t (cols) VALUES (...)` including multi-row inserts, and
+`UPDATE`/`DELETE`/`SELECT` whose whole `WHERE` clause is `key = ?` or `key IN (?, ...)`. The key
+column defaults to `id`; declare others per table:
+
+```typescript
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST },
+	keyColumns: { tickets: 'ticket_id', sessions: 'session_uuid' }
+});
+```
+
+Anything else is unroutable, and CollegeDB throws rather than guessing, because a mis-routed
+write lands a row on a shard no reader queries. The error names the explicit-key alternative. Set
+`onUnroutable: 'fanout'` to query every shard instead.
+
+The planner reads the SQL you hand to `query`, so a Drizzle query builder chain does not go
+through it. Use the key-first API for those.
+
+### Batched Writes
+
+`batch` groups routed statements by shard and issues one round trip per shard:
+
+```typescript
+import { batch } from '@earth-app/collegedb';
+
+const groups = await batch([
+	{ key: 'user-1', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['user-1', 'Ada'] },
+	{ key: 'user-2', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['user-2', 'Grace'] }
+]);
+
+for (const group of groups) {
+	if (group.error) console.error(`${group.shard} failed: ${group.error}`);
+}
+```
+
+Statements on the same shard share that shard's transaction and run in submission order.
+**Statements on different shards do not.** A batch spanning three shards is three independent
+transactions and can leave one shard updated and another not; key the whole unit of work to one
+shard when that matters. The result is reported per shard for the same reason.
+
+D1 caps a Worker invocation at 1,000 queries on the paid plan and 50 on the free plan, so a bulk
+write of one statement per row is not merely slow there.
+
+### Computed Placement
+
+For the `hash` strategy the shard is already a function of the key, so `placement: 'computed'`
+skips the KV round trip entirely and stops recording a mapping per key:
+
+```typescript
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+	strategy: 'hash',
+	placement: 'computed'
+});
+```
+
+Placement uses rendezvous hashing, so adding or removing a shard moves only the keys that must
+move, and the result does not depend on the order the bindings are declared in.
+
+It is opt-in because it does not store mappings, and three things read the keyspace back out of
+those mappings: `getShardStats` key counts, `KVShardMapper.getKeysForShard`, and the migration
+helpers that enumerate mapped keys. Under computed placement the assignment is implied by the
+hash over a keyspace nothing enumerates, so those cannot answer.
+
+`round-robin` and `random` are not functions of the key, and `location` depends on the requesting
+region rather than the key, so all three keep using KV.
+
+For a deployment created before 1.4.0, run `rebalance()` first. It moves stored mappings onto
+their computed shard and reports how many already agreed:
+
+```typescript
+const result = await rebalance('users', { dryRun: true });
+console.log(`${result.agreed}/${result.examined} keys already agree, ${result.moved} would move`);
+```
+
+Once a pass reports no moves and no failures, computed placement resolves every key where the
+stored mapping already pointed. Keys moved by `reassignShard` stay recorded as exceptions and are
+still read from KV.
 
 ### KV Cache and Secondary-Index Lookups
 
@@ -1230,7 +1390,7 @@ await mapper.deleteShardMapping('user-123');
 
 ## Drop-in Replacement for Existing Databases
 
-CollegeDB supports **seamless, automatic integration** with existing D1 databases that already contain data. Simply add your existing databases as shards in the configuration. CollegeDB will automatically detect existing data and create the necessary shard mappings **without requiring any manual migration steps**.
+CollegeDB integrates with databases that already contain data. Add them as shards in the configuration; CollegeDB detects the existing rows and creates the shard mappings for them, with no manual migration step.
 
 ### Requirements for Drop-in Replacement
 
@@ -1505,7 +1665,18 @@ const newest = await firstAllShardsGlobal<{ id: string; created_at: number }>('S
 });
 ```
 
-## Database Query Best Practices
+### Memory Ceiling
+
+A global page merges and sorts in one isolate, so it holds every matching row from every shard at
+once. When `sortBy` names a column and the statement has no `LIMIT`, `OFFSET`, or set operator,
+CollegeDB appends `LIMIT offset + limit` to each shard query, which bounds that. A JavaScript
+`filter` or `comparator`, or `includeTotal`, can promote a row the bound would have discarded, so
+the rewrite does not apply in those cases and every matching row is fetched.
+
+Workers cap an isolate at 128 MB. For a large result set, filter in SQL rather than in a
+`filter` callback, or page with `count` plus keyed ranges instead of a global sort.
+
+## Query Guidance
 
 ### Use Library Utility Operations for DDL and Inspection
 
@@ -2253,7 +2424,7 @@ async function createMonitoringDashboard(env: Env) {
 	const coordinatorId = env.ShardCoordinator.idFromName('default');
 	const coordinator = env.ShardCoordinator.get(coordinatorId);
 
-	// Get comprehensive metrics
+	// Get metrics
 	const [shardsResponse, statsResponse, healthResponse] = await Promise.all([
 		coordinator.fetch('http://coordinator/shards'),
 		coordinator.fetch('http://coordinator/stats'),
@@ -2478,393 +2649,98 @@ export default {
 
 ## Performance Analysis
 
-### Scaling Performance Comparison
+Numbers come from the benchmark runner in [`scripts/sandbox/run.ts`](scripts/sandbox/run.ts).
+Reports land in [`sandbox/results/`](sandbox/results/), and CI publishes the full-matrix run.
 
-CollegeDB provides significant performance improvements through horizontal scaling. Here are mathematical estimates comparing single D1 database vs CollegeDB with different shard counts:
+### Reading the Report
 
-#### Query Performance
+| Section                                  | What it answers                                                                              |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Where a Routed Operation Spends Its Time | Cost of hashing, each KV round trip, shard selection, and SQL execution, measured separately |
+| SQL x KV (Overall)                       | Per-operation and per-scenario averages per backend pair                                     |
+| Core Scenario Latency                    | End-to-end latency per scenario                                                              |
+| Strategy Key Distribution                | How evenly each allocation strategy spreads keys                                             |
 
-_SELECT, VALUES, TABLE, PRAGMA, ..._
+Use `Per-Op Avg` to compare backends. `Overall Avg` is the unweighted mean of the scenario
+averages, so `bulk_crud` at 400 routed operations per iteration dominates `basic_crud` at 4.
 
-| Configuration           | Query Latency\* | Concurrent Queries      | Throughput Gain |
-| ----------------------- | --------------- | ----------------------- | --------------- |
-| Single D1               | ~50-80ms        | Limited by D1 limits    | 1x (baseline)   |
-| CollegeDB (10 shards)   | ~55-85ms        | 10x parallel capacity   | ~8-9x           |
-| CollegeDB (100 shards)  | ~60-90ms        | 100x parallel capacity  | ~75-80x         |
-| CollegeDB (1000 shards) | ~65-95ms        | 1000x parallel capacity | ~650-700x       |
+### Measuring Your Own Deployment
 
-\*Includes KV lookup overhead (~5-15ms) and SHA-256 hashing overhead (~1-3ms when `hashShardMappings: true`)
-
-#### Write Performance
-
-_INSERT, UPDATE, DELETE, ..._
-
-| Configuration           | Write Latency\* | Concurrent Writes  | Throughput Gain |
-| ----------------------- | --------------- | ------------------ | --------------- |
-| Single D1               | ~80-120ms       | ~50 writes/sec     | 1x (baseline)   |
-| CollegeDB (10 shards)   | ~90-135ms       | ~450 writes/sec    | ~9x             |
-| CollegeDB (100 shards)  | ~95-145ms       | ~4,200 writes/sec  | ~84x            |
-| CollegeDB (1000 shards) | ~105-160ms      | ~35,000 writes/sec | ~700x           |
-
-\*Includes KV mapping creation/update overhead (~10-25ms) and SHA-256 hashing overhead (~1-3ms when `hashShardMappings: true`)
-
-### Strategy-Specific Performance
-
-#### Hash Strategy
-
-- **Best for**: Consistent performance, even data distribution
-- **Latency**: Lowest overhead (no coordinator calls, ~1-3ms SHA-256 hashing when enabled)
-- **Throughput**: Optimal for high-volume scenarios
-
-| Shards | Avg Latency | Distribution Quality | Coordinator Dependency |
-| ------ | ----------- | -------------------- | ---------------------- |
-| 10     | +5ms        | Excellent            | None                   |
-| 100    | +5ms        | Excellent            | None                   |
-| 1000   | +5ms        | Excellent            | None                   |
-
-#### Round-Robin Strategy
-
-- **Best for**: Guaranteed even distribution
-- **Latency**: Requires coordinator communication
-- **Throughput**: Good, limited by coordinator
-
-| Shards | Avg Latency | Distribution Quality | Coordinator Dependency |
-| ------ | ----------- | -------------------- | ---------------------- |
-| 10     | +15ms       | Perfect              | High                   |
-| 100    | +20ms       | Perfect              | High                   |
-| 1000   | +25ms       | Perfect              | High                   |
-
-#### Random Strategy
-
-- **Best for**: Simple setup, good distribution over time
-- **Latency**: Low overhead
-- **Throughput**: Good for medium-scale deployments
-
-| Shards | Avg Latency | Distribution Quality | Coordinator Dependency |
-| ------ | ----------- | -------------------- | ---------------------- |
-| 10     | +3ms        | Good                 | None                   |
-| 100    | +3ms        | Good                 | None                   |
-| 1000   | +3ms        | Fair                 | None                   |
-
-#### Location Strategy
-
-- **Best for**: Geographic optimization, reduced latency
-- **Latency**: Optimized by region proximity
-- **Throughput**: Regional performance benefits
-
-| Shards | Avg Latency | Geographic Benefit   | Coordinator Dependency |
-| ------ | ----------- | -------------------- | ---------------------- |
-| 10     | +8ms        | Excellent (-20-40ms) | Optional               |
-| 100    | +10ms       | Excellent (-20-40ms) | Optional               |
-| 1000   | +12ms       | Excellent (-20-40ms) | Optional               |
-
-#### Mixed Strategy
-
-- **Best for**: Optimizing both read and write performance independently
-- **Latency**: Best of both strategies combined
-- **Throughput**: Optimal for workloads with different read/write patterns
-
-**High-Performance Mix**: `{ read: 'hash', write: 'location' }`
-
-| Operation | Strategy | Latency Impact           | Throughput Benefit | Geographic Benefit   |
-| --------- | -------- | ------------------------ | ------------------ | -------------------- |
-| Reads     | Hash     | +5ms                     | Excellent          | None                 |
-| Writes    | Location | +8ms (-20-40ms regional) | Good               | Excellent (-20-40ms) |
-
-**Balanced Mix**: `{ read: 'location', write: 'hash' }`
-
-| Operation | Strategy | Latency Impact           | Throughput Benefit | Geographic Benefit   |
-| --------- | -------- | ------------------------ | ------------------ | -------------------- |
-| Reads     | Location | +8ms (-20-40ms regional) | Good               | Excellent (-20-40ms) |
-| Writes    | Hash     | +5ms                     | Excellent          | None                 |
-
-**Enterprise Mix**: `{ read: 'hash', write: 'round-robin' }`
-
-| Operation | Strategy    | Latency Impact | Distribution Quality | Coordinator Dependency |
-| --------- | ----------- | -------------- | -------------------- | ---------------------- |
-| Reads     | Hash        | +5ms           | Excellent            | None                   |
-| Writes    | Round-Robin | +15-25ms       | Perfect              | High                   |
-
-##### By Shard Count
-
-**Hash + Location Mix** (`{ read: 'hash', write: 'location' }`)
-
-| Shards | Read Latency | Write Latency          | Combined Benefit      | Best Use Case    |
-| ------ | ------------ | ---------------------- | --------------------- | ---------------- |
-| 10     | +5ms         | +8ms (-30ms regional)  | ~22ms net improvement | Global apps      |
-| 100    | +5ms         | +10ms (-30ms regional) | ~20ms net improvement | Enterprise scale |
-| 1000   | +5ms         | +12ms (-30ms regional) | ~18ms net improvement | Massive scale    |
-
-**Location + Hash Mix** (`{ read: 'location', write: 'hash' }`)
-
-| Shards | Read Latency           | Write Latency | Combined Benefit      | Best Use Case         |
-| ------ | ---------------------- | ------------- | --------------------- | --------------------- |
-| 10     | +8ms (-30ms regional)  | +5ms          | ~17ms net improvement | Read-heavy regional   |
-| 100    | +10ms (-30ms regional) | +5ms          | ~15ms net improvement | Analytics workloads   |
-| 1000   | +12ms (-30ms regional) | +5ms          | ~13ms net improvement | Large-scale reporting |
-
-**Hash + Round-Robin Mix** (`{ read: 'hash', write: 'round-robin' }`)
-
-| Shards | Read Latency | Write Latency | Distribution Quality            | Best Use Case      |
-| ------ | ------------ | ------------- | ------------------------------- | ------------------ |
-| 10     | +5ms         | +15ms         | Perfect writes, Excellent reads | Balanced workloads |
-| 100    | +5ms         | +20ms         | Perfect writes, Excellent reads | Large databases    |
-| 1000   | +5ms         | +25ms         | Perfect writes, Excellent reads | Enterprise scale   |
-
-### Mixed Strategy Scenarios & Recommendations
-
-#### Large Database Scenarios (>10M records)
-
-**Scenario**: Massive datasets requiring optimal query performance and balanced growth
+Attach the phase observer to get the same breakdown for your own traffic:
 
 ```typescript
-// Recommended: Hash reads + Round-Robin writes
-{
-  strategy: { read: 'hash', write: 'round-robin' },
-  coordinator: env.ShardCoordinator // Required for round-robin
-}
-```
+import { PhaseCollector, initialize } from '@earth-app/collegedb';
 
-**Performance Profile**:
+const phases = new PhaseCollector();
 
-- Read latency: +5ms (fastest possible routing)
-- Write latency: +15-25ms (coordinator overhead)
-- Data distribution: Perfect balance over time
-- **Ideal for**: Analytics platforms, data warehouses, reporting systems
-
-#### Vast Geographic Spread Scenarios
-
-**Scenario**: Global applications with users across multiple continents
-
-```typescript
-// Recommended: Hash reads + Location writes
-{
-  strategy: { read: 'hash', write: 'location' },
-  targetRegion: getClosestRegionFromIP(request), // Dynamic region targeting
-  shardLocations: {
-    'db-americas': { region: 'wnam', priority: 2 },
-    'db-europe': { region: 'weur', priority: 2 },
-    'db-asia': { region: 'apac', priority: 2 }
-  }
-}
-```
-
-**Performance Profile**:
-
-- Read latency: +5ms (consistent global performance)
-- Write latency: +8ms baseline (-20-40ms regional benefit)
-- **Net improvement**: 15-35ms for geographically distributed users
-- **Ideal for**: Social networks, e-commerce, content platforms
-
-#### High-Volume Write Scenarios
-
-**Scenario**: Applications with heavy write loads (IoT, logging, real-time data)
-
-```typescript
-// Recommended: Location reads + Hash writes
-{
-  strategy: { read: 'location', write: 'hash' },
-  targetRegion: 'wnam',
-  shardLocations: {
-    'db-west': { region: 'wnam', priority: 3 },
-    'db-central': { region: 'enam', priority: 2 },
-    'db-east': { region: 'enam', priority: 1 }
-  }
-}
-```
-
-**Performance Profile**:
-
-- Read latency: +8ms baseline (-20-40ms regional benefit)
-- Write latency: +5ms (fastest write routing)
-- Write throughput: Maximum possible for hash strategy
-- **Ideal for**: IoT data collection, real-time analytics, logging systems
-
-#### Multi-Tenant SaaS Scenarios
-
-**Scenario**: SaaS applications with predictable performance requirements
-
-```typescript
-// Recommended: Hash reads + Hash writes (consistent performance)
-{
-  strategy: { read: 'hash', write: 'hash' }
-  // No coordinator needed, predictable routing for both operations
-}
-```
-
-**Performance Profile**:
-
-- Read latency: +5ms (most predictable)
-- Write latency: +5ms (most predictable)
-- Tenant isolation: Natural sharding by tenant ID
-- **Ideal for**: B2B SaaS, multi-tenant platforms, predictable workloads
-
-#### Read-Heavy Analytics Scenarios
-
-**Scenario**: Analytics and reporting workloads with occasional writes
-
-```typescript
-// Recommended: Random reads + Location writes
-{
-  strategy: { read: 'random', write: 'location' },
-  targetRegion: 'wnam',
-  shardLocations: { /* geographic configuration */ }
-}
-```
-
-**Performance Profile**:
-
-- Read latency: +3ms (lowest overhead, good load balancing)
-- Write latency: +8ms baseline (-20-40ms regional benefit)
-- Read load distribution: Excellent across all shards
-- **Ideal for**: Business intelligence, data analysis, reporting dashboards
-
-### Mixed Strategy Performance Comparison
-
-#### By Database Size
-
-| Database Size                 | Best Mixed Strategy                        | Read Performance      | Write Performance    | Overall Benefit       |
-| ----------------------------- | ------------------------------------------ | --------------------- | -------------------- | --------------------- |
-| **Small (1K-100K records)**   | `{read: 'hash', write: 'hash'}`            | Excellent             | Excellent            | Consistent, simple    |
-| **Medium (100K-1M records)**  | `{read: 'hash', write: 'location'}`        | Excellent             | Good + Regional      | 15-35ms improvement   |
-| **Large (1M-10M records)**    | `{read: 'hash', write: 'round-robin'}`     | Excellent             | Perfect distribution | Optimal scaling       |
-| **Very Large (10M+ records)** | `{read: 'location', write: 'round-robin'}` | Regional optimization | Perfect distribution | Best for global scale |
-
-#### By Geographic Distribution
-
-| Geographic Spread | Best Mixed Strategy                     | Latency Improvement     | Use Case                        |
-| ----------------- | --------------------------------------- | ----------------------- | ------------------------------- |
-| **Single Region** | `{read: 'hash', write: 'hash'}`         | +5ms both operations    | Simple, fast                    |
-| **Multi-Region**  | `{read: 'hash', write: 'location'}`     | 15-35ms net improvement | Global apps                     |
-| **Global**        | `{read: 'location', write: 'location'}` | 20-40ms both operations | Maximum geographic optimization |
-
-#### By Workload Pattern
-
-| Workload Type   | Read/Write Ratio | Best Mixed Strategy                        | Primary Benefit                 |
-| --------------- | ---------------- | ------------------------------------------ | ------------------------------- |
-| **Read-Heavy**  | 90% reads        | `{read: 'random', write: 'location'}`      | Load-balanced queries           |
-| **Write-Heavy** | 70% writes       | `{read: 'location', write: 'hash'}`        | Fast write processing           |
-| **Balanced**    | 50/50            | `{read: 'hash', write: 'hash'}`            | Consistent performance          |
-| **Analytics**   | 95% reads        | `{read: 'location', write: 'round-robin'}` | Regional + perfect distribution |
-
-### SHA-256 Hashing Performance Impact
-
-CollegeDB uses SHA-256 hashing by default (`hashShardMappings: true`) to protect sensitive data in KV keys. This adds a small but measurable performance overhead:
-
-#### Hashing Performance Characteristics
-
-| Operation Type     | SHA-256 Overhead | Total Latency Impact | Security Benefit             |
-| ------------------ | ---------------- | -------------------- | ---------------------------- |
-| **Query (Read)**   | ~1-2ms           | 2-4% increase        | Keys hashed in KV storage    |
-| **Insert (Write)** | ~2-3ms           | 2-3% increase        | Multi-key mappings protected |
-| **Update Mapping** | ~1-3ms           | 1-2% increase        | Existing keys remain secure  |
-
-#### Performance by Key Length
-
-| Key Type                 | Example                        | Hash Time    | Recommendation          |
-| ------------------------ | ------------------------------ | ------------ | ----------------------- |
-| **Short keys**           | `user-123`                     | ~0.5-1ms     | Minimal impact          |
-| **Medium keys**          | `email:user@example.com`       | ~1-2ms       | Good balance            |
-| **Long keys**            | `session:very-long-token-here` | ~2-3ms       | Consider key shortening |
-| **Multi-key operations** | 3+ lookup keys                 | ~3-5ms total | Benefits outweigh cost  |
-
-#### Hashing vs No-Hashing Trade-offs
-
-```typescript
-// With hashing (default - recommended for production)
-const secureConfig = {
-	hashShardMappings: true // Default
-	// + Privacy: Sensitive data not visible in KV
-	// + Security: Keys cannot be enumerated
-	// - Performance: +1-3ms per operation
-	// - Debugging: Original keys not recoverable
-};
-
-// Without hashing (development/debugging only)
-const developmentConfig = {
-	hashShardMappings: false
-	// + Performance: No hashing overhead
-	// + Debugging: Original keys visible in KV
-	// - Privacy: Sensitive data exposed in KV keys
-	// - Security: Keys can be enumerated
-};
-```
-
-#### Optimization Recommendations
-
-1. **Keep keys reasonably short** - Hash time scales with key length
-2. **Use hashing in production** - Security benefits outweigh minimal performance cost
-3. **Disable hashing for development** - When debugging shard distribution
-4. **Monitor hash performance** - Track operation latencies in high-volume scenarios
-
-**Bottom Line**: SHA-256 hashing adds 1-3ms overhead but provides essential privacy and security benefits. The performance impact is minimal compared to network latency and D1 query time.
-
-### Real-World Scaling Benefits
-
-#### Database Size Limits
-
-- **Single D1**: Limited to D1's database size constraints
-- **CollegeDB**: Virtually unlimited through horizontal distribution
-- **Data per shard**: Scales inversely with shard count (1000 shards = 1/1000 data per shard)
-
-#### Geographic Distribution
-
-```typescript
-// Location-aware sharding reduces latency by 20-40ms
 initialize({
-  kv: env.KV,
-  strategy: 'location',
-  targetRegion: 'wnam', // Western North America
-  shardLocations: {
-    'db-west': { region: 'wnam', priority: 2 },    // Preferred
-    'db-east': { region: 'enam', priority: 1 },    // Secondary
-    'db-europe': { region: 'weur', priority: 0.5 } // Fallback
-  },
-  shards: { ... }
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+	strategy: 'hash',
+	onPhase: phases.observer
 });
+
+// ... run some queries, then read the breakdown
+console.table(phases.stats());
 ```
 
-#### Fault Tolerance
+`onPhase` costs nothing when unset. Timings use `performance.now()`, so sub-millisecond
+phases are visible; `Date.now()` reports every one of them as 0 or 1.
 
-- **Single D1**: Single point of failure
-- **CollegeDB**: Distributed failure isolation (failure of 1 shard affects only 1/N of data)
+### What Costs What
 
-### Cost-Performance Analysis
+Per routed operation, counted from the call graph rather than estimated:
 
-| Shards | D1 Costs\*\* | Performance Gain | Cost per Performance Unit |
-| ------ | ------------ | ---------------- | ------------------------- |
-| 1      | 1x           | 1x               | 1.00x                     |
-| 10     | 1.2x         | ~9x              | 0.13x                     |
-| 100    | 2.5x         | ~80x             | 0.03x                     |
-| 1000   | 15x          | ~700x            | 0.02x                     |
+| Path                        | KV reads | KV writes | SQL round trips |
+| --------------------------- | -------- | --------- | --------------- |
+| Warm mapping cache          | 0        | 0         | 1               |
+| Cold cache, mapping exists  | 1        | 0         | 1               |
+| Key not yet mapped, write   | 1        | 1         | 1               |
+| Key not yet mapped, read    | 1        | 0         | 1               |
+| `placement: 'computed'`     | 0        | 0         | 1               |
+| `nextId()`, sequence seeded | 0        | 0         | 0               |
+| `nextId()`, first call      | 0        | 0         | N               |
+| `batch()` of M statements   | 0        | up to M   | one per shard   |
+| `paginate()`                | 0        | 0         | N               |
 
-\*\*Estimated based on D1's pricing model including KV overhead
+`N` is the shard count. A read that finds no row no longer writes a mapping; set
+`allocateOnRead: true` to restore the old behavior.
+
+### Platform Limits
+
+Cloudflare's own published limits shape what a deployment can do, independent of CollegeDB:
+
+- [Workers KV](https://developers.cloudflare.com/kv/platform/limits/) allows 1,000 writes per day
+  on the free plan. One new primary key costs one KV write, so `placement: 'computed'` is the
+  difference between a bounded and an unbounded number of new keys per day there.
+- [D1](https://developers.cloudflare.com/d1/platform/limits/) allows 1,000 queries per Worker
+  invocation on the paid plan and 50 on the free plan. Use `batch()` for bulk writes; one
+  statement per row exceeds the free limit at 50 rows.
+- [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/)
+  helps when a request makes several sequential queries and the shards sit in one region.
+  Cloudflare puts the per-query difference at 20-30 ms from a distant region against 1-3 ms when
+  placed nearby. It does not help a one-query request or a genuinely geo-distributed shard set.
+
+### Fault Tolerance
+
+A single database is a single point of failure. Across N shards, losing one affects 1/N of the
+data, and `firstResilient` falls back to a cross-shard scan when a routed read comes up empty.
 
 ### When to Use CollegeDB
 
-✅ **Recommended for:**
+Worth it for:
 
-- High-traffic applications (>1000 QPS)
-- Large datasets approaching D1 limits
-- Geographic distribution requirements
-- Applications needing >50 concurrent operations
-- Systems requiring fault tolerance
+- Datasets approaching a single database's size or throughput limits
+- Write throughput beyond what one instance sustains
+- Geographic placement of data
+- Isolating failures to a fraction of the dataset
 
-✅ **Mixed Strategy specifically recommended for:**
+Not worth it for:
 
-- **Global applications** needing both fast queries and optimal data placement
-- **Large-scale databases** requiring different optimization for reads vs writes
-- **Multi-workload systems** with distinct read/write patterns
-- **Geographic optimization** while maintaining query performance
-- **Enterprise applications** needing fine-tuned performance control
-
-❌ **Not recommended for:**
-
-- Small applications (<100 QPS)
-- Simple CRUD operations with minimal scale
-- Applications without geographic spread
-- Cost-sensitive deployments at small scale
-- **Single-strategy applications** where reads and writes have identical performance needs
+- Small datasets served fine by one database
+- Workloads that mostly run cross-shard queries, which fan out to every shard
+- Tables whose primary key is a database-generated sequence and which must span shards, unless
+  ids come from `nextId()`
 
 ## Advanced Configuration
 
@@ -2951,7 +2827,7 @@ export default {
 
 #### ShardCoordinator HTTP API
 
-The ShardCoordinator exposes a comprehensive HTTP API for managing shards and allocation:
+The ShardCoordinator exposes an HTTP API for managing shards and allocation:
 
 ##### Shard Management
 
@@ -3071,7 +2947,7 @@ await coordinator.decrementShardCount('db-west');
 
 #### Advanced Monitoring Setup
 
-Set up comprehensive monitoring of your shard distribution:
+Monitor your shard distribution:
 
 ```typescript
 async function monitorShardHealth(env: Env) {

@@ -29,7 +29,7 @@
  * workloads should always run against real D1/Postgres/MySQL/SQLite shards
  * via the adapters in `providers.ts`.
  *
- * @author CollegeDB Team
+ * @author Gregory Mitchell
  * @since 1.2.0
  */
 

@@ -98,14 +98,21 @@ describe('Router utility helpers', () => {
 			await east.prepare(SEQ_SCHEMA).run();
 			await west.prepare(SEQ_SCHEMA).run();
 
+			// Mirrors ShardCoordinator.handleSequence: a `requireExisting` request is
+			// only answered once the sequence has been seeded.
 			const counters = new Map<string, number>();
-			const requests: Array<{ name: string; min?: number }> = [];
+			const requests: Array<{ name: string; min?: number; requireExisting?: boolean }> = [];
 			const coordinator = {
 				idFromName: () => 'default',
 				get: () => ({
 					async fetch(_url: string, init: { body: string }) {
-						const body = JSON.parse(init.body) as { name: string; min?: number };
+						const body = JSON.parse(init.body) as { name: string; min?: number; requireExisting?: boolean };
 						requests.push(body);
+
+						if (body.requireExisting && !counters.has(body.name)) {
+							return new Response(JSON.stringify({ needsSeed: true }), { status: 200 });
+						}
+
 						const current = counters.get(body.name) ?? 0;
 						const next = Math.max(current + 1, body.min ?? 0);
 						counters.set(body.name, next);
@@ -127,7 +134,14 @@ describe('Router utility helpers', () => {
 			const second = await nextId('seq_items');
 			expect(first).toBe(1);
 			expect(second).toBe(2);
-			expect(requests[0]).toEqual({ name: 'seq_items', min: 1 });
+
+			// First id seeds: probe, then seed with the cross-shard maximum.
+			expect(requests[0]).toEqual({ name: 'seq_items', requireExisting: true });
+			expect(requests[1]).toEqual({ name: 'seq_items', min: 1 });
+
+			// Every later id is answered by the probe alone, so no shard is queried.
+			expect(requests[2]).toEqual({ name: 'seq_items', requireExisting: true });
+			expect(requests).toHaveLength(3);
 		});
 	});
 

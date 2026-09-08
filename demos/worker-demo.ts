@@ -1,19 +1,16 @@
 /**
  * @fileoverview Cloudflare Worker Demo for CollegeDB
  *
- * This comprehensive demo implements a production-ready Cloudflare Worker that
- * showcases all CollegeDB features in a real-world API service. It demonstrates
- * best practices for error handling, routing, authentication, and scalable
- * architecture patterns.
+ * A Cloudflare Worker exposing CollegeDB through a small REST API, with error
+ * handling, schema initialization, and admin endpoints for monitoring.
  *
  * Features demonstrated:
- * - Complete REST API implementation
- * - Production-grade error handling and logging
+ * - REST API over routed CRUD
+ * - Error handling and logging
  * - Automatic schema initialization
  * - Multi-endpoint routing with HTTP methods
  * - JSON request/response handling
  * - Administrative endpoints for monitoring
- * - Proper TypeScript typing throughout
  *
  * API Endpoints:
  * - `GET /users/:id` - Get user by ID
@@ -201,7 +198,7 @@ function handleHome(): Response {
 </head>
 <body>
     <h1>🎓 CollegeDB Demo API</h1>
-    <p>A sharded database router for Cloudflare D1 using KV for primary key mapping.</p>
+    <p>A sharded database router that maps primary keys to shards.</p>
 
     <h2>🚀 Quick Start</h2>
     <div class="endpoint">

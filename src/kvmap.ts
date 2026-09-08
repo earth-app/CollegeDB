@@ -2,7 +2,7 @@
  * @fileoverview KV-based shard mapping implementation for CollegeDB
  *
  * This module provides the KVShardMapper class that uses Cloudflare KV storage
- * to maintain mappings between primary keys and their assigned D1 database shards.
+ * to maintain mappings between primary keys and their assigned shards.
  * It handles the persistence and retrieval of shard assignments, enabling the
  * database router to consistently route queries to the correct shard.
  *
@@ -119,7 +119,7 @@ async function runWithConcurrency<T>(items: T[], concurrency: number, work: (ite
 
 /**
  * The KVShardMapper class provides a persistent storage layer for mapping
- * primary keys to their assigned D1 database shards. It uses Cloudflare KV
+ * primary keys to their assigned shards. It uses the configured key-value store
  * for global, eventually consistent storage with low latency reads.
  *
  * Features:
@@ -194,18 +194,27 @@ export class KVShardMapper {
 	private readonly knownShardsCacheTtlMs: number;
 
 	/**
+	 * Whether a mapping miss also probes the legacy multi-key record.
+	 * @private
+	 */
+	private readonly legacyMultiKeyLookup: boolean;
+
+	/**
 	 * Creates a new KVShardMapper instance
 	 * @param kv - KV storage provider
 	 * @param config - Configuration options including hashing preference
 	 */
 	constructor(
 		kv: KVStorage,
-		config: Partial<Pick<CollegeDBConfig, 'hashShardMappings' | 'mappingCacheTtlMs' | 'knownShardsCacheTtlMs'>> = {}
+		config: Partial<
+			Pick<CollegeDBConfig, 'hashShardMappings' | 'mappingCacheTtlMs' | 'knownShardsCacheTtlMs' | 'legacyMultiKeyLookup'>
+		> = {}
 	) {
 		this.kv = kv;
 		this.hashKeys = config.hashShardMappings ?? true; // Default to true for security
 		this.mappingCacheTtlMs = config.mappingCacheTtlMs ?? DEFAULT_MAPPING_CACHE_TTL_MS;
 		this.knownShardsCacheTtlMs = config.knownShardsCacheTtlMs ?? DEFAULT_KNOWN_SHARDS_CACHE_TTL_MS;
+		this.legacyMultiKeyLookup = config.legacyMultiKeyLookup ?? false;
 	}
 
 	/**
@@ -277,6 +286,29 @@ export class KVShardMapper {
 	}
 
 	/**
+	 * Drops the in-memory cache entry for a key so the next read goes to KV.
+	 *
+	 * `mappingCacheTtlMs` is a consistency window, not just a latency knob: until
+	 * it expires, this process keeps routing a key to the shard it last saw.
+	 * Reassignment calls this so the process that performed it is correct
+	 * immediately; other processes still see the old shard until their own entry
+	 * expires.
+	 *
+	 * @param key - Logical key whose cached mapping should be discarded
+	 * @since 1.4.0
+	 */
+	invalidateCachedMapping(key: string): void {
+		const hashed = this.hashCache.get(key);
+		if (hashed) {
+			this.mappingCache.delete(hashed);
+		}
+
+		if (!this.hashKeys) {
+			this.mappingCache.delete(key);
+		}
+	}
+
+	/**
 	 * Hashes a key using SHA-256 if hashing is enabled
 	 * @param key - The key to hash
 	 * @returns The hashed key or original key if hashing is disabled
@@ -340,6 +372,15 @@ export class KVShardMapper {
 		if (singleMapping) {
 			this.setCachedMapping(hashedKey, singleMapping);
 			return singleMapping;
+		}
+
+		// Every writer since 1.0.3 stores a single-key record for each lookup key
+		// alongside the multi-key record, so this second read cannot succeed for
+		// anything this version wrote and would double the cost of every true
+		// miss. It stays available for mappings written before that.
+		if (!this.legacyMultiKeyLookup) {
+			this.setCachedMapping(hashedKey, null);
+			return null;
 		}
 
 		// Try multi-key mapping lookup
