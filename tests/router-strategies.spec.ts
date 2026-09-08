@@ -1,15 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { cached, invalidate } from '../src/cache';
+import { KVShardMapper } from '../src/kvmap';
 import { hrwShard } from '../src/placement';
 import { createInMemoryKVProvider, createInMemorySQLProvider } from '../src/providers-memory';
 import {
 	allAllShardsGlobal,
 	batch,
+	countAllShards,
+	countShard,
 	first,
 	getDatabaseSizesAllShards,
+	indexAllShards,
 	initialize,
 	insert,
+	insertInto,
 	insertShard,
+	invalidateMappingCache,
 	nextId,
 	query,
 	queryAll,
@@ -234,6 +240,21 @@ describe('Generated id extraction', () => {
 		await expect(insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Grace'])).rejects.toThrow(
 			/already mapped to shard db-a/
 		);
+	});
+
+	it('does not read the mapping to rule out a collision on a single shard', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards(['db-a']);
+
+		initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false });
+		await runShard('db-a', 'CREATE TABLE auto_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)');
+
+		const before = counts.get;
+		await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Ada']);
+
+		// One shard has no second sequence, so there is no collision to detect and
+		// the guard's KV read would be spent proving something already known.
+		expect(counts.get).toBe(before);
 	});
 
 	it('accepts repeated generated ids when they stay on one shard', async () => {
@@ -717,6 +738,47 @@ describe('Computed placement', () => {
 		expect(Number(onTarget.results[0]?.c ?? 0)).toBe(1);
 	});
 
+	it('finds keys placed under the previous topology after a shard is added', async () => {
+		const { kv, shards: original } = await setupComputed();
+		const names = Object.keys(original);
+
+		for (let i = 0; i < 30; i++) {
+			const key = `user-${i}`;
+			await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, `User ${i}`]);
+		}
+
+		// Growing the cluster moves roughly 1/m of the keyspace, so for those keys
+		// the newest epoch computes a shard that has no row. They stay reachable
+		// only by walking back through the epoch that placed them, which is the
+		// path a single-candidate shortcut must not swallow.
+		const shards = { ...original, ...(await makeShards(['db-d'])) };
+
+		initialize({
+			kv,
+			shards,
+			strategy: 'hash',
+			placement: 'computed',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+		await runShard('db-d', SCHEMA);
+
+		let relocated = 0;
+		for (let i = 0; i < 30; i++) {
+			const key = `user-${i}`;
+			if (hrwShard(key, [...names, 'db-d']) !== hrwShard(key, names)) {
+				relocated++;
+			}
+
+			expect(await first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key])).toMatchObject({
+				name: `User ${i}`
+			});
+		}
+
+		// A test that relocated nothing would pass without exercising the walk.
+		expect(relocated).toBeGreaterThan(0);
+	});
+
 	it('falls back to KV for strategies that are not functions of the key', async () => {
 		const { kv, counts } = countingKV(createInMemoryKVProvider());
 		const shards = await makeShards(['db-a', 'db-b']);
@@ -760,5 +822,314 @@ describe('Computed placement', () => {
 		expect(result.moved).toBe(0);
 		expect(result.failed).toEqual([]);
 		expect(result.agreed).toBe(result.examined);
+	});
+});
+
+describe('Generated SQL respects each shard dialect', () => {
+	afterEach(() => {
+		resetConfig();
+	});
+
+	/** Records the SQL a shard is asked to prepare, and reports a dialect. */
+	function recordingShard(dialect: 'sqlite' | 'postgres' | 'mysql' | undefined) {
+		const asked: string[] = [];
+		const inner = createInMemorySQLProvider();
+
+		const shard: SQLDatabase = {
+			dialect,
+			prepare(sql: string) {
+				asked.push(sql);
+				return inner.prepare(sql);
+			}
+		};
+
+		return { shard, asked };
+	}
+
+	it('quotes with backticks on a MySQL shard and double quotes elsewhere', async () => {
+		const mysql = recordingShard('mysql');
+		const postgres = recordingShard('postgres');
+
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'db-mysql': mysql.shard, 'db-postgres': postgres.shard },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-mysql', SCHEMA);
+		await runShard('db-postgres', SCHEMA);
+
+		// Pick a key per shard so each dialect is exercised through the routed path.
+		const forMysql = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'].find((k) => hrwShard(k, ['db-mysql', 'db-postgres']) === 'db-mysql')!;
+		const forPostgres = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'].find((k) => hrwShard(k, ['db-mysql', 'db-postgres']) === 'db-postgres')!;
+
+		mysql.asked.length = 0;
+		postgres.asked.length = 0;
+
+		await insertInto(forMysql, 'users', { id: forMysql, name: 'Ada' });
+		await insertInto(forPostgres, 'users', { id: forPostgres, name: 'Grace' });
+
+		expect(mysql.asked.some((sql) => sql.includes('INSERT INTO `users` (`id`, `name`)'))).toBe(true);
+		expect(mysql.asked.every((sql) => !sql.includes('"users"'))).toBe(true);
+		expect(postgres.asked.some((sql) => sql.includes('INSERT INTO "users" ("id", "name")'))).toBe(true);
+	});
+
+	it('builds a MySQL-safe cross-shard MAX for nextId', async () => {
+		const mysql = recordingShard('mysql');
+
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'db-mysql': mysql.shard },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-mysql', 'CREATE TABLE seq_items (id INTEGER PRIMARY KEY, title TEXT)');
+		mysql.asked.length = 0;
+
+		await nextId('seq_items');
+
+		// The sandbox surfaced this as a MySQL syntax error on `SELECT MAX("id")
+		// AS max_value FROM "seq_items"`.
+		const max = mysql.asked.find((sql) => sql.includes('MAX('));
+		expect(max).toBe('SELECT MAX(`id`) AS max_value FROM `seq_items`');
+	});
+
+	it('builds MySQL-safe count, index, and paginated statements', async () => {
+		const mysql = recordingShard('mysql');
+
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'db-mysql': mysql.shard },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-mysql', SCHEMA);
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+		mysql.asked.length = 0;
+		await countShard('db-mysql', 'users');
+		await countAllShards('users');
+		await indexAllShards('users', 'name');
+		await allAllShardsGlobal('SELECT * FROM users', [], { sortBy: 'name', limit: 5 });
+
+		// Nothing generated for a MySQL shard may carry ANSI double quotes.
+		const offenders = mysql.asked.filter((sql) => sql.includes('"'));
+		expect(offenders).toEqual([]);
+		expect(mysql.asked.some((sql) => sql.includes('COUNT(*) AS row_count FROM `users`'))).toBe(true);
+		expect(mysql.asked.some((sql) => sql.includes('ON `users` (`name`)'))).toBe(true);
+		expect(mysql.asked.some((sql) => sql.includes('ORDER BY `name` ASC LIMIT 5'))).toBe(true);
+	});
+
+	it('quotes per shard when one cluster mixes vendors', async () => {
+		// The cross-shard helpers resolve the quoted table once when every shard
+		// agrees on a dialect, which is the case that made the per-call rebuild
+		// worth removing. A cluster that disagrees has to keep quoting per shard,
+		// and this is the only thing that proves that branch still runs.
+		const mysql = recordingShard('mysql');
+		const postgres = recordingShard('postgres');
+
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'db-mysql': mysql.shard, 'db-postgres': postgres.shard },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-mysql', SCHEMA);
+		await runShard('db-postgres', SCHEMA);
+		mysql.asked.length = 0;
+		postgres.asked.length = 0;
+
+		await countAllShards('users');
+		await indexAllShards('users', 'name');
+
+		expect(mysql.asked.every((sql) => !sql.includes('"'))).toBe(true);
+		expect(postgres.asked.every((sql) => !sql.includes('`'))).toBe(true);
+		expect(mysql.asked.some((sql) => sql.includes('COUNT(*) AS row_count FROM `users`'))).toBe(true);
+		expect(postgres.asked.some((sql) => sql.includes('COUNT(*) AS row_count FROM "users"'))).toBe(true);
+		expect(mysql.asked.some((sql) => sql.includes('ON `users` (`name`)'))).toBe(true);
+		expect(postgres.asked.some((sql) => sql.includes('ON "users" ("name")'))).toBe(true);
+	});
+
+	it('falls back to double quotes when a provider reports no dialect', async () => {
+		const unknown = recordingShard(undefined);
+
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards: { 'db-unknown': unknown.shard },
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+
+		await runShard('db-unknown', SCHEMA);
+		unknown.asked.length = 0;
+
+		await insertInto('user-1', 'users', { id: 'user-1', name: 'Ada' });
+		expect(unknown.asked.some((sql) => sql.includes('INSERT INTO "users" ("id", "name")'))).toBe(true);
+	});
+});
+
+describe('Repeated initialization', () => {
+	afterEach(() => {
+		resetConfig();
+	});
+
+	it('keeps the mapping cache across identical initialize calls', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards();
+		const config = {
+			kv,
+			shards,
+			strategy: 'hash' as const,
+			disableAutoMigration: true,
+			hashShardMappings: false,
+			mappingCacheTtlMs: 60_000
+		};
+
+		initialize(config);
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+		counts.get = 0;
+
+		// The documented Workers pattern re-initializes on every request. Building
+		// a fresh mapper each time threw the mapping cache away, which made
+		// mappingCacheTtlMs dead there: every routed read paid a KV round trip.
+		for (let i = 0; i < 5; i++) {
+			initialize(config);
+			expect(await first<{ name: string }>('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1'])).toMatchObject({ name: 'Ada' });
+		}
+
+		expect(counts.get).toBe(0);
+	});
+
+	it('registers known shards once per shard set, not once per call', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards();
+		const config = { kv, shards, strategy: 'hash' as const, disableAutoMigration: true, hashShardMappings: false };
+
+		initialize(config);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		const afterFirst = counts.put;
+		for (let i = 0; i < 10; i++) {
+			initialize(config);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(counts.put).toBe(afterFirst);
+	});
+
+	it('builds a fresh mapper when the KV store or the shards change', async () => {
+		const shards = await makeShards();
+		const firstKv = countingKV(createInMemoryKVProvider());
+
+		initialize({ kv: firstKv.kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+		// A different KV store must not inherit the previous mapper's cache.
+		const secondKv = countingKV(createInMemoryKVProvider());
+		initialize({ kv: secondKv.kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false });
+
+		secondKv.counts.get = 0;
+		await first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
+		expect(secondKv.counts.get).toBeGreaterThan(0);
+	});
+
+	it('rebuilds placement state when the strategy changes', async () => {
+		const kv = createInMemoryKVProvider();
+		const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+		const base = { kv, shards, disableAutoMigration: true, hashShardMappings: false };
+
+		initialize({ ...base, strategy: 'hash' });
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+		await run('k-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['k-1', 'Ada']);
+
+		// The strategy benchmark re-initializes per cell with the same bindings but
+		// a different strategy, so a cached placement decision cannot carry over.
+		initialize({ ...base, strategy: 'round-robin' });
+		for (let i = 0; i < 6; i++) {
+			await run(`rr-${i}`, 'INSERT INTO users (id, name) VALUES (?, ?)', [`rr-${i}`, `User ${i}`]);
+		}
+
+		const perShard = await Promise.all(
+			Object.keys(shards).map(async (name) => {
+				const result = await runShard<{ c: number }>(name, "SELECT COUNT(*) AS c FROM users WHERE id LIKE 'rr-%'");
+				return Number(result.results[0]?.c ?? 0);
+			})
+		);
+
+		expect(perShard.sort()).toEqual([2, 2, 2]);
+	});
+});
+
+describe('Out-of-band mapping changes', () => {
+	afterEach(() => {
+		resetConfig();
+	});
+
+	it('sees a mapping changed through a separate mapper once invalidated', async () => {
+		const kv = createInMemoryKVProvider();
+		const shards = await makeShards();
+		const config = {
+			kv,
+			shards,
+			strategy: 'hash' as const,
+			disableAutoMigration: true,
+			hashShardMappings: true,
+			mappingCacheTtlMs: 60_000
+		};
+
+		initialize(config);
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+		const mapper = new KVShardMapper(kv, { hashShardMappings: true });
+		const source = (await mapper.getShardMapping('user-1'))!.shard;
+		const target = source === 'db-a' ? 'db-b' : 'db-a';
+
+		// Move the row and the mapping without going through reassignShard.
+		await runShard(target, 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+		await runShard(source, 'DELETE FROM users WHERE id = ?', ['user-1']);
+		await mapper.updateShardMapping('user-1', target);
+
+		// Still cached, so this process routes to the shard the row just left.
+		expect(await first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1'])).toBeNull();
+
+		await invalidateMappingCache('user-1');
+		expect(await first<{ name: string }>('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1'])).toMatchObject({ name: 'Ada' });
+	});
+
+	it('clears every cached mapping when called with no key', async () => {
+		const kv = createInMemoryKVProvider();
+		const shards = await makeShards();
+		const config = { kv, shards, strategy: 'hash' as const, disableAutoMigration: true, hashShardMappings: true };
+
+		initialize(config);
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+		await expect(invalidateMappingCache()).resolves.toBeUndefined();
+		expect(await first<{ name: string }>('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1'])).toMatchObject({ name: 'Ada' });
 	});
 });

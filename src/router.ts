@@ -63,6 +63,7 @@ import {
 	buildInsert,
 	buildUpdate,
 	buildUpsert,
+	validateIdentifier,
 	type BuildInsertOptions,
 	type BuildUpsertOptions,
 	type ColumnValues
@@ -76,6 +77,7 @@ import type {
 	PreparedStatement,
 	QueryResult,
 	SQLDatabase,
+	SQLDialect,
 	ShardLocation,
 	ShardStats,
 	ShardingStrategy
@@ -118,6 +120,15 @@ let generatedInsertRoundRobinIndex = 0;
  * @private
  */
 let placementDecision: { mode: 'computed' | 'kv'; manifest: PlacementManifest | null } | null = null;
+
+/**
+ * Shard sets whose known-shard registration has already been done in this
+ * process, so calling {@link initialize} per request costs nothing after the
+ * first call.
+ *
+ * @private
+ */
+const syncedShardSets = new Set<string>();
 
 /**
  * Gets the shared mapper for the active configuration.
@@ -174,6 +185,17 @@ function getMapper(config: CollegeDBConfig): KVShardMapper {
  */
 export function initialize(config: CollegeDBConfig) {
 	const active = applyConfig(config);
+	const fingerprint = shardSetFingerprint(active);
+
+	// The documented Workers pattern calls initialize on every request, so this
+	// bookkeeping runs per request unless it is memoized. Registering the same
+	// shard set again is a KV read plus a KV write that changes nothing, and it
+	// is now awaited through waitUntil rather than silently cancelled, so the
+	// cost is real. Skip it once the set has been registered.
+	if (syncedShardSets.has(fingerprint)) {
+		return;
+	}
+	syncedShardSets.add(fingerprint);
 
 	// Background: sync KV known shards with configured shards
 	try {
@@ -186,9 +208,15 @@ export function initialize(config: CollegeDBConfig) {
 					const merged = Array.from(new Set([...existing, ...Object.keys(active.shards)]));
 					await mapper.setKnownShards(merged);
 				})
-				.catch(() => void 0)
+				.catch(() => {
+					// Let a later initialize retry rather than leaving the set
+					// recorded as synced when it never was.
+					syncedShardSets.delete(fingerprint);
+				})
 		);
-	} catch {}
+	} catch {
+		syncedShardSets.delete(fingerprint);
+	}
 
 	if (active.shards && Object.keys(active.shards).length > 0 && !active.disableAutoMigration) {
 		track(
@@ -198,6 +226,14 @@ export function initialize(config: CollegeDBConfig) {
 			})
 		);
 	}
+}
+
+/**
+ * Identifies a configuration by the shard set its bookkeeping depends on.
+ * @private
+ */
+function shardSetFingerprint(config: CollegeDBConfig): string {
+	return Object.keys(config.shards).sort().join('\u0000');
 }
 
 /**
@@ -223,19 +259,86 @@ function applyConfig(config: CollegeDBConfig): CollegeDBConfig {
 		active = { ...config, kv: instrumentKV(config.kv), shards };
 	}
 
+	// Reconfiguring with the same bindings and options keeps the existing mapper,
+	// so its mapping and hash caches survive. Rebuilding it every time made
+	// `mappingCacheTtlMs` dead on Workers, where the documented pattern calls
+	// initialize once per request: every routed read paid a KV round trip no
+	// matter how recently the same key had been resolved.
+	//
+	// The mapper's caches are keyed by primary key and do not depend on the
+	// allocation strategy, so they survive a strategy change. Placement state
+	// does depend on it, and is rebuilt whenever the strategy or the shard set
+	// moves.
+	const previous = globalConfig;
+	const reuseMapper = globalMapper !== null && previous !== null && isSameMapperConfig(previous, active);
+	const reusePlacement = reuseMapper && previous !== null && isSamePlacementConfig(previous, active);
+
 	globalConfig = active;
-	globalMapper = new KVShardMapper(active.kv, {
-		hashShardMappings: active.hashShardMappings,
-		mappingCacheTtlMs: active.mappingCacheTtlMs,
-		knownShardsCacheTtlMs: active.knownShardsCacheTtlMs,
-		legacyMultiKeyLookup: active.legacyMultiKeyLookup
-	});
-	shardSizeCache.clear();
-	generatedInsertRoundRobinIndex = 0;
-	resetPlacementState();
-	placementDecision = null;
+
+	if (!reuseMapper) {
+		globalMapper = new KVShardMapper(active.kv, {
+			hashShardMappings: active.hashShardMappings,
+			mappingCacheTtlMs: active.mappingCacheTtlMs,
+			knownShardsCacheTtlMs: active.knownShardsCacheTtlMs,
+			legacyMultiKeyLookup: active.legacyMultiKeyLookup
+		});
+	}
+
+	if (!reusePlacement) {
+		shardSizeCache.clear();
+		generatedInsertRoundRobinIndex = 0;
+		resetPlacementState();
+		placementDecision = null;
+	}
 
 	return active;
+}
+
+/**
+ * Whether two configurations can share one {@link KVShardMapper}.
+ *
+ * Compares the KV store and the shard providers by identity rather than by
+ * name, so a test that builds fresh in-memory providers always gets a fresh
+ * mapper while a Worker re-initializing with the same bindings keeps its caches.
+ *
+ * @private
+ */
+function isSameMapperConfig(left: CollegeDBConfig, right: CollegeDBConfig): boolean {
+	if (
+		left.kv !== right.kv ||
+		left.hashShardMappings !== right.hashShardMappings ||
+		left.mappingCacheTtlMs !== right.mappingCacheTtlMs ||
+		left.knownShardsCacheTtlMs !== right.knownShardsCacheTtlMs ||
+		left.legacyMultiKeyLookup !== right.legacyMultiKeyLookup
+	) {
+		return false;
+	}
+
+	const leftBindings = Object.keys(left.shards);
+	const rightBindings = Object.keys(right.shards);
+	if (leftBindings.length !== rightBindings.length) {
+		return false;
+	}
+
+	return leftBindings.every((binding) => left.shards[binding] === right.shards[binding]);
+}
+
+/**
+ * Whether two configurations resolve placement identically.
+ *
+ * Placement depends on the strategy and the target region as well as the shard
+ * set, so a cached decision cannot outlive a change to any of them.
+ *
+ * @private
+ */
+function isSamePlacementConfig(left: CollegeDBConfig, right: CollegeDBConfig): boolean {
+	return (
+		left.placement === right.placement &&
+		left.targetRegion === right.targetRegion &&
+		left.maxDatabaseSize === right.maxDatabaseSize &&
+		JSON.stringify(left.strategy ?? null) === JSON.stringify(right.strategy ?? null) &&
+		JSON.stringify(left.shardLocations ?? null) === JSON.stringify(right.shardLocations ?? null)
+	);
 }
 
 /**
@@ -420,6 +523,7 @@ export function resetConfig(): void {
 	ensuredSchemaFingerprints.clear();
 	resetPlacementState();
 	placementDecision = null;
+	syncedShardSets.clear();
 	setPhaseObserver(null);
 }
 
@@ -1253,8 +1357,11 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
  */
 async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<SQLDatabase> {
 	const config = getConfig();
-	const candidates = await resolveCandidates(primaryKey, operationType);
-	const shard = candidates[0]!;
+	const decision = placementDecision ?? (await resolvePlacement(config));
+	const shard =
+		decision.mode === 'computed' && decision.manifest
+			? (await resolveCandidates(primaryKey, operationType))[0]!
+			: await getShardForKey(primaryKey, operationType);
 	const database = config.shards[shard];
 
 	if (!database) {
@@ -1323,7 +1430,24 @@ async function readAcrossCandidates<T>(
 	isEmpty: (value: T) => boolean
 ): Promise<T> {
 	const config = getConfig();
-	const candidates = await resolveCandidates(key, getOperationType(sql));
+	const operationType = getOperationType(sql);
+
+	// KV placement resolves to exactly one shard, which is the steady state for
+	// every deployment that has not opted into computed placement. Taking it
+	// here skips the candidate array, the epoch walk and the empty-result
+	// bookkeeping below, none of which can do anything with one candidate.
+	const decision = placementDecision ?? (await resolvePlacement(config));
+	if (decision.mode !== 'computed' || !decision.manifest) {
+		const binding = await getShardForKey(key, operationType);
+		const database = config.shards[binding];
+		if (!database) {
+			throw new CollegeDBError(`Shard ${binding} not found in configuration`, 'SHARD_NOT_FOUND');
+		}
+
+		return await execute(database);
+	}
+
+	const candidates = await resolveCandidates(key, operationType);
 
 	let firstResult: T | undefined;
 
@@ -1572,7 +1696,11 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 	// and so on. Storing the second mapping would overwrite the first and leave
 	// the earlier row on a shard nothing routes to. Refusing here turns silent
 	// unreachability into an error at the point the collision happens.
-	const existing = await mapper.getShardMapping(idKey);
+	//
+	// One shard has no second sequence to collide with, so the lookup is skipped
+	// there rather than spending a KV read per insert to rule out a collision
+	// that cannot occur.
+	const existing = Object.keys(config.shards).length > 1 ? await mapper.getShardMapping(idKey) : null;
 	if (existing && existing.shard !== shardBinding) {
 		throw new CollegeDBError(
 			`Generated id ${idKey} is already mapped to shard ${existing.shard}, but this insert ran on ${shardBinding}. ` +
@@ -1849,6 +1977,41 @@ export async function firstByLookupKey<T = Record<string, unknown>>(
 }
 
 /**
+ * Drops cached shard mappings so the next read resolves them from KV again.
+ *
+ * CollegeDB caches a key's shard in memory for `mappingCacheTtlMs`, which makes
+ * that TTL a staleness window: a mapping changed elsewhere, by another isolate
+ * or by a {@link KVShardMapper} built directly, is not visible here until the
+ * entry expires. {@link reassignShard} already clears what it changes, so this
+ * is for changes made outside CollegeDB's own routing.
+ *
+ * Re-running {@link initialize} is not a substitute. It reuses the existing
+ * mapper when the bindings and options are unchanged, precisely so the cache
+ * survives the per-request initialization the Workers examples use.
+ *
+ * @param key - Logical key to drop, or omit to drop every cached mapping
+ * @throws {CollegeDBError} If CollegeDB is not initialized
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const mapper = new KVShardMapper(env.KV, { hashShardMappings: true });
+ * await mapper.updateShardMapping('user-123', 'db-west');
+ *
+ * invalidateMappingCache('user-123'); // this process now reads the new shard
+ * ```
+ */
+export async function invalidateMappingCache(key?: string): Promise<void> {
+	const mapper = getMapper(getConfig());
+
+	if (key === undefined) {
+		mapper.clearMappingCache();
+		return;
+	}
+
+	await mapper.invalidateCachedMapping(key);
+}
+
+/**
  * Reassigns a primary key to a different shard
  *
  * Moves a primary key and its associated data from one shard to another. This
@@ -1938,7 +2101,7 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 	// is not handed the shard it has just been moved off.
 	await forgetCoordinatorAllocation(config, primaryKey);
 
-	mapper.invalidateCachedMapping(primaryKey);
+	await mapper.invalidateCachedMapping(primaryKey);
 }
 
 /**
@@ -2333,6 +2496,67 @@ export async function allAllShards<T = Record<string, unknown>>(
 }
 
 /**
+ * Runs an all-shards query whose SQL is built per shard.
+ *
+ * `allAllShards` takes one statement for every shard, which cannot be right
+ * when the shards are different backends: a generated statement has to quote
+ * identifiers the way its own target expects. This builds the statement once
+ * per shard from that shard's dialect.
+ *
+ * @private
+ */
+async function allAllShardsBuilt<T = Record<string, unknown>>(
+	build: (dialect: SQLDialect | undefined) => string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<QueryResult<T>[]> {
+	const config = getConfig();
+	const tasks: Array<() => Promise<QueryResult<T>>> = [];
+
+	// One statement per distinct dialect rather than one per shard. A cluster
+	// that does not mix vendors builds it once.
+	const byDialect = new Map<SQLDialect | undefined, string>();
+	const statementFor = (dialect: SQLDialect | undefined): string => {
+		let sql = byDialect.get(dialect);
+		if (sql === undefined) {
+			sql = build(dialect);
+			byDialect.set(dialect, sql);
+		}
+		return sql;
+	};
+
+	for (const [binding, db] of Object.entries(config.shards)) {
+		if (!binding || !db) {
+			console.error(`Shard ${binding ?? '<null>'} not found, skipping`);
+			continue;
+		}
+
+		tasks.push(() =>
+			db
+				.prepare(statementFor(db.dialect))
+				.bind(...bindings)
+				.all<T>()
+				.catch((error) => {
+					console.error(`Error executing query on shard ${binding}:`, error);
+					return {
+						success: false,
+						results: [],
+						error: error instanceof Error ? error.message : String(error),
+						meta: { duration: 0 }
+					} satisfies QueryResult<T>;
+				})
+		);
+	}
+
+	const out: QueryResult<T>[] = [];
+	for (let i = 0; i < tasks.length; i += batchSize) {
+		out.push(...(await Promise.all(tasks.slice(i, i + batchSize).map((fn) => fn()))));
+	}
+
+	return out;
+}
+
+/**
  * Options for global all-shards merge/sort/pagination.
  * @since 1.1.4
  */
@@ -2357,6 +2581,34 @@ export interface GlobalAllShardsOptions<T = Record<string, unknown>> {
 	 * @since 1.2.4
 	 */
 	includeTotal?: boolean;
+}
+
+/**
+ * Returns a function that quotes `table` for a given shard.
+ *
+ * MySQL and MariaDB reject ANSI double quotes, so a cross-shard helper has to
+ * quote per shard rather than once. Almost no cluster actually mixes vendors,
+ * so the quoted form is resolved once here and the per-shard branch only runs
+ * for the clusters that need it.
+ *
+ * @private
+ */
+function tableQuoter(config: CollegeDBConfig, table: string): (db: SQLDatabase) => string {
+	let dialect: SQLDialect | undefined;
+	let seen = false;
+
+	for (const db of Object.values(config.shards)) {
+		if (!db) continue;
+		if (!seen) {
+			dialect = db.dialect;
+			seen = true;
+		} else if (db.dialect !== dialect) {
+			return (shard) => quoteIdentifier(table, shard.dialect);
+		}
+	}
+
+	const quoted = quoteIdentifier(table, dialect);
+	return () => quoted;
 }
 
 function normalizeBatchSize(batchSize: number | undefined, defaultValue: number = 50): number {
@@ -2480,7 +2732,13 @@ function mergeAllShardQueryResults<T = Record<string, unknown>>(shardResults: Qu
  *
  * @private
  */
-function pushDownGlobalLimit<T>(sql: string, options: GlobalAllShardsOptions<T>, offset: number, limit: number | undefined): string {
+function pushDownGlobalLimit<T>(
+	sql: string,
+	options: GlobalAllShardsOptions<T>,
+	offset: number,
+	limit: number | undefined,
+	dialect?: SQLDialect
+): string {
 	if (limit === undefined || options.filter || options.comparator || options.includeTotal) {
 		return sql;
 	}
@@ -2508,7 +2766,7 @@ function pushDownGlobalLimit<T>(sql: string, options: GlobalAllShardsOptions<T>,
 		const direction = options.sortDirection === 'desc' ? 'DESC' : 'ASC';
 		const alreadyOrdered = /\bORDER\s+BY\b/.test(upper);
 		if (!alreadyOrdered) {
-			return `${trimmed} ORDER BY ${quoteIdentifier(options.sortBy)} ${direction} LIMIT ${perShard}`;
+			return `${trimmed} ORDER BY ${quoteIdentifier(options.sortBy, dialect)} ${direction} LIMIT ${perShard}`;
 		}
 	}
 
@@ -2524,8 +2782,9 @@ export async function allAllShardsGlobal<T = Record<string, unknown>>(
 	const offset = normalizeOffset(options.offset);
 	const limit = normalizeLimit(options.limit);
 
-	const effectiveSql = pushDownGlobalLimit(sql, options, offset, limit);
-	const merged = mergeAllShardQueryResults(await allAllShards<T>(effectiveSql, bindings, batchSize));
+	const merged = mergeAllShardQueryResults(
+		await allAllShardsBuilt<T>((dialect) => pushDownGlobalLimit(sql, options, offset, limit, dialect), bindings, batchSize)
+	);
 	let rows = merged.results;
 
 	if (options.filter) {
@@ -2661,6 +2920,9 @@ export async function flush(): Promise<void> {
 
 	await mapper.clearAllMappings();
 	shardSizeCache.clear();
+	// The known-shard registration is memoized per process, so a flush has to
+	// let the next initialize re-register rather than assume it already did.
+	syncedShardSets.clear();
 
 	// Also flush coordinator if available
 	if (config.coordinator) {
@@ -2700,20 +2962,37 @@ export async function getDatabaseSizeForShard(shardBinding: string): Promise<num
 	return await getDatabaseSize(database);
 }
 
-const SQL_IDENTIFIER_PART_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+function quoteIdentifier(identifier: string, dialect?: SQLDialect): string {
+	const quote = dialect === 'mysql' ? '`' : '"';
+	return validateIdentifier(identifier)
+		.map((part) => `${quote}${part}${quote}`)
+		.join('.');
+}
 
-function quoteIdentifier(identifier: string): string {
-	const trimmed = identifier.trim();
-	if (!trimmed) {
-		throw new CollegeDBError('Identifier cannot be empty', 'INVALID_IDENTIFIER');
+/**
+ * Dialect of a named shard, or `undefined` when the provider does not say.
+ *
+ * Statements CollegeDB generates itself have to quote identifiers the way the
+ * target backend expects: MySQL and MariaDB reject ANSI double quotes unless
+ * `ANSI_QUOTES` is set, so a generated `SELECT MAX("id") FROM "t"` fails there
+ * outright.
+ *
+ * @private
+ */
+function dialectOf(binding: string | undefined): SQLDialect | undefined {
+	if (!binding) {
+		return undefined;
 	}
+	return globalConfig?.shards[binding]?.dialect;
+}
 
-	const parts = trimmed.split('.').map((part) => part.trim());
-	if (parts.some((part) => !part || !SQL_IDENTIFIER_PART_REGEX.test(part))) {
-		throw new CollegeDBError(`Invalid SQL identifier: ${identifier}`, 'INVALID_IDENTIFIER');
-	}
-
-	return parts.map((part) => `"${part}"`).join('.');
+/**
+ * Dialect of the shard a key routes to.
+ * @private
+ */
+async function dialectForKey(key: string, operationType: OperationType = 'write'): Promise<SQLDialect | undefined> {
+	const candidates = await resolveCandidates(key, operationType);
+	return dialectOf(candidates[0]);
 }
 
 function normalizeIndexNameSegment(value: string): string {
@@ -2783,23 +3062,25 @@ function normalizeIndexColumns(columns: string | string[] | IndexColumnDefinitio
 function buildCreateIndexSQL(
 	table: string,
 	columns: string | string[] | IndexColumnDefinition[],
-	options: CreateIndexOptions = {}
+	options: CreateIndexOptions = {},
+	dialect?: SQLDialect
 ): string {
 	const normalizedColumns = normalizeIndexColumns(columns);
-	const quotedTable = quoteIdentifier(table);
+	const quotedTable = quoteIdentifier(table, dialect);
 	const generatedIndexName = options.indexName
 		? options.indexName
 		: ['idx', normalizeIndexNameSegment(table), ...normalizedColumns.map((column) => normalizeIndexNameSegment(column.name))]
 				.filter(Boolean)
 				.join('_')
 				.slice(0, 120);
-	const quotedIndexName = quoteIdentifier(generatedIndexName || 'idx_auto');
+	const quotedIndexName = quoteIdentifier(generatedIndexName || 'idx_auto', dialect);
 
 	const columnClauses = normalizedColumns
 		.map((column) => {
-			const quotedColumn = quoteIdentifier(column.name);
+			const quotedColumn = quoteIdentifier(column.name, dialect);
 			const order = column.order ? ` ${column.order}` : '';
-			const collate = column.collate ? ` COLLATE ${quoteIdentifier(column.collate).replace(/"/g, '')}` : '';
+			// A collation is a bare name, not a quoted identifier.
+			const collate = column.collate ? ` COLLATE ${validateIdentifier(column.collate).join('.')}` : '';
 			return `${quotedColumn}${collate}${order}`;
 		})
 		.join(', ');
@@ -2827,7 +3108,7 @@ export async function index<T = Record<string, unknown>>(
 	columns: string | string[] | IndexColumnDefinition[],
 	options: Omit<CreateIndexOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	const sql = buildCreateIndexSQL(table, columns, options);
+	const sql = buildCreateIndexSQL(table, columns, options, await dialectForKey(key));
 	return run<T>(key, sql);
 }
 
@@ -2847,7 +3128,7 @@ export async function indexShard<T = Record<string, unknown>>(
 	columns: string | string[] | IndexColumnDefinition[],
 	options: Omit<CreateIndexOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	const sql = buildCreateIndexSQL(table, columns, options);
+	const sql = buildCreateIndexSQL(table, columns, options, dialectOf(shardBinding));
 	return runShard<T>(shardBinding, sql);
 }
 
@@ -2865,8 +3146,20 @@ export async function indexAllShards<T = Record<string, unknown>>(
 	columns: string | string[] | IndexColumnDefinition[],
 	options: CreateIndexOptions = {}
 ): Promise<QueryResult<T>[]> {
-	const sql = buildCreateIndexSQL(table, columns, options);
-	return runAllShards<T>(sql, [], normalizeBatchSize(options.batchSize));
+	const config = getConfig();
+	const batchSize = normalizeBatchSize(options.batchSize);
+	const tasks = Object.entries(config.shards)
+		.filter(([binding, db]) => binding && db)
+		.map(([binding, db]) => async () => {
+			const sql = buildCreateIndexSQL(table, columns, options, db.dialect);
+			return await runShard<T>(binding, sql);
+		});
+
+	const out: QueryResult<T>[] = [];
+	for (let i = 0; i < tasks.length; i += batchSize) {
+		out.push(...(await Promise.all(tasks.slice(i, i + batchSize).map((fn) => fn()))));
+	}
+	return out;
 }
 
 /**
@@ -2967,7 +3260,7 @@ export interface ShardTableCount {
  * @since 1.1.4
  */
 export async function count(key: string, table: string): Promise<number> {
-	const quotedTable = quoteIdentifier(table);
+	const quotedTable = quoteIdentifier(table, await dialectForKey(key, 'read'));
 	const row = await first<{ row_count?: number | string }>(key, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
 	if (!row || row.row_count === undefined || row.row_count === null) {
 		return 0;
@@ -2985,7 +3278,7 @@ export async function count(key: string, table: string): Promise<number> {
  * @since 1.1.4
  */
 export async function countShard(shardBinding: string, table: string): Promise<number> {
-	const quotedTable = quoteIdentifier(table);
+	const quotedTable = quoteIdentifier(table, dialectOf(shardBinding));
 	const row = await firstShard<{ row_count?: number | string }>(shardBinding, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
 	if (!row || row.row_count === undefined || row.row_count === null) {
 		return 0;
@@ -3005,18 +3298,19 @@ export async function countShard(shardBinding: string, table: string): Promise<n
 export async function countAllShards(table: string, batchSize: number = 50): Promise<{ total: number; shards: ShardTableCount[] }> {
 	const config = getConfig();
 	const normalizedBatchSize = normalizeBatchSize(batchSize);
-	const quotedTable = quoteIdentifier(table);
-	const sql = `SELECT COUNT(*) AS row_count FROM ${quotedTable}`;
 	const tasks: Array<() => Promise<ShardTableCount>> = [];
+	const quoter = tableQuoter(config, table);
 
 	for (const [binding, db] of Object.entries(config.shards)) {
 		if (!binding || !db) {
 			continue;
 		}
 
+		const probeSql = `SELECT COUNT(*) AS row_count FROM ${quoter(db)}`;
+
 		tasks.push(async () => {
 			try {
-				const row = await db.prepare(sql).first<{ row_count?: number | string }>();
+				const row = await db.prepare(probeSql).first<{ row_count?: number | string }>();
 				const parsed = Number(row?.row_count ?? 0);
 				return {
 					shard: binding,
@@ -3588,9 +3882,10 @@ export interface NextIdOptions {
  * @private
  */
 async function maxColumnAcrossShards(table: string, column: string): Promise<number> {
-	const quotedTable = quoteIdentifier(table);
-	const quotedColumn = quoteIdentifier(column);
-	const rows = await firstAllShards<{ max_value: number | string | null }>(`SELECT MAX(${quotedColumn}) AS max_value FROM ${quotedTable}`);
+	const results = await allAllShardsBuilt<{ max_value: number | string | null }>(
+		(dialect) => `SELECT MAX(${quoteIdentifier(column, dialect)}) AS max_value FROM ${quoteIdentifier(table, dialect)}`
+	);
+	const rows = results.map((result) => result.results[0] ?? null);
 
 	let max = 0;
 	for (const row of rows) {
@@ -3950,7 +4245,7 @@ export async function insertInto<T = Record<string, unknown>>(
 	values: ColumnValues,
 	options: BuildInsertOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildInsert(table, values, options);
+	const { sql, bindings } = buildInsert(table, values, { ...options, dialect: await dialectForKey(key) });
 	return await run<T>(key, sql, bindings);
 }
 
@@ -3984,7 +4279,8 @@ export async function insertReturning<T = Record<string, unknown>>(
 	await insertInto(key, table, values, options);
 
 	const idValue = values[idColumn] ?? key;
-	return await first<T>(key, `SELECT * FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(idColumn)} = ?`, [idValue]);
+	const dialect = await dialectForKey(key, 'read');
+	return await first<T>(key, `SELECT * FROM ${quoteIdentifier(table, dialect)} WHERE ${quoteIdentifier(idColumn, dialect)} = ?`, [idValue]);
 }
 
 /**
@@ -4010,7 +4306,7 @@ export async function updateRow<T = Record<string, unknown>>(
 	where: ColumnValues,
 	options: CrudReturningOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildUpdate(table, values, where, options);
+	const { sql, bindings } = buildUpdate(table, values, where, { ...options, dialect: await dialectForKey(key) });
 	return await run<T>(key, sql, bindings);
 }
 
@@ -4057,7 +4353,7 @@ export async function patch<T = Record<string, unknown>>(
  * ```
  */
 export async function deleteRow<T = Record<string, unknown>>(key: string, table: string, where: ColumnValues): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildDelete(table, where);
+	const { sql, bindings } = buildDelete(table, where, { dialect: await dialectForKey(key) });
 	return await run<T>(key, sql, bindings);
 }
 
@@ -4111,7 +4407,7 @@ export async function upsert<T = Record<string, unknown>>(
 	conflictColumns: string | string[],
 	options: BuildUpsertOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildUpsert(table, values, conflictColumns, options);
+	const { sql, bindings } = buildUpsert(table, values, conflictColumns, { ...options, dialect: await dialectForKey(key) });
 	return await run<T>(key, sql, bindings);
 }
 
