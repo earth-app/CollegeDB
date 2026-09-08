@@ -1,10 +1,12 @@
-import type { D1Database, DurableObjectNamespace, KVNamespace } from '@cloudflare/workers-types';
+import type { D1Database, DurableObjectNamespace, ExecutionContext, KVNamespace } from '@cloudflare/workers-types';
 import { sql as drizzleSql } from 'drizzle-orm';
 import { drizzle as drizzleD1 } from 'drizzle-orm/d1';
+import { Client as PostgresClient } from 'pg';
 import {
 	all,
 	allAllShards,
 	allShard,
+	createHyperdrivePostgresProvider,
 	createMappingsForExistingKeys,
 	createNuxtHubKVProvider,
 	createSchemaAcrossShards,
@@ -21,6 +23,7 @@ import {
 	ShardCoordinator
 } from '../src/index';
 import { KVShardMapper } from '../src/kvmap';
+import type { HyperdriveProvider } from '../src/providers';
 import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy, ShardLocation } from '../src/types';
 
 export { ShardCoordinator };
@@ -31,9 +34,13 @@ interface Env {
 	'db-east': D1Database;
 	'db-west': D1Database;
 	'db-central': D1Database;
+	HYPERDRIVE?: { connectionString: string };
 }
 
-type SandboxProfile = 'native' | 'drizzle' | 'nuxthub';
+/** Identifies the current request, so the Hyperdrive client is per-request. */
+let currentRequestScope: object | undefined;
+
+type SandboxProfile = 'native' | 'drizzle' | 'nuxthub' | 'hyperdrive';
 
 const BENCH_SCHEMA = `
 	CREATE TABLE IF NOT EXISTS users (
@@ -118,10 +125,49 @@ function createDrizzleD1CompatProvider(db: D1Database) {
 }
 
 function normalizeProfile(raw: string | null): SandboxProfile {
-	if (raw === 'drizzle' || raw === 'nuxthub') {
+	if (raw === 'drizzle' || raw === 'nuxthub' || raw === 'hyperdrive') {
 		return raw;
 	}
 	return 'native';
+}
+
+/**
+ * Builds a shard backed by the Hyperdrive binding.
+ *
+ * This is the only place in the repo where the Hyperdrive adapters run against
+ * an actual `env.HYPERDRIVE`. `wrangler dev` supplies one from
+ * `localConnectionString` (or the matching
+ * `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` variable), so the
+ * driver path, the binding shape, and the per-request connection lifecycle are
+ * all exercised.
+ *
+ * Local Hyperdrive does no query caching or edge pooling, so this validates
+ * correctness and connection count, not pooling latency.
+ */
+function createHyperdriveShard(env: Env, scope: () => object | undefined): HyperdriveProvider | null {
+	if (!env.HYPERDRIVE?.connectionString) {
+		return null;
+	}
+
+	return createHyperdrivePostgresProvider(
+		env.HYPERDRIVE,
+		(connectionString) => {
+			const client = new PostgresClient({ connectionString });
+			return {
+				connect: async () => {
+					await client.connect();
+				},
+				query: async <T = Record<string, unknown>>(sql: string, bindings: any[] = []) => {
+					const result = await client.query(sql, bindings);
+					return { rows: result.rows as T[], rowCount: result.rowCount, command: result.command };
+				},
+				end: async () => {
+					await client.end();
+				}
+			};
+		},
+		{ scope }
+	);
 }
 
 function buildConfig(
@@ -133,7 +179,9 @@ function buildConfig(
 	}
 ): CollegeDBConfig {
 	const useDrizzle = profile === 'drizzle' || profile === 'nuxthub';
-	const shardA = useDrizzle ? createDrizzleD1CompatProvider(env['db-east']) : env['db-east'];
+	const hyperdriveShard = profile === 'hyperdrive' ? createHyperdriveShard(env, () => currentRequestScope) : null;
+
+	const shardA = hyperdriveShard ?? (useDrizzle ? createDrizzleD1CompatProvider(env['db-east']) : env['db-east']);
 	const shardB = useDrizzle ? createDrizzleD1CompatProvider(env['db-west']) : env['db-west'];
 	const shardC = useDrizzle ? createDrizzleD1CompatProvider(env['db-central']) : env['db-central'];
 
@@ -267,13 +315,17 @@ async function collectDatabaseSizes(config: CollegeDBConfig): Promise<Record<str
 }
 
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const { pathname, searchParams } = url;
 		const profile = normalizeProfile(searchParams.get('profile'));
 
+		// The Hyperdrive provider keys its client on this, so each request gets
+		// its own connection and none is reused across requests.
+		currentRequestScope = request;
+
 		const config = buildConfig(env, profile);
-		initialize(config);
+		initialize({ ...config, waitUntil: (promise) => ctx.waitUntil(promise) });
 
 		try {
 			if (pathname === '/health') {
@@ -522,33 +574,49 @@ export default {
 				initialize(strategyConfig);
 				await resetData();
 
-				const samplesMs: number[] = [];
-
+				// workerd advances its clock only on I/O, so timing one statement at a
+				// time reported whole milliseconds and every p95 in this matrix came
+				// back as an integer. Each phase is timed as a whole and divided by
+				// its statement count instead.
+				const writeBatchStarted = performance.now();
 				for (let i = 0; i < writes; i += 1) {
 					const id = `${prefix}-w-${i}`;
-					const started = performance.now();
 					await run(id, INSERT_USER_SQL, [id, `Strategy ${i}`, `${id}@strategy.cloudflare.local`, Date.now()]);
-					samplesMs.push(performance.now() - started);
 				}
+				const writeTotalMs = performance.now() - writeBatchStarted;
 
+				const hitBatchStarted = performance.now();
 				for (let i = 0; i < reads; i += 1) {
 					const existingId = `${prefix}-w-${i % writes}`;
-					const existingStarted = performance.now();
 					await first(existingId, SELECT_USER_SQL, [existingId]);
-					samplesMs.push(performance.now() - existingStarted);
-
-					const missingId = `${prefix}-missing-${i}`;
-					const missingStarted = performance.now();
-					await first(missingId, SELECT_USER_SQL, [missingId]);
-					samplesMs.push(performance.now() - missingStarted);
 				}
+				const hitTotalMs = performance.now() - hitBatchStarted;
+
+				const missBatchStarted = performance.now();
+				for (let i = 0; i < reads; i += 1) {
+					const missingId = `${prefix}-missing-${i}`;
+					await first(missingId, SELECT_USER_SQL, [missingId]);
+				}
+				const missTotalMs = performance.now() - missBatchStarted;
+
+				const statements = writes + reads * 2;
 
 				return json({
 					success: true,
-					statements: samplesMs.length,
+					statements,
 					writes,
 					reads,
-					samplesMs,
+					phaseTotalsMs: {
+						write: writeTotalMs,
+						readHit: hitTotalMs,
+						readMiss: missTotalMs
+					},
+					perOpMs: {
+						write: writes > 0 ? writeTotalMs / writes : 0,
+						readHit: reads > 0 ? hitTotalMs / reads : 0,
+						readMiss: reads > 0 ? missTotalMs / reads : 0
+					},
+					totalMs: writeTotalMs + hitTotalMs + missTotalMs,
 					targetRegion,
 					shardLocations: strategyConfig.shardLocations
 				});

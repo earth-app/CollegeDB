@@ -1,6 +1,6 @@
 {
   "name": "@earth-app/collegedb",
-  "description": "Cloudflare D1 sharding router with KV-backed primary-key mappings and a Durable Object shard coordinator.",
+  "description": "Horizontal sharding router for SQL databases. Routes queries by primary key across many database instances, with adapters for D1, PostgreSQL, MySQL, MariaDB, SQLite and Drizzle, and key-value mapping backed by Workers KV, Redis, Valkey or NuxtHub.",
   "version": "1.3.0",
   "license": "MIT",
   "author": "Gregory Mitchell",
@@ -20,16 +20,26 @@
     "LICENSE"
   ],
   "keywords": [
-    "cloudflare",
-    "d1",
     "sharding",
     "shard",
-    "kv",
-    "durable-objects",
-    "drizzle",
+    "horizontal-scaling",
+    "database",
+    "sql",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
     "sqlite",
+    "redis",
+    "valkey",
+    "drizzle",
+    "cloudflare",
+    "d1",
+    "kv",
     "workers",
-    "database"
+    "durable-objects",
+    "hyperdrive",
+    "nuxthub"
   ],
   "publishConfig": {
     "access": "public"
@@ -51,8 +61,8 @@
     "test:sandbox:mariadb": "bun scripts/sandbox/run.ts --db=mariadb --kv=all",
     "test:sandbox:sqlite": "bun scripts/sandbox/run.ts --db=sqlite --kv=all",
     "test:sandbox:drizzle": "bun scripts/sandbox/run.ts --db=all --kv=all --profile=drizzle",
-    "test:sandbox:nuxthub": "bun scripts/sandbox/run.ts --db=all --kv=all --profile=nuxthub",
-    "test:sandbox:hyperdrive": "bun scripts/sandbox/run.ts --db=all --kv=all --profile=hyperdrive",
+    "test:sandbox:per-statement-connection": "bun scripts/sandbox/run.ts --db=all --kv=all --profile=per-statement-connection",
+    "test:sandbox:hyperdrive": "bun scripts/sandbox/run.ts --cloudflare-only --profile=hyperdrive",
     "test:sandbox:redis": "bun scripts/sandbox/run.ts --db=all --kv=redis",
     "test:sandbox:valkey": "bun scripts/sandbox/run.ts --db=all --kv=valkey",
     "test:sandbox:postgres+redis": "bun scripts/sandbox/run.ts --db=postgres --kv=redis",

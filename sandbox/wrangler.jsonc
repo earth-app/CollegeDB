@@ -25,6 +25,13 @@
 			"preview_database_id": "your-central-preview-db-id"
 		}
 	],
+	"hyperdrive": [
+		{
+			"binding": "HYPERDRIVE",
+			"id": "collegedb-sandbox-hyperdrive",
+			"localConnectionString": "postgres://collegedb:collegedb@127.0.0.1:5432/postgres"
+		}
+	],
 	"kv_namespaces": [
 		{
 			"binding": "KV",
