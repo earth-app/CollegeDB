@@ -146,6 +146,51 @@ export interface SQLiteClientLike {
 }
 
 /**
+ * A connection leased for the duration of one batch, and the hook that returns
+ * it to wherever it came from.
+ *
+ * @template C - Client contract the leased connection satisfies
+ * @since 1.4.0
+ */
+export interface LeasedConnection<C> {
+	/** The dedicated connection; every statement in the batch runs through it */
+	client: C;
+	/** Returns the connection to its pool. Called once, including on failure. */
+	release: () => void | Promise<void>;
+}
+
+/**
+ * Controls whether an adapter may run a {@link SQLDatabase.runBatch} group inside
+ * one transaction, and on which connection.
+ *
+ * A transaction is only correct when every statement in it, `BEGIN` and `COMMIT`
+ * included, travels down the same connection. A pool does not guarantee that,
+ * and a pool cannot be told apart from a single connection by inspection: `pg`'s
+ * `Client` and `Pool` both expose `connect()`, and any of them can be wrapped in
+ * something that exposes only `query()`. So the adapter never guesses. It
+ * batches when it recognizes a pool it knows how to lease from, when you hand it
+ * a {@link SQLBatchOptions.lease} of your own, or when you state that the handle
+ * is a single connection. Otherwise statements run one at a time, exactly as
+ * before.
+ *
+ * @since 1.4.0
+ */
+export interface SQLBatchOptions<C = unknown> {
+	/**
+	 * Declares that the handle is one dedicated connection, so `BEGIN`/`COMMIT`
+	 * can be issued straight through it. Set this for a `pg.Client`, a `mysql2`
+	 * connection, or any SQLite handle. Do **not** set it for a pool.
+	 */
+	singleConnection?: boolean;
+	/**
+	 * Leases a dedicated connection for one batch. Takes precedence over
+	 * {@link SQLBatchOptions.singleConnection} and over pool autodetection, and is
+	 * the escape hatch for a handle CollegeDB does not recognize.
+	 */
+	lease?: () => Promise<LeasedConnection<C>>;
+}
+
+/**
  * Hyperdrive binding shape used by helper factories.
  */
 export interface HyperdriveBindingLike {
@@ -187,6 +232,13 @@ export interface DrizzleClientLike {
 	run?: (query: any) => any | Promise<any>;
 	all?: (query: any) => any | Promise<any>;
 	get?: (query: any) => any | Promise<any>;
+	/**
+	 * Drizzle's own transaction API, present on the node-postgres, mysql2 and
+	 * SQLite drivers. Where it exists, Drizzle pins the connection and issues the
+	 * transaction control itself, which is the guarantee a batch needs.
+	 * @since 1.4.0
+	 */
+	transaction?: <T>(callback: (tx: DrizzleClientLike) => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -428,19 +480,37 @@ export function createValkeyKVProvider(client: RedisLikeClient, options: { scanC
  * @param sqlTag - Optional Drizzle `sql` helper for Drizzle interop
  * @returns SQLDatabase-compatible adapter
  */
-export function createPostgreSQLProvider(client: PostgresClientLike): SQLDatabase;
+export function createPostgreSQLProvider(client: PostgresClientLike, options?: SQLBatchOptions<PostgresClientLike>): SQLDatabase;
 export function createPostgreSQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
-export function createPostgreSQLProvider(client: PostgresClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
-	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'postgres');
+export function createPostgreSQLProvider(
+	client: PostgresClientLike | DrizzleClientLike,
+	sqlTagOrOptions?: DrizzleSqlTagLike | SQLBatchOptions<PostgresClientLike>
+): SQLDatabase {
+	if (typeof sqlTagOrOptions === 'function') {
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTagOrOptions, 'postgres');
 	}
 
-	return {
+	const provider: SQLDatabase = {
 		dialect: 'postgres',
 		prepare(sql: string): PreparedStatement {
 			return new PostgresPreparedStatement(client as PostgresClientLike, sql);
 		}
 	};
+
+	const lease = resolveLease<PostgresClientLike>(client, sqlTagOrOptions);
+	if (lease) {
+		provider.runBatch = async <T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> => {
+			if (statements.length === 0) {
+				return [];
+			}
+
+			return (await runBatchInTransaction(lease, statements, (leased, statement) =>
+				new PostgresPreparedStatement(leased, statement.sql, statement.bindings ?? []).run<T>()
+			)) as QueryResult<T>[];
+		};
+	}
+
+	return provider;
 }
 
 /**
@@ -455,19 +525,43 @@ export function createPostgreSQLProvider(client: PostgresClientLike | DrizzleCli
  * @param sqlTag - Optional Drizzle `sql` helper for Drizzle interop
  * @returns SQLDatabase-compatible adapter
  */
-export function createMySQLProvider(client: MySQLClientLike): SQLDatabase;
+export function createMySQLProvider(client: MySQLClientLike, options?: SQLBatchOptions<MySQLClientLike>): SQLDatabase;
 export function createMySQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
-export function createMySQLProvider(client: MySQLClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
-	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'mysql');
+export function createMySQLProvider(
+	client: MySQLClientLike | DrizzleClientLike,
+	sqlTagOrOptions?: DrizzleSqlTagLike | SQLBatchOptions<MySQLClientLike>
+): SQLDatabase {
+	if (typeof sqlTagOrOptions === 'function') {
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTagOrOptions, 'mysql');
 	}
 
-	return {
+	const provider: SQLDatabase = {
 		dialect: 'mysql',
 		prepare(sql: string): PreparedStatement {
 			return new MySQLPreparedStatement(client as MySQLClientLike, sql);
 		}
 	};
+
+	const lease = resolveLease<MySQLClientLike>(client, sqlTagOrOptions);
+	if (lease) {
+		provider.runBatch = async <T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> => {
+			if (statements.length === 0) {
+				return [];
+			}
+
+			return (await runBatchInTransaction(
+				lease,
+				statements,
+				(leased, statement) => new MySQLPreparedStatement(leased, statement.sql, statement.bindings ?? []).run<T>(),
+				// `mysql2`'s execute() speaks the prepared-statement protocol, which
+				// answers BEGIN with "This command is not supported in the prepared
+				// statement protocol yet". query() is the text protocol and takes it.
+				async (leased, sql) => (leased.query ? await leased.query(sql) : await leased.execute!(sql))
+			)) as QueryResult<T>[];
+		};
+	}
+
+	return provider;
 }
 
 /**
@@ -482,19 +576,40 @@ export function createMySQLProvider(client: MySQLClientLike | DrizzleClientLike,
  * @param sqlTag - Optional Drizzle `sql` helper for Drizzle interop
  * @returns SQLDatabase-compatible adapter
  */
-export function createSQLiteProvider(client: SQLiteClientLike): SQLDatabase;
+export function createSQLiteProvider(client: SQLiteClientLike, options?: SQLBatchOptions<SQLiteClientLike>): SQLDatabase;
 export function createSQLiteProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike): SQLDatabase;
-export function createSQLiteProvider(client: SQLiteClientLike | DrizzleClientLike, sqlTag?: DrizzleSqlTagLike): SQLDatabase {
-	if (sqlTag) {
-		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTag, 'sqlite');
+export function createSQLiteProvider(
+	client: SQLiteClientLike | DrizzleClientLike,
+	sqlTagOrOptions?: DrizzleSqlTagLike | SQLBatchOptions<SQLiteClientLike>
+): SQLDatabase {
+	if (typeof sqlTagOrOptions === 'function') {
+		return createDrizzleSQLProvider(client as DrizzleClientLike, sqlTagOrOptions, 'sqlite');
 	}
 
-	return {
+	const provider: SQLDatabase = {
 		dialect: 'sqlite',
 		prepare(sql: string): PreparedStatement {
 			return new SQLitePreparedStatement(client as SQLiteClientLike, sql);
 		}
 	};
+
+	// A SQLite handle is a file, not a pool, so there is nothing to lease and a
+	// transaction is always on the one connection. It still has to be asked for,
+	// because the handle could be a wrapper that serializes elsewhere.
+	const lease = resolveLease<SQLiteClientLike>(client, sqlTagOrOptions);
+	if (lease) {
+		provider.runBatch = async <T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> => {
+			if (statements.length === 0) {
+				return [];
+			}
+
+			return (await runBatchInTransaction(lease, statements, (leased, statement) =>
+				new SQLitePreparedStatement(leased, statement.sql, statement.bindings ?? []).run<T>()
+			)) as QueryResult<T>[];
+		};
+	}
+
+	return provider;
 }
 
 /**
@@ -509,12 +624,41 @@ export function createSQLiteProvider(client: SQLiteClientLike | DrizzleClientLik
  * @returns SQLDatabase-compatible adapter
  */
 export function createDrizzleSQLProvider(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike, dialect?: SQLDialect): SQLDatabase {
-	return {
+	const provider: SQLDatabase = {
 		dialect,
 		prepare(sql: string): PreparedStatement {
 			return new DrizzlePreparedStatement(client, sqlTag, sql);
 		}
 	};
+
+	// Drizzle owns the connection, so its own transaction is the only sound way
+	// to bracket a group here: there is nothing to lease and no way to tell
+	// whether the driver underneath is pooled.
+	//
+	// Except on a driver that has a native batch, which is Drizzle's marker for
+	// a backend without interactive transactions. D1 is the case that matters:
+	// `db.transaction()` exists there and resolves against a mock, but a real D1
+	// answers the `begin` it emits with `Failed query: begin`. Those keep the
+	// sequential path; the raw D1 binding gets its native batch elsewhere.
+	const hasNativeBatch = typeof (client as { batch?: unknown }).batch === 'function';
+
+	if (typeof client.transaction === 'function' && !hasNativeBatch) {
+		provider.runBatch = async <T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> => {
+			if (statements.length === 0) {
+				return [];
+			}
+
+			return await client.transaction!(async (tx) => {
+				const results: QueryResult<T>[] = [];
+				for (const statement of statements) {
+					results.push(await new DrizzlePreparedStatement(tx, sqlTag, statement.sql).bind(...(statement.bindings ?? [])).run<T>());
+				}
+				return results;
+			});
+		};
+	}
+
+	return provider;
 }
 
 /**
@@ -911,6 +1055,98 @@ interface NativeBatchCapable {
  *
  * @private
  */
+/**
+ * Resolves how a batch should get a connection, or `null` when it must not.
+ *
+ * Autodetection is deliberately one-directional: it recognizes the two pool
+ * shapes it knows how to lease from and says nothing about anything else. A
+ * handle it does not recognize is left un-batched rather than assumed to be a
+ * single connection, because assuming wrong sends `BEGIN` down a different
+ * connection than the statements it is supposed to bracket.
+ *
+ * @private
+ */
+function resolveLease<C>(client: unknown, options: SQLBatchOptions<C> | undefined): (() => Promise<LeasedConnection<C>>) | null {
+	if (options?.lease) {
+		return options.lease;
+	}
+
+	const candidate = client as {
+		getConnection?: () => Promise<{ release?: () => void; destroy?: () => void }>;
+		connect?: () => Promise<{ release?: () => void }>;
+		totalCount?: number;
+		idleCount?: number;
+	};
+
+	// `mysql2` pools, which hand back a connection carrying its own release.
+	if (typeof candidate.getConnection === 'function') {
+		return async () => {
+			const connection = await candidate.getConnection!();
+			return {
+				client: connection as C,
+				release: () => connection.release?.()
+			};
+		};
+	}
+
+	// `pg` pools. `Client` also has `connect`, so the pool-only counters are what
+	// separate them; `Client.connect()` resolves to nothing and would leave the
+	// batch with no connection to run on.
+	if (typeof candidate.connect === 'function' && typeof candidate.totalCount === 'number' && typeof candidate.idleCount === 'number') {
+		return async () => {
+			const connection = await candidate.connect!();
+			return {
+				client: connection as C,
+				release: () => connection.release?.()
+			};
+		};
+	}
+
+	if (options?.singleConnection) {
+		return async () => ({ client: client as C, release: () => {} });
+	}
+
+	return null;
+}
+
+/**
+ * Runs a group of statements inside one transaction on one connection.
+ *
+ * `BEGIN` and `COMMIT` are issued through the same handle as the statements,
+ * which is the whole point of the lease. A failure rolls back and rethrows, so a
+ * partially applied group is never reported as success.
+ *
+ * @private
+ */
+async function runBatchInTransaction<C>(
+	lease: () => Promise<LeasedConnection<C>>,
+	statements: BatchStatement[],
+	execute: (client: C, statement: BatchStatement) => Promise<QueryResult<any>>,
+	control: (client: C, sql: string) => Promise<unknown> = (client, sql) => execute(client, { sql })
+): Promise<QueryResult<any>[]> {
+	const { client, release } = await lease();
+
+	try {
+		await control(client, 'BEGIN');
+
+		try {
+			const results: QueryResult<any>[] = [];
+			for (const statement of statements) {
+				results.push(await execute(client, statement));
+			}
+			await control(client, 'COMMIT');
+			return results;
+		} catch (error) {
+			// A rollback that itself fails must not replace the original error,
+			// which is the one that explains what went wrong.
+			await Promise.resolve(control(client, 'ROLLBACK')).catch(() => undefined);
+			throw error;
+		}
+	} finally {
+		await release();
+	}
+}
+
 function withNativeBatch(provider: SQLDatabase, rawBinding: unknown = provider): SQLDatabase {
 	const candidate = rawBinding as Partial<NativeBatchCapable>;
 	if (typeof candidate.batch !== 'function' || typeof candidate.prepare !== 'function' || provider.runBatch) {
