@@ -35,13 +35,54 @@ import { hrwShard } from './placement';
 import type { D1Region, MixedShardingStrategy, OperationType, ShardCoordinatorState, ShardingStrategy } from './types';
 
 /**
- * Storage key prefix for the per-key allocation ledger.
+ * Legacy storage key prefix for the per-key allocation ledger.
  *
  * Recording each decision is what makes allocation idempotent across concurrent
- * callers, since a Durable Object serializes its own requests.
+ * callers, since a Durable Object serializes its own requests. The ledger lives in
+ * the `allocations` table; these keys are the copy older versions read.
  * @private
  */
 const ALLOCATION_LEDGER_PREFIX = 'alloc:';
+
+/** @private */
+const LEGACY_STATE_KEY = 'coordinator_state';
+
+/** @private */
+const LEGACY_GENERATION_KEY = 'gen';
+
+/** @private */
+const UPGRADE_PAGE_SIZE = 200;
+
+/** Durable Object storage rejects batch deletes and puts above 128 keys. @private */
+const MAX_KEYS_PER_WRITE = 128;
+
+/** @private */
+const SCHEMA = [
+	'CREATE TABLE IF NOT EXISTS shards (name TEXT PRIMARY KEY, position INTEGER NOT NULL)',
+	'CREATE TABLE IF NOT EXISTS stats (binding TEXT PRIMARY KEY, count INTEGER NOT NULL, last_updated INTEGER)',
+	'CREATE TABLE IF NOT EXISTS allocations (primary_key TEXT PRIMARY KEY, shard TEXT NOT NULL, created_at INTEGER NOT NULL)',
+	'CREATE TABLE IF NOT EXISTS sequences (name TEXT PRIMARY KEY, value INTEGER NOT NULL)',
+	'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
+];
+
+/**
+ * Where the coordinator is in the move from legacy storage keys to SQL.
+ *
+ * `legacy`: nothing copied yet. `copying`: state copied, allocations copied in pages behind
+ * a cursor, reads of uncopied keys fall through to the legacy keys. `dual`: SQL serves every
+ * read and writes still land on the legacy keys. `sql-only`: legacy keys retired.
+ * @private
+ */
+type UpgradePhase = 'legacy' | 'copying' | 'dual' | 'sql-only';
+
+/** The ledger change of one commit, kept in `meta` so a half-finished legacy write can be replayed. @private */
+interface LedgerOp {
+	put?: Array<[string, string]>;
+	del?: string[];
+}
+
+/** Legacy copy of the coordinator state, stamped with the generation that wrote it. @private */
+type LegacyState = ShardCoordinatorState & { seq?: number };
 
 /**
  * Durable Object for coordinating shard allocation and maintaining statistics
@@ -54,7 +95,13 @@ const ALLOCATION_LEDGER_PREFIX = 'alloc:';
  * - Track available shards and their current load
  * - Implement allocation strategies (round-robin, random, hash-based)
  * - Provide HTTP API for shard allocation and management
- * - Maintain persistent state using Durable Object storage
+ * - Maintain persistent state in the object's SQLite database (`ctx.storage.sql`)
+ *
+ * State from earlier versions lives under legacy storage keys. The first requests copy it
+ * into SQL in pages, and until {@link ShardCoordinator.retireLegacy} runs every write also
+ * lands on the legacy keys, so the previous version can still read the object. That window is
+ * read-only for a downgrade: writes the previous version makes to the legacy keys are not
+ * copied back when the object upgrades again, and the new version overwrites them.
  *
  * @example
  * ```typescript
@@ -74,49 +121,372 @@ export class ShardCoordinator {
 	private state: DurableObjectState;
 
 	/**
+	 * Resolves once the tables exist and legacy recovery has run
+	 * @private
+	 */
+	private ready: Promise<void>;
+
+	/**
+	 * Tail of the request queue; a request finishes before the next one starts
+	 * @private
+	 */
+	private queue: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * Set when a legacy write failed after SQL committed, so the next request replays it
+	 * @private
+	 */
+	private legacyBehind = false;
+
+	/**
 	 * Creates a new ShardCoordinator instance
 	 * @param state - Durable Object state provided by Cloudflare runtime
 	 */
 	constructor(state: DurableObjectState) {
 		this.state = state;
+		this.ready = state.blockConcurrencyWhile(() => this.initialize());
 	}
 
 	/**
-	 * Gets the current coordinator state from persistent storage
+	 * Creates the tables and reconciles the legacy copy with SQL before any request runs
+	 * @private
+	 */
+	private async initialize(): Promise<void> {
+		this.createSchema();
+		await this.recoverLegacy();
+	}
+
+	/**
+	 * Creates the tables if they are missing and seeds the upgrade phase
+	 * @private
+	 */
+	private createSchema(): void {
+		for (const statement of SCHEMA) this.state.storage.sql.exec(statement);
+		this.state.storage.sql.exec("INSERT OR IGNORE INTO meta (key, value) VALUES ('phase', 'legacy')");
+	}
+
+	/**
+	 * Runs one request body after earlier ones finish and after one upgrade step
 	 *
-	 * Retrieves the coordinator state from Durable Object storage, returning
-	 * a default state if none exists. The state includes known shards, statistics,
-	 * allocation strategy, and round-robin counter.
+	 * Handlers await between reading and writing, so the queue keeps two requests
+	 * for the same key from both seeing it unallocated.
 	 *
 	 * @private
-	 * @returns Promise resolving to the current coordinator state
-	 * @throws {Error} If storage access fails
+	 * @param task - The request body
+	 * @returns Promise resolving to the body's result
 	 */
-	private async getState(): Promise<ShardCoordinatorState> {
-		const state = await this.state.storage.get<ShardCoordinatorState>('coordinator_state');
-		return (
-			state || {
-				knownShards: [],
-				shardStats: {},
-				strategy: 'round-robin',
-				roundRobinIndex: 0
+	private exclusive<T>(task: () => Promise<T>): Promise<T> {
+		const run = this.queue.then(async () => {
+			await this.ready;
+			if (this.legacyBehind) {
+				await this.recoverLegacy();
+				this.legacyBehind = false;
 			}
+			await this.advanceUpgrade();
+			return task();
+		});
+		this.queue = run.catch(() => {});
+		return run;
+	}
+
+	/**
+	 * Reads one value from the `meta` table
+	 * @private
+	 */
+	private meta(key: string): string | undefined {
+		return this.state.storage.sql.exec<{ value: string }>('SELECT value FROM meta WHERE key = ?', key).toArray()[0]?.value;
+	}
+
+	/**
+	 * Writes one value to the `meta` table
+	 * @private
+	 */
+	private setMeta(key: string, value: string | number): void {
+		this.state.storage.sql.exec('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', key, String(value));
+	}
+
+	/**
+	 * Current upgrade phase
+	 * @private
+	 */
+	private phase(): UpgradePhase {
+		return (this.meta('phase') ?? 'legacy') as UpgradePhase;
+	}
+
+	/**
+	 * Generation marker of the SQL representation, bumped by every commit
+	 * @private
+	 */
+	private seq(): number {
+		return Number(this.meta('seq') ?? 0);
+	}
+
+	/**
+	 * Reads the coordinator state from the SQL tables
+	 *
+	 * The cursors are turned into arrays here so no result stays open across an await.
+	 *
+	 * @private
+	 * @returns The current coordinator state, empty when nothing was stored
+	 */
+	private readSqlState(): ShardCoordinatorState {
+		const sql = this.state.storage.sql;
+		const knownShards = sql
+			.exec<{ name: string }>('SELECT name FROM shards ORDER BY position')
+			.toArray()
+			.map((row) => row.name);
+
+		const shardStats: ShardCoordinatorState['shardStats'] = {};
+		for (const row of sql
+			.exec<{ binding: string; count: number; last_updated: number | null }>('SELECT * FROM stats ORDER BY rowid')
+			.toArray()) {
+			shardStats[row.binding] = {
+				binding: row.binding,
+				count: row.count,
+				...(row.last_updated !== null && { lastUpdated: row.last_updated })
+			};
+		}
+
+		const sequences: Record<string, number> = {};
+		for (const row of sql.exec<{ name: string; value: number }>('SELECT * FROM sequences ORDER BY rowid').toArray()) {
+			sequences[row.name] = row.value;
+		}
+
+		const config = JSON.parse(this.meta('config') ?? '{}') as Pick<ShardCoordinatorState, 'strategy' | 'targetRegion' | 'shardLocations'>;
+		return {
+			knownShards,
+			shardStats,
+			sequences,
+			strategy: config.strategy ?? 'round-robin',
+			roundRobinIndex: Number(this.meta('round_robin_index') ?? 0),
+			...(config.targetRegion && { targetRegion: config.targetRegion }),
+			...(config.shardLocations && { shardLocations: config.shardLocations })
+		};
+	}
+
+	/**
+	 * Replaces the state tables with the given state; call inside a transaction
+	 * @private
+	 * @param state - The state to store
+	 */
+	private writeSqlState(state: ShardCoordinatorState): void {
+		const sql = this.state.storage.sql;
+		sql.exec('DELETE FROM shards');
+		sql.exec('DELETE FROM stats');
+		sql.exec('DELETE FROM sequences');
+		state.knownShards.forEach((name, position) => sql.exec('INSERT INTO shards (name, position) VALUES (?, ?)', name, position));
+		for (const [binding, stat] of Object.entries(state.shardStats)) {
+			sql.exec('INSERT INTO stats (binding, count, last_updated) VALUES (?, ?, ?)', binding, stat.count, stat.lastUpdated ?? null);
+		}
+		for (const [name, value] of Object.entries(state.sequences ?? {})) {
+			sql.exec('INSERT INTO sequences (name, value) VALUES (?, ?)', name, value);
+		}
+		this.setMeta('round_robin_index', state.roundRobinIndex);
+		this.setMeta(
+			'config',
+			JSON.stringify({ strategy: state.strategy, targetRegion: state.targetRegion, shardLocations: state.shardLocations })
 		);
 	}
 
 	/**
-	 * Saves the coordinator state to persistent storage
+	 * Applies allocation changes to the `allocations` table; call inside a transaction
+	 * @private
+	 * @param op - Rows to record and keys to drop
+	 * @returns How many rows the deletes removed
+	 */
+	private applyLedger(op: LedgerOp): number {
+		const sql = this.state.storage.sql;
+		let deleted = 0;
+		for (const [key, shard] of op.put ?? []) {
+			sql.exec(
+				'INSERT INTO allocations (primary_key, shard, created_at) VALUES (?, ?, ?) ON CONFLICT(primary_key) DO UPDATE SET shard = excluded.shard',
+				key,
+				shard,
+				Date.now()
+			);
+		}
+		for (const key of op.del ?? []) {
+			deleted += sql.exec('SELECT 1 FROM allocations WHERE primary_key = ?', key).toArray().length;
+			sql.exec('DELETE FROM allocations WHERE primary_key = ?', key);
+		}
+		return deleted;
+	}
+
+	/**
+	 * Commits one change: SQL first with the generation marker last in the same
+	 * transaction, then the legacy copy with its own marker last
 	 *
-	 * Persists the coordinator state to Durable Object storage. This includes
-	 * all shard information, statistics, and configuration.
+	 * A crash between the two leaves SQL ahead of the legacy marker, which
+	 * {@link recoverLegacy} repairs before the next request runs.
 	 *
 	 * @private
-	 * @param state - The coordinator state to persist
-	 * @returns Promise that resolves when state is saved
-	 * @throws {Error} If storage write fails
+	 * @param change - New coordinator state and or allocation changes
+	 * @returns How many allocation rows the change deleted
 	 */
-	private async saveState(state: ShardCoordinatorState): Promise<void> {
-		await this.state.storage.put('coordinator_state', state);
+	private async commit(change: { state?: ShardCoordinatorState; ledger?: LedgerOp }): Promise<number> {
+		const seq = this.seq() + 1;
+		let deleted = 0;
+		this.state.storage.transactionSync(() => {
+			if (change.state) this.writeSqlState(change.state);
+			if (change.ledger) deleted = this.applyLedger(change.ledger);
+			this.setMeta('last_op', JSON.stringify(change.ledger ?? {}));
+			this.setMeta('seq', seq);
+		});
+
+		if (this.phase() !== 'sql-only') {
+			try {
+				await this.writeLegacy(seq, change.ledger ?? {});
+			} catch (error) {
+				this.legacyBehind = true;
+				throw error;
+			}
+		}
+		return deleted;
+	}
+
+	/**
+	 * Writes the legacy copy of one commit: allocation keys, the state, then the generation key
+	 * @private
+	 * @param seq - Generation of the commit
+	 * @param op - Allocation changes of the commit
+	 */
+	private async writeLegacy(seq: number, op: LedgerOp): Promise<void> {
+		const storage = this.state.storage;
+		if (op.put?.length) {
+			await storage.put(Object.fromEntries(op.put.map(([key, shard]) => [`${ALLOCATION_LEDGER_PREFIX}${key}`, shard])));
+		}
+		if (op.del?.length) {
+			await storage.delete(op.del.map((key) => `${ALLOCATION_LEDGER_PREFIX}${key}`));
+		}
+		await storage.put(LEGACY_STATE_KEY, { ...this.readSqlState(), seq } satisfies LegacyState);
+		await storage.put(LEGACY_GENERATION_KEY, seq);
+	}
+
+	/**
+	 * Picks the representation with the highest completed generation and makes the other match
+	 *
+	 * The legacy copy is complete when its `gen` key equals the stamp on its state. SQL is
+	 * the default winner. Legacy wins only when it is complete and strictly newer; a legacy
+	 * state stamped past its own `gen` is an interrupted write and is overwritten from SQL.
+	 *
+	 * @private
+	 */
+	private async recoverLegacy(): Promise<void> {
+		const phase = this.phase();
+		if (phase === 'legacy' || phase === 'sql-only') return;
+
+		const storage = this.state.storage;
+		const generation = (await storage.get<number>(LEGACY_GENERATION_KEY)) ?? 0;
+		const legacy = await storage.get<LegacyState>(LEGACY_STATE_KEY);
+		const complete = (legacy?.seq ?? 0) === generation;
+		const sqlSeq = this.seq();
+
+		if (complete && generation > sqlSeq && legacy) {
+			storage.transactionSync(() => {
+				this.writeSqlState(legacy);
+				this.state.storage.sql.exec('DELETE FROM allocations');
+				this.state.storage.sql.exec("DELETE FROM meta WHERE key = 'cursor'");
+				this.setMeta('seq', generation);
+				this.setMeta('phase', 'copying');
+			});
+		} else if (!complete || generation !== sqlSeq) {
+			await this.writeLegacy(sqlSeq, JSON.parse(this.meta('last_op') ?? '{}') as LedgerOp);
+		}
+	}
+
+	/**
+	 * Runs one step of the legacy to SQL copy
+	 *
+	 * The first step copies the state; each later step copies one page of the allocation
+	 * ledger and moves the cursor in the same transaction, and the last page flips the
+	 * phase to `dual`. Allocations made during the copy are dual-written, so the copy
+	 * only fills in keys SQL has not seen.
+	 *
+	 * @private
+	 */
+	private async advanceUpgrade(): Promise<void> {
+		const storage = this.state.storage;
+		const phase = this.phase();
+
+		if (phase === 'legacy') {
+			const legacy = await storage.get<LegacyState>(LEGACY_STATE_KEY);
+			storage.transactionSync(() => {
+				this.writeSqlState(legacy ?? { knownShards: [], shardStats: {}, strategy: 'round-robin', roundRobinIndex: 0 });
+				this.setMeta('phase', 'copying');
+			});
+		} else if (phase === 'copying') {
+			const cursor = this.meta('cursor');
+			const page = await storage.list<string>({
+				prefix: ALLOCATION_LEDGER_PREFIX,
+				limit: UPGRADE_PAGE_SIZE,
+				...(cursor && { startAfter: cursor })
+			});
+			storage.transactionSync(() => {
+				for (const [key, shard] of page) {
+					if (typeof shard !== 'string') continue;
+					storage.sql.exec(
+						'INSERT INTO allocations (primary_key, shard, created_at) VALUES (?, ?, ?) ON CONFLICT(primary_key) DO UPDATE SET shard = excluded.shard',
+						key.slice(ALLOCATION_LEDGER_PREFIX.length),
+						shard,
+						Date.now()
+					);
+				}
+				if (page.size < UPGRADE_PAGE_SIZE) {
+					storage.sql.exec("DELETE FROM meta WHERE key = 'cursor'");
+					this.setMeta('phase', 'dual');
+				} else {
+					this.setMeta('cursor', [...page.keys()].pop()!);
+				}
+			});
+		}
+	}
+
+	/**
+	 * Runs the remaining copy steps, for routes that need every allocation in SQL
+	 * @private
+	 */
+	private async completeUpgrade(): Promise<void> {
+		while (this.phase() === 'legacy' || this.phase() === 'copying') await this.advanceUpgrade();
+	}
+
+	/**
+	 * Looks up the recorded shard for a key, falling through to the legacy key while the copy runs
+	 * @private
+	 * @param primaryKey - The key to look up
+	 * @returns The recorded shard, or undefined when none is recorded
+	 */
+	private async readAllocation(primaryKey: string): Promise<string | undefined> {
+		const row = this.state.storage.sql
+			.exec<{ shard: string }>('SELECT shard FROM allocations WHERE primary_key = ?', primaryKey)
+			.toArray()[0];
+		if (row) return row.shard;
+		if (this.phase() !== 'copying') return undefined;
+		return await this.state.storage.get<string>(`${ALLOCATION_LEDGER_PREFIX}${primaryKey}`);
+	}
+
+	/**
+	 * Stops writing the legacy keys and deletes them
+	 *
+	 * Finishes any pending copy first. The phase flips to `sql-only` before the keys go, so an
+	 * interrupted run leaves unused keys behind and calling it again finishes the cleanup.
+	 * Afterwards the previous coordinator version cannot read this object; downgrading past
+	 * this call is unsupported.
+	 *
+	 * @returns Promise that resolves when the legacy keys are gone
+	 * @since 1.4.0
+	 */
+	async retireLegacy(): Promise<void> {
+		await this.exclusive(async () => {
+			await this.completeUpgrade();
+			this.setMeta('phase', 'sql-only');
+			const storage = this.state.storage;
+			await storage.delete([LEGACY_STATE_KEY, LEGACY_GENERATION_KEY]);
+			for (;;) {
+				const page = await storage.list({ prefix: ALLOCATION_LEDGER_PREFIX, limit: MAX_KEYS_PER_WRITE });
+				if (page.size === 0) break;
+				await storage.delete([...page.keys()]);
+			}
+		});
 	}
 
 	/**
@@ -132,6 +502,11 @@ export class ShardCoordinator {
 	 * - GET /stats - Get shard statistics
 	 * - POST /stats - Update shard statistics
 	 * - POST /allocate - Allocate a shard for a primary key
+	 * - POST /forget - Drop the recorded allocation for a primary key
+	 * - POST /sequence - Take the next value of a named sequence
+	 * - GET /allocations - Page through recorded allocations (`?after=<key>&limit=<n>`, since 1.4.0)
+	 * - POST /allocations/prune - Drop the named allocations, at most 128 keys (since 1.4.0)
+	 * - POST /retire-legacy - Delete the legacy storage keys (since 1.4.0)
 	 * - POST /flush - Clear all coordinator state (development only)
 	 * - GET /health - Health check endpoint
 	 *
@@ -153,25 +528,33 @@ export class ShardCoordinator {
 		const method = request.method;
 
 		try {
+			await this.ready;
 			switch (`${method} ${path}`) {
 				case 'GET /shards':
-					return this.handleListShards();
+					return await this.handleListShards();
 				case 'POST /shards':
-					return this.handleAddShard(request);
+					return await this.handleAddShard(request);
 				case 'DELETE /shards':
-					return this.handleRemoveShard(request);
+					return await this.handleRemoveShard(request);
 				case 'GET /stats':
-					return this.handleGetStats();
+					return await this.handleGetStats();
 				case 'POST /stats':
-					return this.handleUpdateStats(request);
+					return await this.handleUpdateStats(request);
 				case 'POST /allocate':
-					return this.handleAllocateShard(request);
+					return await this.handleAllocateShard(request);
 				case 'POST /forget':
-					return this.handleForgetAllocation(request);
+					return await this.handleForgetAllocation(request);
 				case 'POST /sequence':
-					return this.handleSequence(request);
+					return await this.handleSequence(request);
+				case 'GET /allocations':
+					return await this.handleListAllocations(url);
+				case 'POST /allocations/prune':
+					return await this.handlePruneAllocations(request);
+				case 'POST /retire-legacy':
+					await this.retireLegacy();
+					return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 				case 'POST /flush':
-					return this.handleFlush();
+					return await this.handleFlush();
 				case 'GET /health':
 					return new Response('OK', { status: 200 });
 				default:
@@ -191,9 +574,10 @@ export class ShardCoordinator {
 	 * @example Response body: `["db-east", "db-west", "db-central"]`
 	 */
 	private async handleListShards(): Promise<Response> {
-		const state = await this.getState();
-		return new Response(JSON.stringify(state.knownShards), {
-			headers: { 'Content-Type': 'application/json' }
+		return this.exclusive(async () => {
+			return new Response(JSON.stringify(this.readSqlState().knownShards), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -218,20 +602,22 @@ export class ShardCoordinator {
 			});
 		}
 
-		const state = await this.getState();
+		return this.exclusive(async () => {
+			const state = this.readSqlState();
 
-		if (!state.knownShards.includes(shard)) {
-			state.knownShards.push(shard);
-			state.shardStats[shard] = {
-				binding: shard,
-				count: 0,
-				lastUpdated: Date.now()
-			};
-			await this.saveState(state);
-		}
+			if (!state.knownShards.includes(shard)) {
+				state.knownShards.push(shard);
+				state.shardStats[shard] = {
+					binding: shard,
+					count: 0,
+					lastUpdated: Date.now()
+				};
+				await this.commit({ state });
+			}
 
-		return new Response(JSON.stringify({ success: true }), {
-			headers: { 'Content-Type': 'application/json' }
+			return new Response(JSON.stringify({ success: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -256,21 +642,23 @@ export class ShardCoordinator {
 			});
 		}
 
-		const state = await this.getState();
+		return this.exclusive(async () => {
+			const state = this.readSqlState();
 
-		const index = state.knownShards.indexOf(shard);
-		if (index > -1) {
-			state.knownShards.splice(index, 1);
-			delete state.shardStats[shard];
-			// Adjust round-robin index if necessary
-			if (state.roundRobinIndex >= state.knownShards.length) {
-				state.roundRobinIndex = 0;
+			const index = state.knownShards.indexOf(shard);
+			if (index > -1) {
+				state.knownShards.splice(index, 1);
+				delete state.shardStats[shard];
+				// Adjust round-robin index if necessary
+				if (state.roundRobinIndex >= state.knownShards.length) {
+					state.roundRobinIndex = 0;
+				}
+				await this.commit({ state });
 			}
-			await this.saveState(state);
-		}
 
-		return new Response(JSON.stringify({ success: true }), {
-			headers: { 'Content-Type': 'application/json' }
+			return new Response(JSON.stringify({ success: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -282,10 +670,11 @@ export class ShardCoordinator {
 	 * @example Response body: `[{"binding": "db-east", "count": 1234, "lastUpdated": 1672531200000}]`
 	 */
 	private async handleGetStats(): Promise<Response> {
-		const state = await this.getState();
-		const stats = Object.values(state.shardStats);
-		return new Response(JSON.stringify(stats), {
-			headers: { 'Content-Type': 'application/json' }
+		return this.exclusive(async () => {
+			const stats = Object.values(this.readSqlState().shardStats);
+			return new Response(JSON.stringify(stats), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -316,16 +705,18 @@ export class ShardCoordinator {
 			});
 		}
 
-		const state = await this.getState();
+		return this.exclusive(async () => {
+			const state = this.readSqlState();
 
-		if (state.shardStats[shard]) {
-			state.shardStats[shard].count = count;
-			state.shardStats[shard].lastUpdated = Date.now();
-			await this.saveState(state);
-		}
+			if (state.shardStats[shard]) {
+				state.shardStats[shard].count = count;
+				state.shardStats[shard].lastUpdated = Date.now();
+				await this.commit({ state });
+			}
 
-		return new Response(JSON.stringify({ success: true }), {
-			headers: { 'Content-Type': 'application/json' }
+			return new Response(JSON.stringify({ success: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -360,42 +751,43 @@ export class ShardCoordinator {
 			});
 		}
 
-		const state = await this.getState();
-		const eligibleShards = availableShards || state.knownShards;
+		return this.exclusive(async () => {
+			const state = this.readSqlState();
+			const eligibleShards = availableShards || state.knownShards;
 
-		if (eligibleShards.length === 0) {
-			return new Response(JSON.stringify({ error: 'No shards available' }), {
-				status: 400,
+			if (eligibleShards.length === 0) {
+				return new Response(JSON.stringify({ error: 'No shards available' }), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
+
+			// Recording the decision makes allocation idempotent per key. Without it,
+			// two concurrent first-touches of the same key under round-robin or random
+			// receive different shards, both write the mapping to KV, and the row
+			// written by the loser of that race sits on a shard the surviving mapping
+			// does not name. The ledger is advisory: the KV mapping stays the record.
+			const recorded = await this.readAllocation(primaryKey);
+			if (typeof recorded === 'string' && eligibleShards.includes(recorded)) {
+				return new Response(JSON.stringify({ shard: recorded, reused: true }), {
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
+
+			const effectiveStrategy = this.resolveStrategy(state.strategy, strategy, operationType || 'write');
+			const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy, eligibleShards);
+
+			const ledger: LedgerOp = { put: [[primaryKey, selectedShard]] };
+			if (effectiveStrategy === 'round-robin') {
+				state.roundRobinIndex = (state.roundRobinIndex + 1) % eligibleShards.length;
+				await this.commit({ state, ledger });
+			} else {
+				await this.commit({ ledger });
+			}
+
+			return new Response(JSON.stringify({ shard: selectedShard }), {
 				headers: { 'Content-Type': 'application/json' }
 			});
-		}
-
-		// A Durable Object serializes its requests, so recording the decision here
-		// makes allocation idempotent per key. Without it, two concurrent
-		// first-touches of the same key under round-robin or random receive
-		// different shards, both write the mapping to KV, and the row written by
-		// the loser of that race sits on a shard the surviving mapping does not
-		// name.
-		const ledgerKey = `${ALLOCATION_LEDGER_PREFIX}${primaryKey}`;
-		const recorded = await this.state.storage.get<string>(ledgerKey);
-		if (typeof recorded === 'string' && eligibleShards.includes(recorded)) {
-			return new Response(JSON.stringify({ shard: recorded, reused: true }), {
-				headers: { 'Content-Type': 'application/json' }
-			});
-		}
-
-		const effectiveStrategy = this.resolveStrategy(state.strategy, strategy, operationType || 'write');
-		const selectedShard = this.selectShard(primaryKey, state, effectiveStrategy, eligibleShards);
-
-		await this.state.storage.put(ledgerKey, selectedShard);
-
-		if (effectiveStrategy === 'round-robin') {
-			state.roundRobinIndex = (state.roundRobinIndex + 1) % eligibleShards.length;
-			await this.saveState(state);
-		}
-
-		return new Response(JSON.stringify({ shard: selectedShard }), {
-			headers: { 'Content-Type': 'application/json' }
 		});
 	}
 
@@ -406,10 +798,13 @@ export class ShardCoordinator {
 	 * first-touch allocates afresh instead of being handed the stale decision.
 	 *
 	 * @param primaryKey - The key whose recorded allocation should be dropped
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	async forgetAllocation(primaryKey: string): Promise<void> {
-		await this.state.storage.delete(`${ALLOCATION_LEDGER_PREFIX}${primaryKey}`);
+		await this.exclusive(async () => {
+			if ((await this.readAllocation(primaryKey)) === undefined) return;
+			await this.commit({ ledger: { del: [primaryKey] } });
+		});
 	}
 
 	/**
@@ -463,29 +858,92 @@ export class ShardCoordinator {
 			});
 		}
 
-		const state = await this.getState();
-		const sequences = state.sequences ?? {};
+		return this.exclusive(async () => {
+			const state = this.readSqlState();
+			const sequences = state.sequences ?? {};
 
-		// A caller that has not paid for a cross-shard maximum asks with
-		// `requireExisting` so it only gets an answer when the sequence is already
-		// past every existing row. Answering with 1 here would hand out an id that
-		// collides with rows the shards already hold.
-		if (requireExisting && sequences[name] === undefined) {
-			return new Response(JSON.stringify({ needsSeed: true }), {
+			// A caller that has not paid for a cross-shard maximum asks with
+			// `requireExisting` so it only gets an answer when the sequence is already
+			// past every existing row. Answering with 1 here would hand out an id that
+			// collides with rows the shards already hold.
+			if (requireExisting && sequences[name] === undefined) {
+				return new Response(JSON.stringify({ needsSeed: true }), {
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
+
+			const current = sequences[name] ?? 0;
+			const floor = typeof min === 'number' && Number.isFinite(min) ? Math.floor(min) : 0;
+			const next = Math.max(current + 1, floor);
+
+			sequences[name] = next;
+			state.sequences = sequences;
+			await this.commit({ state });
+
+			return new Response(JSON.stringify({ value: next }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		});
+	}
+
+	/**
+	 * Lists recorded allocations in key order, one page at a time.
+	 *
+	 * Finishes any pending legacy copy first so the listing is complete. The `next`
+	 * field is the last key of a full page, or null on the final page.
+	 *
+	 * @private
+	 * @param url - Request URL carrying the optional `after` and `limit` query parameters
+	 * @returns Promise resolving to HTTP response with the page
+	 * @example Response body: `{"allocations": [{"primaryKey": "user-1", "shard": "db-east", "createdAt": 1672531200000}], "next": null}`
+	 */
+	private async handleListAllocations(url: URL): Promise<Response> {
+		const after = url.searchParams.get('after') ?? '';
+		const requested = Number.parseInt(url.searchParams.get('limit') ?? '', 10);
+		const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 1000) : 100;
+
+		return this.exclusive(async () => {
+			await this.completeUpgrade();
+			const rows = this.state.storage.sql
+				.exec<{
+					primary_key: string;
+					shard: string;
+					created_at: number;
+				}>('SELECT primary_key, shard, created_at FROM allocations WHERE primary_key > ? ORDER BY primary_key LIMIT ?', after, limit + 1)
+				.toArray();
+			const page = rows.slice(0, limit);
+			const body = {
+				allocations: page.map((row) => ({ primaryKey: row.primary_key, shard: row.shard, createdAt: row.created_at })),
+				next: rows.length > limit ? page[page.length - 1]!.primary_key : null
+			};
+			return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+		});
+	}
+
+	/**
+	 * Drops the named allocations. The caller has checked each key against its mapping,
+	 * and nothing here prunes on its own.
+	 *
+	 * @private
+	 * @param request - HTTP request containing up to 128 primary keys
+	 * @returns Promise resolving to HTTP response with the number of rows removed
+	 * @example Request body: `{"primaryKeys": ["user-1", "user-2"]}`
+	 * @example Response body: `{"pruned": 2}`
+	 */
+	private async handlePruneAllocations(request: Request): Promise<Response> {
+		const { primaryKeys } = (await request.json()) as { primaryKeys?: unknown };
+
+		if (!Array.isArray(primaryKeys) || primaryKeys.length > MAX_KEYS_PER_WRITE || primaryKeys.some((key) => typeof key !== 'string')) {
+			return new Response(JSON.stringify({ error: `primaryKeys must be an array of at most ${MAX_KEYS_PER_WRITE} strings` }), {
+				status: 400,
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}
 
-		const current = sequences[name] ?? 0;
-		const floor = typeof min === 'number' && Number.isFinite(min) ? Math.floor(min) : 0;
-		const next = Math.max(current + 1, floor);
-
-		sequences[name] = next;
-		state.sequences = sequences;
-		await this.saveState(state);
-
-		return new Response(JSON.stringify({ value: next }), {
-			headers: { 'Content-Type': 'application/json' }
+		return this.exclusive(async () => {
+			await this.completeUpgrade();
+			const pruned = primaryKeys.length === 0 ? 0 : await this.commit({ ledger: { del: primaryKeys as string[] } });
+			return new Response(JSON.stringify({ pruned }), { headers: { 'Content-Type': 'application/json' } });
 		});
 	}
 
@@ -501,9 +959,17 @@ export class ShardCoordinator {
 	 * @example Response body: `{"success": true}`
 	 */
 	private async handleFlush(): Promise<Response> {
-		await this.state.storage.deleteAll();
-		return new Response(JSON.stringify({ success: true }), {
-			headers: { 'Content-Type': 'application/json' }
+		return this.exclusive(async () => {
+			await this.state.storage.deleteAll();
+			// deleteAll may or may not drop the tables, so create them and empty them either way
+			this.createSchema();
+			for (const table of ['shards', 'stats', 'allocations', 'sequences', 'meta']) {
+				this.state.storage.sql.exec(`DELETE FROM ${table}`);
+			}
+			this.createSchema();
+			return new Response(JSON.stringify({ success: true }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
 		});
 	}
 
@@ -648,12 +1114,14 @@ export class ShardCoordinator {
 	 * ```
 	 */
 	async incrementShardCount(shard: string): Promise<void> {
-		const state = await this.getState();
-		if (state.shardStats[shard]) {
-			state.shardStats[shard].count++;
-			state.shardStats[shard].lastUpdated = Date.now();
-			await this.saveState(state);
-		}
+		await this.exclusive(async () => {
+			const state = this.readSqlState();
+			if (state.shardStats[shard]) {
+				state.shardStats[shard].count++;
+				state.shardStats[shard].lastUpdated = Date.now();
+				await this.commit({ state });
+			}
+		});
 	}
 
 	/**
@@ -669,11 +1137,13 @@ export class ShardCoordinator {
 	 * ```
 	 */
 	async decrementShardCount(shard: string): Promise<void> {
-		const state = await this.getState();
-		if (state.shardStats[shard] && state.shardStats[shard].count > 0) {
-			state.shardStats[shard].count--;
-			state.shardStats[shard].lastUpdated = Date.now();
-			await this.saveState(state);
-		}
+		await this.exclusive(async () => {
+			const state = this.readSqlState();
+			if (state.shardStats[shard] && state.shardStats[shard].count > 0) {
+				state.shardStats[shard].count--;
+				state.shardStats[shard].lastUpdated = Date.now();
+				await this.commit({ state });
+			}
+		});
 	}
 }

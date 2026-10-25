@@ -25,6 +25,7 @@ export {
 	count,
 	countAllShards,
 	countShard,
+	createClient,
 	createSchema,
 	deleteById,
 	deleteLookup,
@@ -46,6 +47,7 @@ export {
 	getDatabaseSizeForShard,
 	getDatabaseSizesAllShards,
 	getLookup,
+	getMigrationStatus,
 	getShardStats,
 	getTotalDatabaseSize,
 	index,
@@ -65,23 +67,29 @@ export {
 	paginate,
 	patch,
 	prepare,
+	pruneEpochs,
+	publishEligibility,
+	purgeRetired,
 	query,
 	queryAll,
 	queryFirst,
 	reassignShard,
 	rebalance,
+	recoverMigrations,
 	resetConfig,
 	run,
 	runAllShards,
 	runShard,
 	setLookup,
 	updateRow,
-	upsert
+	upsert,
+	verifyMigrations
 } from './router';
 
 export type {
 	BatchEntry,
 	BatchShardResult,
+	CollegeDBClient,
 	CreateIndexOptions,
 	CrudReturningOptions,
 	EnsureSchemaOptions,
@@ -116,13 +124,14 @@ export {
 	type PlacementEpoch,
 	type PlacementManifest
 } from './placement';
+export type { PruneOptions, PruneReport } from './topology';
 
 // Export per-phase timing instrumentation
 export { PhaseCollector, isPhaseObserverActive, setPhaseObserver } from './telemetry';
 export type { PhaseName, PhaseObserver, PhaseSpan, PhaseStats } from './telemetry';
 
 // Export deterministic SQL builders
-export { buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier, validateIdentifier } from './query';
+export { PROVEN_JOURNAL_DIALECTS, buildDelete, buildInsert, buildUpdate, buildUpsert, quoteIdentifier, validateIdentifier } from './query';
 export type { BuildInsertOptions, BuildUpsertOptions, BuiltQuery, ColumnValues } from './query';
 
 // Export KV read-through cache helpers
@@ -132,7 +141,10 @@ export type { CacheOptions } from './cache';
 // Export utility classes
 export { ShardCoordinator } from './durable';
 export { CollegeDBError } from './errors';
+export { withKVTimeout } from './kv-timeout';
 export { KVShardMapper } from './kvmap';
+export { reconcileAllocations } from './reconcile';
+export type { ReconcileOptions, ReconcileReport } from './reconcile';
 
 // Export provider adapters
 export {
@@ -190,14 +202,24 @@ export {
 	validateTableForSharding,
 	type IntegrationOptions,
 	type IntegrationResult,
-	type ValidationResult
+	type MigrateRecordOptions,
+	type MigrationState,
+	type MigrationStatus,
+	type MoveRecordOptions,
+	type PurgeReport,
+	type RecoveryReport,
+	type RetirePolicy,
+	type ValidationResult,
+	type VerifyReport
 } from './migrations';
 
 // Export types
 export type {
 	BatchStatement,
 	CollegeDBConfig,
+	ConsistencyCapabilities,
 	D1Region,
+	EligibilityContext,
 	Env,
 	KVListResult,
 	KVStorage,
@@ -206,11 +228,15 @@ export type {
 	PreparedStatement,
 	QueryResult,
 	QueryResultMeta,
+	ReadConsistency,
+	ReadOptions,
 	SQLDatabase,
 	SQLDialect,
+	SQLSession,
 	ShardCoordinatorState,
 	ShardLocation,
 	ShardMapping,
+	ShardState,
 	ShardStats,
 	ShardingStrategy
 } from './types';

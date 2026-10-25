@@ -18,10 +18,10 @@
  * faster than that, which is why it is not the default.
  *
  * @author Gregory Mitchell
- * @since 1.4.0
+ * @since 1.3.0
  */
 
-import type { BatchStatement, KVListResult, KVStorage, PreparedStatement, QueryResult, SQLDatabase } from './types';
+import type { BatchStatement, KVListResult, KVStorage, PreparedStatement, QueryResult, SQLDatabase, SQLSession } from './types';
 
 /**
  * A distinct cost inside a routed operation.
@@ -31,14 +31,14 @@ import type { BatchStatement, KVListResult, KVStorage, PreparedStatement, QueryR
  * - `shard.select` - running the allocation strategy for an unmapped key
  * - `coordinator.fetch` - a Durable Object round trip
  * - `sql.prepare` / `sql.exec` - statement construction and execution
- * @since 1.4.0
+ * @since 1.3.0
  */
 export type PhaseName =
 	'hash' | 'kv.get' | 'kv.put' | 'kv.delete' | 'kv.list' | 'shard.select' | 'coordinator.fetch' | 'sql.prepare' | 'sql.exec';
 
 /**
  * One measured phase.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface PhaseSpan {
 	/** Which cost this span measured */
@@ -52,11 +52,28 @@ export interface PhaseSpan {
 /**
  * Receives every measured phase. Must not throw; exceptions are swallowed so a
  * broken observer cannot fail a query.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export type PhaseObserver = (span: PhaseSpan) => void;
 
-let observer: PhaseObserver | null = null;
+/**
+ * Where a configuration's spans go. The default instance reports to
+ * {@link setPhaseObserver}; every client has a sink of its own, fed from its
+ * `onPhase`, so spans never reach another client's observer.
+ * @since 1.4.0
+ */
+export interface PhaseSink {
+	/** Receives each span, or `null` when instrumentation is off */
+	observer: PhaseObserver | null;
+}
+
+/** Creates a sink that reports to `observer`, or to nothing. @since 1.4.0 */
+export function createPhaseSink(observer: PhaseObserver | null = null): PhaseSink {
+	return { observer };
+}
+
+/** The sink behind {@link setPhaseObserver}. @since 1.4.0 */
+export const defaultPhaseSink: PhaseSink = createPhaseSink();
 
 const clock: () => number =
 	typeof performance !== 'undefined' && typeof performance.now === 'function' ? () => performance.now() : () => Date.now();
@@ -65,26 +82,28 @@ const clock: () => number =
  * Installs the phase observer, or clears it when passed `null`.
  *
  * Called by {@link initialize} from `config.onPhase`; exported so tests and
- * benchmark harnesses can attach a collector without reinitializing.
+ * benchmark harnesses can attach a collector without reinitializing. It applies
+ * to the default instance only: a client takes its observer from its own
+ * `onPhase`.
  *
  * @param next - Observer to install, or `null` to disable instrumentation
- * @since 1.4.0
+ * @since 1.3.0
  */
 export function setPhaseObserver(next: PhaseObserver | null): void {
-	observer = next ?? null;
+	defaultPhaseSink.observer = next ?? null;
 }
 
 /**
- * Reports whether instrumentation is currently active.
+ * Reports whether instrumentation is currently active on the default instance.
  *
  * Use this to skip building an expensive `detail` string that would only be
  * read by an observer.
  *
  * @returns `true` when a phase observer is installed
- * @since 1.4.0
+ * @since 1.3.0
  */
 export function isPhaseObserverActive(): boolean {
-	return observer !== null;
+	return defaultPhaseSink.observer !== null;
 }
 
 /**
@@ -93,8 +112,9 @@ export function isPhaseObserverActive(): boolean {
  * Returns `undefined` when no observer is installed, which {@link phaseEnd}
  * treats as "do nothing". Reading the clock is skipped entirely in that case.
  *
+ * @param sink - Where the span will be reported; the default instance's sink when omitted
  * @returns An opaque start timestamp, or `undefined` when instrumentation is off
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const started = phaseStart();
@@ -102,8 +122,8 @@ export function isPhaseObserverActive(): boolean {
  * phaseEnd('kv.get', started);
  * ```
  */
-export function phaseStart(): number | undefined {
-	return observer === null ? undefined : clock();
+export function phaseStart(sink: PhaseSink = defaultPhaseSink): number | undefined {
+	return sink.observer === null ? undefined : clock();
 }
 
 /**
@@ -115,9 +135,11 @@ export function phaseStart(): number | undefined {
  * @param phase - Which cost this span measured
  * @param started - The value returned by {@link phaseStart}
  * @param detail - Optional discriminator recorded on the span
- * @since 1.4.0
+ * @param sink - Where to report the span; the default instance's sink when omitted
+ * @since 1.3.0
  */
-export function phaseEnd(phase: PhaseName, started: number | undefined, detail?: string): void {
+export function phaseEnd(phase: PhaseName, started: number | undefined, detail?: string, sink: PhaseSink = defaultPhaseSink): void {
+	const observer = sink.observer;
 	if (observer === null || started === undefined) {
 		return;
 	}
@@ -141,74 +163,75 @@ export function phaseEnd(phase: PhaseName, started: number | undefined, detail?:
  * is created at all and the original store is used directly.
  *
  * @param kv - The store to wrap
+ * @param sink - Where the spans go; the default instance's sink when omitted
  * @returns A store with identical behavior that reports timings
- * @since 1.4.0
+ * @since 1.3.0
  */
-export function instrumentKV(kv: KVStorage): KVStorage {
+export function instrumentKV(kv: KVStorage, sink: PhaseSink = defaultPhaseSink): KVStorage {
 	const wrapped: KVStorage = {
 		async get<T = unknown>(key: string, type?: 'text' | 'json'): Promise<any> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await (type === 'json' ? kv.get<T>(key, 'json') : kv.get(key, type));
 			} finally {
-				phaseEnd('kv.get', started, keyPrefix(key));
+				phaseEnd('kv.get', started, keyPrefix(key), sink);
 			}
 		},
 		async put(key: string, value: string): Promise<void> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				await kv.put(key, value);
 			} finally {
-				phaseEnd('kv.put', started, keyPrefix(key));
+				phaseEnd('kv.put', started, keyPrefix(key), sink);
 			}
 		},
 		async delete(key: string): Promise<void> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				await kv.delete(key);
 			} finally {
-				phaseEnd('kv.delete', started, keyPrefix(key));
+				phaseEnd('kv.delete', started, keyPrefix(key), sink);
 			}
 		},
 		async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<KVListResult> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await kv.list(options);
 			} finally {
-				phaseEnd('kv.list', started, options?.prefix);
+				phaseEnd('kv.list', started, options?.prefix, sink);
 			}
 		}
 	};
 
 	if (kv.getMany) {
 		wrapped.getMany = async <T = unknown>(keys: string[], type?: 'text' | 'json'): Promise<any> => {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await (type === 'json' ? kv.getMany!<T>(keys, 'json') : kv.getMany!(keys, type));
 			} finally {
-				phaseEnd('kv.get', started, `many:${keys.length}`);
+				phaseEnd('kv.get', started, `many:${keys.length}`, sink);
 			}
 		};
 	}
 
 	if (kv.putMany) {
 		wrapped.putMany = async (entries) => {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				await kv.putMany!(entries);
 			} finally {
-				phaseEnd('kv.put', started, `many:${entries.length}`);
+				phaseEnd('kv.put', started, `many:${entries.length}`, sink);
 			}
 		};
 	}
 
 	if (kv.deleteMany) {
 		wrapped.deleteMany = async (keys) => {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				await kv.deleteMany!(keys);
 			} finally {
-				phaseEnd('kv.delete', started, `many:${keys.length}`);
+				phaseEnd('kv.delete', started, `many:${keys.length}`, sink);
 			}
 		};
 	}
@@ -224,64 +247,106 @@ export function instrumentKV(kv: KVStorage): KVStorage {
  *
  * @param db - The provider to wrap
  * @param binding - Shard binding name, recorded as the span detail
+ * @param sink - Where the spans go; the default instance's sink when omitted
  * @returns A provider with identical behavior that reports timings
- * @since 1.4.0
+ * @since 1.3.0
  */
-export function instrumentSQL(db: SQLDatabase, binding: string): SQLDatabase {
+export function instrumentSQL(db: SQLDatabase, binding: string, sink: PhaseSink = defaultPhaseSink): SQLDatabase {
 	const wrapped: SQLDatabase = {
 		prepare(sql: string): PreparedStatement {
-			const prepareStarted = phaseStart();
-			const inner = db.prepare(sql);
-			phaseEnd('sql.prepare', prepareStarted, binding);
-			return instrumentStatement(inner, binding);
+			return instrumentPrepare(db, sql, binding, sink);
 		}
 	};
 
+	if (db.dialect) {
+		wrapped.dialect = db.dialect;
+	}
+	if (db.consistency) {
+		wrapped.consistency = db.consistency;
+	}
+	if (db.atomicBatch !== undefined) {
+		wrapped.atomicBatch = db.atomicBatch;
+	}
 	if (db.runBatch) {
 		wrapped.runBatch = async <T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]> => {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await db.runBatch!<T>(statements);
 			} finally {
-				phaseEnd('sql.exec', started, `${binding}:batch:${statements.length}`);
+				phaseEnd('sql.exec', started, `${binding}:batch:${statements.length}`, sink);
 			}
 		};
+	}
+	// set only when present, so typeof detection stays truthful
+	if (db.withSession) {
+		wrapped.withSession = (constraintOrBookmark?: string): SQLSession =>
+			instrumentSession(db.withSession!(constraintOrBookmark), binding, sink);
 	}
 
 	return wrapped;
 }
 
 /**
+ * Wraps a read session so statements it prepares report spans and its bookmark
+ * reads through unchanged.
+ * @private
+ */
+function instrumentSession(session: SQLSession, binding: string, sink: PhaseSink): SQLSession {
+	return {
+		prepare(sql: string): PreparedStatement {
+			return instrumentPrepare(session, sql, binding, sink);
+		},
+		getBookmark: () => session.getBookmark()
+	};
+}
+
+/**
+ * Prepares a statement on a database or session and reports the `sql.prepare` span.
+ * @private
+ */
+function instrumentPrepare(
+	target: { prepare(sql: string): PreparedStatement },
+	sql: string,
+	binding: string,
+	sink: PhaseSink
+): PreparedStatement {
+	const started = phaseStart(sink);
+	const inner = target.prepare(sql);
+	phaseEnd('sql.prepare', started, binding, sink);
+	return instrumentStatement(inner, binding, sink);
+}
+
+/**
  * Wraps a prepared statement so each terminal call reports a `sql.exec` span.
  * @private
  */
-function instrumentStatement(statement: PreparedStatement, binding: string): PreparedStatement {
+function instrumentStatement(statement: PreparedStatement, binding: string, sink: PhaseSink): PreparedStatement {
 	return {
 		bind(...bindings: any[]): PreparedStatement {
-			return instrumentStatement(statement.bind(...bindings), binding);
+			return instrumentStatement(statement.bind(...bindings), binding, sink);
 		},
 		async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await statement.run<T>();
 			} finally {
-				phaseEnd('sql.exec', started, binding);
+				phaseEnd('sql.exec', started, binding, sink);
 			}
 		},
 		async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await statement.all<T>();
 			} finally {
-				phaseEnd('sql.exec', started, binding);
+				phaseEnd('sql.exec', started, binding, sink);
 			}
 		},
 		async first<T = Record<string, unknown>>(): Promise<T | null> {
-			const started = phaseStart();
+			const started = phaseStart(sink);
 			try {
 				return await statement.first<T>();
 			} finally {
-				phaseEnd('sql.exec', started, binding);
+				phaseEnd('sql.exec', started, binding, sink);
 			}
 		}
 	};
@@ -299,7 +364,7 @@ function keyPrefix(key: string): string {
 
 /**
  * Aggregated statistics for one phase.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface PhaseStats {
 	/** Which cost these statistics describe */
@@ -327,7 +392,7 @@ export interface PhaseStats {
  * table rather than a stream: attach {@link PhaseCollector.observer}, run a
  * workload, then read {@link PhaseCollector.stats}.
  *
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const collector = new PhaseCollector();

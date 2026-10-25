@@ -11,7 +11,7 @@ import {
 	setPhaseObserver,
 	type PhaseSpan
 } from '../src/telemetry';
-import type { KVStorage, SQLDatabase } from '../src/types';
+import type { KVStorage, PreparedStatement, SQLDatabase, SQLSession } from '../src/types';
 
 const SCHEMA = 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)';
 
@@ -304,5 +304,95 @@ describe('Instrument wrappers', () => {
 		const wrapped = instrumentSQL(failing, 'db-c');
 		await expect(wrapped.prepare('SELECT 1').run()).rejects.toThrow('boom');
 		expect(spans.filter((span) => span.phase === 'sql.exec' && span.detail === 'db-c')).toHaveLength(1);
+	});
+
+	describe('provider capabilities', () => {
+		afterEach(() => {
+			resetConfig();
+		});
+
+		function statement(): PreparedStatement {
+			const stmt: PreparedStatement = {
+				bind: () => stmt,
+				async run() {
+					return { success: true, results: [], meta: { duration: 0 } };
+				},
+				async all() {
+					return { success: true, results: [], meta: { duration: 0 } };
+				},
+				async first() {
+					return null;
+				}
+			};
+			return stmt;
+		}
+
+		it('keeps dialect and consistency on the wrapper', () => {
+			const consistency = { primary: true, session: false, eventual: true };
+			const db: SQLDatabase = { prepare: () => statement(), dialect: 'postgres', consistency };
+
+			const wrapped = instrumentSQL(db, 'pg-a');
+			expect(wrapped.dialect).toBe('postgres');
+			expect(wrapped.consistency).toBe(consistency);
+		});
+
+		it('leaves withSession, consistency, and dialect absent when the provider lacks them', () => {
+			const wrapped = instrumentSQL({ prepare: () => statement() }, 'plain');
+			expect('withSession' in wrapped).toBe(false);
+			expect('consistency' in wrapped).toBe(false);
+			expect('dialect' in wrapped).toBe(false);
+		});
+
+		it('instruments a read session and passes its bookmark through', async () => {
+			const { spans } = record();
+			const session: SQLSession = { prepare: () => statement(), getBookmark: () => 'bm-1' };
+			let constraint: string | undefined;
+
+			const d1Like: SQLDatabase = {
+				prepare: () => statement(),
+				withSession(this: SQLDatabase, arg?: string) {
+					expect(this).toBe(d1Like);
+					constraint = arg;
+					return session;
+				}
+			};
+
+			const wrapped = instrumentSQL(d1Like, 'd1-a');
+			expect(typeof wrapped.withSession).toBe('function');
+
+			const opened = wrapped.withSession!('first-primary');
+			expect(constraint).toBe('first-primary');
+			expect(opened.getBookmark()).toBe('bm-1');
+
+			await opened.prepare('SELECT 1').all();
+			expect(spans.filter((span) => span.phase === 'sql.prepare').map((span) => span.detail)).toEqual(['d1-a']);
+			expect(spans.filter((span) => span.phase === 'sql.exec').map((span) => span.detail)).toEqual(['d1-a']);
+		});
+
+		it('serves a session read through initialize with onPhase set', async () => {
+			const spans: PhaseSpan[] = [];
+			const constraints: string[] = [];
+
+			const d1Like: SQLDatabase = {
+				prepare: () => statement(),
+				withSession(constraint?: string) {
+					constraints.push(constraint ?? '');
+					return { prepare: () => statement(), getBookmark: () => 'bm-1' };
+				}
+			};
+
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards: { 'd1-a': d1Like },
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false,
+				onPhase: (span) => spans.push(span)
+			});
+
+			await expect(first('k1', 'SELECT * FROM items WHERE id = ?', ['k1'], { consistency: { mode: 'session' } })).resolves.toBeNull();
+			expect(constraints).toEqual(['first-unconstrained']);
+			expect(spans.some((span) => span.phase === 'sql.prepare' && span.detail === 'd1-a')).toBe(true);
+		});
 	});
 });

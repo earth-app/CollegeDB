@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	allAllShardsGlobal,
 	allByLookupKey,
@@ -582,5 +582,55 @@ describe('Key hashing', () => {
 		const cold = await fresh.hashKey('repeat-me');
 		const warm = await fresh.hashKey('repeat-me');
 		expect(warm).toBe(cold);
+	});
+
+	it('evicts the oldest memoized hash instead of stopping at the bound', async () => {
+		const fresh = new KVShardMapper(createInMemoryKVProvider());
+		for (let i = 0; i <= 10_000; i++) {
+			await fresh.hashKey(`bulk-${i}`);
+		}
+		expect(fresh['hashCache'].size).toBe(10_000);
+
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		await fresh.hashKey('bulk-10000');
+		expect(digest).not.toHaveBeenCalled();
+
+		await fresh.hashKey('bulk-0');
+		expect(digest).toHaveBeenCalledTimes(1);
+		digest.mockRestore();
+	});
+
+	it('keeps evicting oldest first after the ring wraps', async () => {
+		const fresh = new KVShardMapper(createInMemoryKVProvider());
+		for (let i = 0; i < 25_000; i++) {
+			await fresh.hashKey(`wrap-${i}`);
+		}
+		expect(fresh['hashCache'].size).toBe(10_000);
+
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		await fresh.hashKey('wrap-24999');
+		await fresh.hashKey('wrap-15000');
+		expect(digest).not.toHaveBeenCalled();
+
+		await fresh.hashKey('wrap-14999');
+		expect(digest).toHaveBeenCalledTimes(1);
+		digest.mockRestore();
+	});
+
+	it('gives a key one ring slot when two lookups for it overlap', async () => {
+		const fresh = new KVShardMapper(createInMemoryKVProvider());
+		await Promise.all([fresh.hashKey('twin'), fresh.hashKey('twin')]);
+		for (let i = 0; i < 9_999; i++) {
+			await fresh.hashKey(`fill-${i}`);
+		}
+		expect(fresh['hashCache'].size).toBe(10_000);
+
+		await fresh.hashKey('one-more');
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		await fresh.hashKey('fill-9998');
+		expect(digest).not.toHaveBeenCalled();
+		await fresh.hashKey('twin');
+		expect(digest).toHaveBeenCalledTimes(1);
+		digest.mockRestore();
 	});
 });

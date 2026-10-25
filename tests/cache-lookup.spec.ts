@@ -83,6 +83,58 @@ describe('KV read-through cache', () => {
 		resetConfig();
 		await expect(cached('k:5', async () => 1)).rejects.toThrow('CollegeDB not initialized');
 	});
+
+	it('keeps single-flight per store when two stores share a key', async () => {
+		const other = createInMemoryKVProvider();
+		const first = cached(
+			'shared',
+			async () => {
+				await Promise.resolve();
+				return 'a';
+			},
+			{ kv }
+		);
+		const second = cached(
+			'shared',
+			async () => {
+				await Promise.resolve();
+				return 'b';
+			},
+			{ kv: other }
+		);
+
+		expect(await first).toBe('a');
+		expect(await second).toBe('b');
+	});
+
+	it('shares one fetcher call per store across concurrent misses', async () => {
+		const fetcher = vi.fn(async () => {
+			await Promise.resolve();
+			return 'once';
+		});
+
+		const results = await Promise.all([cached('k:dup', fetcher), cached('k:dup', fetcher), cached('k:dup', fetcher)]);
+
+		expect(results).toEqual(['once', 'once', 'once']);
+		expect(fetcher).toHaveBeenCalledTimes(1);
+	});
+
+	it('rejects a hung fetch and frees the key for the next caller', async () => {
+		const hung = cached('k:hang', () => new Promise<string>(() => {}), { fetchTimeoutMs: 20 });
+
+		await expect(hung).rejects.toMatchObject({ code: 'CACHE_FETCH_TIMEOUT' });
+		expect(await cached('k:hang', async () => 'ok')).toBe('ok');
+	});
+
+	it('rejects every caller that joined the hung fetch', async () => {
+		const joiner = vi.fn(async () => 'never');
+		const first = cached('k:hang2', () => new Promise<string>(() => {}), { fetchTimeoutMs: 20 });
+		const second = cached('k:hang2', joiner, { fetchTimeoutMs: 20 });
+
+		await expect(first).rejects.toMatchObject({ code: 'CACHE_FETCH_TIMEOUT' });
+		await expect(second).rejects.toMatchObject({ code: 'CACHE_FETCH_TIMEOUT' });
+		expect(joiner).not.toHaveBeenCalled();
+	});
 });
 
 describe('Secondary-index lookups', () => {

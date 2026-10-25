@@ -41,34 +41,67 @@
  */
 
 import type { Request } from '@cloudflare/workers-types';
+import { asyncContextAvailable, runInScope } from './async-context';
+import { cached as cacheValue, invalidate as invalidateCache, type CacheOptions } from './cache';
 import { CollegeDBError } from './errors';
+import { withKVTimeout } from './kv-timeout';
 import { KVShardMapper } from './kvmap';
-import { createSchemaAcrossShards } from './migrations';
+import {
+	createSchemaAcrossShards,
+	ensureJournalSchema,
+	ensureShardTables,
+	findTombstone,
+	getMigrationStatus as getJournalStatus,
+	moveRecord,
+	purgeRetired as purgeJournal,
+	recoverMigrations as recoverJournal,
+	runGuardedWrite,
+	verifyMigrations as verifyJournal,
+	type MigrationEnv,
+	type MigrationStatus,
+	type MoveRecordOptions,
+	type PublishInfo,
+	type PurgeReport,
+	type RecoveryReport,
+	type VerifyReport
+} from './migrations';
 import {
 	addPlacementException,
 	candidateShards,
-	createManifest,
 	hrwShard,
+	isPlacementBackingOff,
+	isPlacementManifestFresh,
 	loadPlacementExceptions,
 	loadPlacementManifest,
+	placementUnverified,
+	publishPlacementEpoch,
+	republishPlacementExceptions,
 	resetPlacementState,
 	savePlacementManifest,
-	withCurrentTopology,
+	shardForEpoch,
 	type PlacementManifest
 } from './placement';
 import { planQuery, unroutableError } from './planner';
 import { createWorkersKVProvider, isKVStorage, toProvider, type DrizzleSqlTagLike } from './providers';
 import {
 	buildDelete,
+	buildGuardedInsert,
+	buildGuardedUpsert,
 	buildInsert,
 	buildUpdate,
 	buildUpsert,
+	isProvenJournalDialect,
 	validateIdentifier,
 	type BuildInsertOptions,
 	type BuildUpsertOptions,
-	type ColumnValues
+	type BuiltQuery,
+	type ColumnValues,
+	type TombstoneGuard
 } from './query';
-import { instrumentKV, instrumentSQL, phaseEnd, phaseStart, setPhaseObserver } from './telemetry';
+import { reconcileAllocationsIn, type ReconcileOptions, type ReconcileReport } from './reconcile';
+import { createRouterState, currentState, type RouterState } from './state';
+import { instrumentKV, instrumentSQL, phaseEnd, phaseStart } from './telemetry';
+import { readFence, runPrune, type PruneOptions, type PruneReport } from './topology';
 import type {
 	CollegeDBConfig,
 	D1Region,
@@ -76,6 +109,8 @@ import type {
 	OperationType,
 	PreparedStatement,
 	QueryResult,
+	ReadConsistency,
+	ReadOptions,
 	SQLDatabase,
 	SQLDialect,
 	ShardLocation,
@@ -83,67 +118,28 @@ import type {
 	ShardingStrategy
 } from './types';
 
-/**
- * Global configuration for the collegedb instance
- *
- * Stores the system-wide configuration including KV namespace, available shards,
- * coordinator settings, and allocation strategy. Must be initialized before
- * any routing operations can be performed.
- *
- * @private
- */
-let globalConfig: CollegeDBConfig | null = null;
-
-/**
- * Shared mapper instance for the active configuration.
- *
- * Reusing a single mapper preserves in-memory caches and avoids repeated
- * constructor/setup overhead on each operation.
- *
- * @private
- */
-let globalMapper: KVShardMapper | null = null;
-
-/**
- * In-memory cache for per-shard size checks.
- * @private
- */
-const shardSizeCache = new Map<string, { size: number; expiresAt: number }>();
-
-let generatedInsertRoundRobinIndex = 0;
-
-/**
- * Cached placement decision for the active configuration. Cleared whenever the
- * configuration changes, so a reconfigured process never resolves against
- * another deployment's topology.
- *
- * @private
- */
-let placementDecision: { mode: 'computed' | 'kv'; manifest: PlacementManifest | null } | null = null;
-
-/**
- * Shard sets whose known-shard registration has already been done in this
- * process, so calling {@link initialize} per request costs nothing after the
- * first call.
- *
- * @private
- */
-const syncedShardSets = new Set<string>();
+/** @private */
+function clearPlacementDecision(s: RouterState): void {
+	s.placementDecision = null;
+	s.placementFlight = null;
+	s.placementReadOnly = false;
+	s.placementToken++;
+}
 
 /**
  * Gets the shared mapper for the active configuration.
  * @private
  */
-function getMapper(config: CollegeDBConfig): KVShardMapper {
-	if (!globalMapper) {
-		globalMapper = new KVShardMapper(config.kv, {
+function getMapper(s: RouterState, config: CollegeDBConfig): KVShardMapper {
+	if (!s.mapper) {
+		s.mapper = new KVShardMapper(config.kv, {
 			hashShardMappings: config.hashShardMappings,
 			mappingCacheTtlMs: config.mappingCacheTtlMs,
 			knownShardsCacheTtlMs: config.knownShardsCacheTtlMs
 		});
 	}
 
-	return globalMapper;
+	return s.mapper;
 }
 
 /**
@@ -184,7 +180,12 @@ function getMapper(config: CollegeDBConfig): KVShardMapper {
  * ```
  */
 export function initialize(config: CollegeDBConfig) {
-	const active = applyConfig(config);
+	return initializeIn(currentState(), config);
+}
+
+function initializeIn(s: RouterState, config: CollegeDBConfig) {
+	validateJournalConfig(config);
+	const active = applyConfig(s, config);
 	const fingerprint = shardSetFingerprint(active);
 
 	// The documented Workers pattern calls initialize on every request, so this
@@ -192,39 +193,61 @@ export function initialize(config: CollegeDBConfig) {
 	// shard set again is a KV read plus a KV write that changes nothing, and it
 	// is now awaited through waitUntil rather than silently cancelled, so the
 	// cost is real. Skip it once the set has been registered.
-	if (syncedShardSets.has(fingerprint)) {
+	if (s.syncedShardSets.has(fingerprint)) {
 		return;
 	}
-	syncedShardSets.add(fingerprint);
+	s.syncedShardSets.add(fingerprint);
 
 	// Background: sync KV known shards with configured shards
 	try {
-		const mapper = getMapper(active);
+		const mapper = getMapper(s, active);
 		track(
 			active,
 			Promise.resolve()
 				.then(async () => {
 					const existing = await mapper.getKnownShards();
 					const merged = Array.from(new Set([...existing, ...Object.keys(active.shards)]));
-					await mapper.setKnownShards(merged);
+					// an unchanged list is not written back
+					if (merged.length !== existing.length) {
+						await mapper.setKnownShards(merged);
+					}
 				})
 				.catch(() => {
 					// Let a later initialize retry rather than leaving the set
 					// recorded as synced when it never was.
-					syncedShardSets.delete(fingerprint);
+					s.syncedShardSets.delete(fingerprint);
 				})
 		);
 	} catch {
-		syncedShardSets.delete(fingerprint);
+		s.syncedShardSets.delete(fingerprint);
+	}
+
+	if (active.journalShard !== undefined) {
+		track(
+			active,
+			ensureJournalSchema(active.shards, active.journalShard).catch((error) => {
+				console.warn('Creating the migration journal tables failed; they are created again on first use:', error);
+			})
+		);
 	}
 
 	if (active.shards && Object.keys(active.shards).length > 0 && !active.disableAutoMigration) {
 		track(
 			active,
-			performAutoMigration(active).catch((error) => {
+			performAutoMigration(s, active).catch((error) => {
 				console.warn('Background auto-migration failed:', error);
 			})
 		);
+	}
+}
+
+/**
+ * Rejects a `journalShard` that is not one of the configured shards.
+ * @private
+ */
+function validateJournalConfig(config: CollegeDBConfig): void {
+	if (config.journalShard !== undefined && !config.shards[config.journalShard]) {
+		throw new CollegeDBError(`journalShard ${config.journalShard} is not a configured shard`, 'INVALID_JOURNAL_SHARD');
 	}
 }
 
@@ -247,16 +270,19 @@ function shardSetFingerprint(config: CollegeDBConfig): string {
  * @private
  * @returns The configuration that was installed
  */
-function applyConfig(config: CollegeDBConfig): CollegeDBConfig {
-	setPhaseObserver(config.onPhase ?? null);
+function applyConfig(s: RouterState, config: CollegeDBConfig): CollegeDBConfig {
+	s.sink.observer = config.onPhase ?? null;
 
 	let active = config;
+	if (config.kvTimeoutMs) {
+		active = { ...config, kv: withKVTimeout(config.kv, config.kvTimeoutMs) };
+	}
 	if (config.onPhase) {
 		const shards: Record<string, SQLDatabase> = {};
 		for (const [binding, database] of Object.entries(config.shards)) {
-			shards[binding] = database ? instrumentSQL(database, binding) : database;
+			shards[binding] = database ? instrumentSQL(database, binding, s.sink) : database;
 		}
-		active = { ...config, kv: instrumentKV(config.kv), shards };
+		active = { ...active, kv: instrumentKV(active.kv, s.sink), shards };
 	}
 
 	// Reconfiguring with the same bindings and options keeps the existing mapper,
@@ -269,14 +295,14 @@ function applyConfig(config: CollegeDBConfig): CollegeDBConfig {
 	// allocation strategy, so they survive a strategy change. Placement state
 	// does depend on it, and is rebuilt whenever the strategy or the shard set
 	// moves.
-	const previous = globalConfig;
-	const reuseMapper = globalMapper !== null && previous !== null && isSameMapperConfig(previous, active);
+	const previous = s.config;
+	const reuseMapper = s.mapper !== null && previous !== null && isSameMapperConfig(previous, active);
 	const reusePlacement = reuseMapper && previous !== null && isSamePlacementConfig(previous, active);
 
-	globalConfig = active;
+	s.config = active;
 
 	if (!reuseMapper) {
-		globalMapper = new KVShardMapper(active.kv, {
+		s.mapper = new KVShardMapper(active.kv, {
 			hashShardMappings: active.hashShardMappings,
 			mappingCacheTtlMs: active.mappingCacheTtlMs,
 			knownShardsCacheTtlMs: active.knownShardsCacheTtlMs,
@@ -285,10 +311,11 @@ function applyConfig(config: CollegeDBConfig): CollegeDBConfig {
 	}
 
 	if (!reusePlacement) {
-		shardSizeCache.clear();
-		generatedInsertRoundRobinIndex = 0;
-		resetPlacementState();
-		placementDecision = null;
+		s.shardSizeCache.clear();
+		s.unmeasuredLogged.clear();
+		s.roundRobinIndex = 0;
+		resetPlacementState(s.placement);
+		clearPlacementDecision(s);
 	}
 
 	return active;
@@ -336,6 +363,7 @@ function isSamePlacementConfig(left: CollegeDBConfig, right: CollegeDBConfig): b
 		left.placement === right.placement &&
 		left.targetRegion === right.targetRegion &&
 		left.maxDatabaseSize === right.maxDatabaseSize &&
+		JSON.stringify(left.shardState ?? null) === JSON.stringify(right.shardState ?? null) &&
 		JSON.stringify(left.strategy ?? null) === JSON.stringify(right.strategy ?? null) &&
 		JSON.stringify(left.shardLocations ?? null) === JSON.stringify(right.shardLocations ?? null)
 	);
@@ -402,12 +430,21 @@ function track(config: CollegeDBConfig, promise: Promise<unknown>): void {
  * });
  * ```
  */
-export async function initializeAsync(config: CollegeDBConfig) {
-	const active = applyConfig(config);
+export function initializeAsync(config: CollegeDBConfig) {
+	return initializeAsyncIn(currentState(), config);
+}
+
+async function initializeAsyncIn(s: RouterState, config: CollegeDBConfig) {
+	validateJournalConfig(config);
+	const active = applyConfig(s, config);
+
+	if (active.journalShard !== undefined) {
+		await ensureJournalSchema(active.shards, active.journalShard);
+	}
 
 	// Sync KV known shards with configured shards (awaited in async init)
 	try {
-		const mapper = getMapper(active);
+		const mapper = getMapper(s, active);
 		const existing = await mapper.getKnownShards();
 		const merged = Array.from(new Set([...existing, ...Object.keys(active.shards)]));
 		await mapper.setKnownShards(merged);
@@ -415,7 +452,7 @@ export async function initializeAsync(config: CollegeDBConfig) {
 
 	if (active.shards && Object.keys(active.shards).length > 0 && !active.disableAutoMigration)
 		try {
-			await performAutoMigration(active);
+			await performAutoMigration(s, active);
 		} catch (error) {
 			console.warn('Auto migration failed:', error);
 		}
@@ -425,9 +462,23 @@ export async function initializeAsync(config: CollegeDBConfig) {
  * Initializes the configuration and then performs a callback once the configuration
  * has finished initializing.
  *
+ * The callback runs against a state of its own, so every module-level call it
+ * makes, before or after an `await`, uses `config` even when another
+ * `collegedb` call with a different configuration overlaps it. The module-level
+ * configuration is left as it was. A later call with the same bindings and
+ * options reuses that state, so per-request callers keep their caches.
+ *
+ * That isolation needs `AsyncLocalStorage`. On a runtime without it (Workers
+ * without `nodejs_compat`), a callback runs against the module-level state like
+ * `initialize` does. A different configuration started while another callback is
+ * running then throws `CONCURRENT_CONFIG`, and the same configuration may overlap.
+ * {@link createClient} needs no async context and is the only isolation-safe API
+ * there.
+ *
  * @param config - CollegeDB Configuration
  * @param callback - The callback to perform after the initialization
  * @returns The result of the callback
+ * @throws {CollegeDBError} `CONCURRENT_CONFIG` when there is no async context and a callback with a different configuration is running
  * @example
  * ```
  * import { collegedb, first } from 'collegedb'
@@ -444,9 +495,83 @@ export async function initializeAsync(config: CollegeDBConfig) {
  * });
  * ```
  */
-export async function collegedb<T>(config: CollegeDBConfig, callback: () => T) {
-	await initializeAsync(config);
-	return await callback();
+export async function collegedb<T>(config: CollegeDBConfig, callback: () => T): Promise<Awaited<T>> {
+	if (!asyncContextAvailable()) {
+		return await runOnDefaultState(config, callback);
+	}
+
+	const scoped = scopedStateFor(config);
+	return await runInScope(scoped, async () => {
+		await initializeAsyncIn(scoped, config);
+		return await callback();
+	});
+}
+
+/** Most scoped states kept per KV store. @private */
+const MAX_SCOPED_STATES = 8;
+
+/**
+ * States made for `collegedb` callbacks, by KV store, each with the configuration
+ * it was made for.
+ * @private
+ */
+const scopedStates = new WeakMap<KVStorage, Array<{ config: CollegeDBConfig; state: RouterState }>>();
+
+/**
+ * The state a `collegedb` callback with `config` runs against. A configuration
+ * with the same bindings and options gets the state an earlier call made, so a
+ * Worker that calls `collegedb` on every request keeps its mapping and manifest
+ * caches warm like one that calls `initialize`. Any other configuration gets a
+ * state of its own.
+ * @private
+ */
+function scopedStateFor(config: CollegeDBConfig): RouterState {
+	const kept = scopedStates.get(config.kv) ?? [];
+	const found = kept.find((entry) => isSameMapperConfig(entry.config, config) && isSamePlacementConfig(entry.config, config));
+	if (found) {
+		return found.state;
+	}
+
+	const state = createRouterState();
+	kept.push({ config, state });
+	if (kept.length > MAX_SCOPED_STATES) {
+		kept.shift();
+	}
+	scopedStates.set(config.kv, kept);
+	return state;
+}
+
+/**
+ * The configuration of the `collegedb` callbacks running on the default state,
+ * which is all there is without an async context.
+ * @private
+ */
+let unscopedClaim: { config: CollegeDBConfig; running: number } | null = null;
+
+/**
+ * Runs a `collegedb` callback on the default state, refusing a different
+ * configuration while another callback is still running.
+ * @private
+ */
+async function runOnDefaultState<T>(config: CollegeDBConfig, callback: () => T): Promise<Awaited<T>> {
+	if (unscopedClaim && !(isSameMapperConfig(unscopedClaim.config, config) && isSamePlacementConfig(unscopedClaim.config, config))) {
+		throw new CollegeDBError(
+			'collegedb() cannot start this callback: another collegedb() callback with a different configuration is still running, and this runtime has no AsyncLocalStorage to keep them apart. Wait for it to finish, or use createClient(config), which keeps each configuration separate.',
+			'CONCURRENT_CONFIG'
+		);
+	}
+
+	const claim = (unscopedClaim ??= { config, running: 0 });
+	claim.running++;
+
+	try {
+		await initializeAsync(config);
+		return await callback();
+	} finally {
+		if (--claim.running === 0 && unscopedClaim === claim) {
+			unscopedClaim = null;
+		}
+	}
 }
 
 /**
@@ -459,7 +584,7 @@ export async function collegedb<T>(config: CollegeDBConfig, callback: () => T) {
  * @private
  * @param config - CollegeDB configuration
  */
-async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
+async function performAutoMigration(s: RouterState, config: CollegeDBConfig): Promise<void> {
 	try {
 		const { autoDetectAndMigrate } = await import('./migrations');
 		const shardNames = Object.keys(config.shards);
@@ -475,7 +600,8 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
 
 			try {
 				const result = await autoDetectAndMigrate(database, shardName, config, {
-					maxRecordsToCheck: 1000
+					maxRecordsToCheck: 1000,
+					statusCache: s.migrationStatus
 				});
 
 				return {
@@ -516,15 +642,21 @@ async function performAutoMigration(config: CollegeDBConfig): Promise<void> {
  * @internal
  */
 export function resetConfig(): void {
-	globalConfig = null;
-	globalMapper = null;
-	shardSizeCache.clear();
-	generatedInsertRoundRobinIndex = 0;
-	ensuredSchemaFingerprints.clear();
-	resetPlacementState();
-	placementDecision = null;
-	syncedShardSets.clear();
-	setPhaseObserver(null);
+	resetConfigIn(currentState());
+}
+
+function resetConfigIn(s: RouterState): void {
+	s.config = null;
+	s.mapper = null;
+	s.shardSizeCache.clear();
+	s.unmeasuredLogged.clear();
+	s.roundRobinIndex = 0;
+	s.ensuredSchemaFingerprints.clear();
+	resetPlacementState(s.placement);
+	clearPlacementDecision(s);
+	s.syncedShardSets.clear();
+	s.migrationStatus?.clear();
+	s.sink.observer = null;
 }
 
 /**
@@ -543,7 +675,11 @@ export function resetConfig(): void {
  * ```
  */
 export function isInitialized(): boolean {
-	return globalConfig !== null;
+	return isInitializedIn(currentState());
+}
+
+function isInitializedIn(s: RouterState): boolean {
+	return s.config !== null;
 }
 
 /**
@@ -555,7 +691,11 @@ export function isInitialized(): boolean {
  * @internal
  */
 export function getActiveConfig(): CollegeDBConfig | null {
-	return globalConfig;
+	return getActiveConfigIn(currentState());
+}
+
+function getActiveConfigIn(s: RouterState): CollegeDBConfig | null {
+	return s.config;
 }
 
 /**
@@ -569,11 +709,11 @@ export function getActiveConfig(): CollegeDBConfig | null {
  * @returns The global CollegeDB configuration
  * @throws {Error} If initialize() has not been called yet
  */
-function getConfig(): CollegeDBConfig {
-	if (!globalConfig) {
+function getConfig(s: RouterState): CollegeDBConfig {
+	if (!s.config) {
 		throw new CollegeDBError('CollegeDB not initialized. Call initialize() first.', 'NOT_INITIALIZED');
 	}
-	return globalConfig;
+	return s.config;
 }
 
 /**
@@ -967,9 +1107,9 @@ async function getDatabaseSize(database: SQLDatabase): Promise<number> {
  * Retrieves a shard size using a short-lived in-memory cache.
  * @private
  */
-async function getDatabaseSizeForAllocation(shardName: string, config: CollegeDBConfig): Promise<number> {
+async function getDatabaseSizeForAllocation(s: RouterState, shardName: string, config: CollegeDBConfig): Promise<number> {
 	const cacheTtlMs = Math.max(0, config.sizeCacheTtlMs ?? 30_000);
-	const cached = shardSizeCache.get(shardName);
+	const cached = s.shardSizeCache.get(shardName);
 
 	if (cached && cached.expiresAt >= Date.now()) {
 		return cached.size;
@@ -982,7 +1122,7 @@ async function getDatabaseSizeForAllocation(shardName: string, config: CollegeDB
 
 	const size = await getDatabaseSize(database);
 	if (cacheTtlMs > 0) {
-		shardSizeCache.set(shardName, {
+		s.shardSizeCache.set(shardName, {
 			size,
 			expiresAt: Date.now() + cacheTtlMs
 		});
@@ -999,9 +1139,9 @@ async function getDatabaseSizeForAllocation(shardName: string, config: CollegeDB
  * @private
  * @param availableShards - List of shard names to filter
  * @param config - CollegeDB configuration containing maxDatabaseSize setting
- * @returns Promise resolving to filtered list of shard names
+ * @returns Promise resolving to filtered list of shard names, which keeps every shard whose size cannot be read
  */
-async function filterShardsBySize(availableShards: string[], config: CollegeDBConfig): Promise<string[]> {
+async function filterShardsBySize(s: RouterState, availableShards: string[], config: CollegeDBConfig): Promise<string[]> {
 	if (typeof config.maxDatabaseSize !== 'number' || !Number.isFinite(config.maxDatabaseSize) || config.maxDatabaseSize <= 0) {
 		return availableShards;
 	}
@@ -1010,7 +1150,7 @@ async function filterShardsBySize(availableShards: string[], config: CollegeDBCo
 
 	const sizeChecks = await Promise.allSettled(
 		availableShards.map(async (shardName) => {
-			const size = await getDatabaseSizeForAllocation(shardName, config);
+			const size = await getDatabaseSizeForAllocation(s, shardName, config);
 			return {
 				shard: shardName,
 				size,
@@ -1019,12 +1159,19 @@ async function filterShardsBySize(availableShards: string[], config: CollegeDBCo
 		})
 	);
 
-	const validShards = sizeChecks
-		.filter(
-			(result): result is PromiseFulfilledResult<{ shard: string; size: number; withinLimit: boolean }> =>
-				result.status === 'fulfilled' && result.value.withinLimit
-		)
-		.map((result) => result.value.shard);
+	// a size that cannot be read is unknown, and the limit applies only where it can be measured
+	const validShards = availableShards.filter((shard, index) => {
+		const check = sizeChecks[index]!;
+		if (check.status === 'fulfilled') {
+			return check.value.withinLimit;
+		}
+
+		if (config.debug && !s.unmeasuredLogged.has(shard)) {
+			s.unmeasuredLogged.add(shard);
+			console.warn(`Could not read the size of ${shard}, so maxDatabaseSize does not apply to it:`, check.reason);
+		}
+		return true;
+	});
 
 	// If all shards exceed the size limit, log warning and return all shards
 	// to prevent complete failure (existing mappings should still work)
@@ -1041,6 +1188,77 @@ async function filterShardsBySize(availableShards: string[], config: CollegeDBCo
 	}
 
 	return validShards;
+}
+
+/**
+ * Keeps the shards that `shardState` and the `eligible` predicate allow to take
+ * new keys. A predicate that throws, rejects or returns anything but `true`
+ * leaves its shard out, and a throw also fails the call: a shard whose
+ * eligibility is unknown never counts as eligible.
+ *
+ * @private
+ * @throws {CollegeDBError} `ELIGIBILITY_FAILED` when the predicate throws or rejects
+ */
+async function filterShardsByState(
+	shards: string[],
+	config: CollegeDBConfig,
+	operation: 'allocate' | 'publish',
+	key?: string
+): Promise<string[]> {
+	const open = shards.filter((shard) => {
+		const state = config.shardState?.[shard];
+		return state?.writable !== false && (state?.drain ?? 'active') === 'active';
+	});
+
+	const predicate = config.eligible;
+	if (!predicate) {
+		return open;
+	}
+
+	const verdicts = await Promise.all(
+		open.map(async (shard) => {
+			const state = config.shardState?.[shard] ?? {};
+
+			try {
+				return (await predicate(shard, { key, operation, tags: state.tags ?? {}, state })) === true;
+			} catch (error) {
+				throw new CollegeDBError(
+					`The eligible predicate failed for ${shard} (${error instanceof Error ? error.message : String(error)}). Nothing was ${operation === 'publish' ? 'published' : 'allocated'}; retry the operation.`,
+					'ELIGIBILITY_FAILED'
+				);
+			}
+		})
+	);
+
+	return open.filter((_, index) => verdicts[index]);
+}
+
+/**
+ * The shards a new key may go to: `shardState`, then the predicate, then the
+ * `maxDatabaseSize` limit, which keeps its fallback of ignoring itself when every
+ * remaining shard is over it. A shard `shardState` or the predicate turned away
+ * is never a fallback.
+ *
+ * @private
+ * @throws {CollegeDBError} `NO_ELIGIBLE_SHARD` when `shardState` and the predicate leave nothing
+ */
+async function selectEligibleShards(
+	s: RouterState,
+	config: CollegeDBConfig,
+	operation: 'allocate' | 'publish',
+	key?: string,
+	withSize: boolean = true
+): Promise<string[]> {
+	const allowed = await filterShardsByState(Object.keys(config.shards), config, operation, key);
+
+	if (allowed.length === 0) {
+		throw new CollegeDBError(
+			'No shard is eligible for new keys: every configured shard is read-only, draining, retired or turned down by the eligible predicate.',
+			'NO_ELIGIBLE_SHARD'
+		);
+	}
+
+	return withSize ? await filterShardsBySize(s, allowed, config) : allowed;
 }
 
 /**
@@ -1102,12 +1320,13 @@ function selectShardByLocation(
  * @private
  */
 function selectShardByStrategy(
+	s: RouterState,
 	effectiveStrategy: ShardingStrategy,
 	primaryKey: string,
 	availableShards: string[],
 	config: CollegeDBConfig
 ): string {
-	const started = phaseStart();
+	const started = phaseStart(s.sink);
 	try {
 		switch (effectiveStrategy) {
 			case 'hash': {
@@ -1123,8 +1342,8 @@ function selectShardByStrategy(
 				return availableShards[Math.floor(Math.random() * availableShards.length)] || availableShards[0]!;
 			}
 			case 'round-robin': {
-				const shard = availableShards[generatedInsertRoundRobinIndex % availableShards.length]!;
-				generatedInsertRoundRobinIndex = (generatedInsertRoundRobinIndex + 1) % availableShards.length;
+				const shard = availableShards[s.roundRobinIndex % availableShards.length]!;
+				s.roundRobinIndex = (s.roundRobinIndex + 1) % availableShards.length;
 				return shard;
 			}
 			default: {
@@ -1132,7 +1351,7 @@ function selectShardByStrategy(
 			}
 		}
 	} finally {
-		phaseEnd('shard.select', started, effectiveStrategy);
+		phaseEnd('shard.select', started, effectiveStrategy, s.sink);
 	}
 }
 
@@ -1181,39 +1400,233 @@ function selectShardByStrategy(
  * functions of the key, and `location` depends on the requesting region rather
  * than the key, so any of them forces the KV path.
  *
+ * Under computed placement the manifest is re-read once its TTL passes, and a
+ * newer one another client published is adopted without publishing anything. A
+ * read tolerates a failed re-read and keeps the manifest it holds; a write needs
+ * one verified within its TTL. With nothing held, a failed read throws
+ * `PLACEMENT_UNVERIFIED` rather than assuming a topology.
+ *
+ * With `journalShard` set the manifest comes from the journal, which is strongly
+ * consistent, and KV holds a derived copy. Callers that find the cache expired
+ * share one refresh, and for a second after a refresh fails a read keeps the stale
+ * manifest without trying again, so an outage does not make every read wait out
+ * the timeout. Writes always try.
+ *
+ * When a manifest exists and no shard is eligible, nothing is published: the
+ * epochs held keep serving reads and every write is refused with
+ * `NO_ELIGIBLE_SHARD` until a refresh finds an eligible shard.
+ *
  * @private
  */
-async function resolvePlacement(config: CollegeDBConfig): Promise<{ mode: 'computed' | 'kv'; manifest: PlacementManifest | null }> {
-	if (placementDecision) {
-		return placementDecision;
+async function resolvePlacement(
+	s: RouterState,
+	config: CollegeDBConfig,
+	forWrite: boolean = false
+): Promise<{ mode: 'computed' | 'kv'; manifest: PlacementManifest | null }> {
+	const ready = heldDecision(s, forWrite);
+	if (ready) {
+		return ready;
 	}
 
-	const shards = Object.keys(config.shards);
-	const strategyIsHash = resolveStrategy(config, 'read') === 'hash' && resolveStrategy(config, 'write') === 'hash';
+	const held = s.placementDecision;
 
-	if (config.placement !== 'computed' || !strategyIsHash || shards.length === 0) {
-		placementDecision = { mode: 'kv', manifest: null };
-		return placementDecision;
+	try {
+		const flight =
+			s.placementFlight ??
+			refreshPlacement(s, config).finally(() => {
+				s.placementFlight = null;
+			});
+		s.placementFlight = flight;
+		return await flight;
+	} catch (error) {
+		if (held && !forWrite && error instanceof CollegeDBError && error.code === 'PLACEMENT_UNVERIFIED') {
+			return held;
+		}
+
+		throw error;
+	}
+}
+
+/**
+ * The decision {@link resolvePlacement} returns without reading anything, or
+ * `null` when a refresh is due. Hot paths take it before awaiting, so a held
+ * decision costs no promise.
+ * @private
+ */
+function heldDecision(s: RouterState, forWrite: boolean): { mode: 'computed' | 'kv'; manifest: PlacementManifest | null } | null {
+	const held = s.placementDecision;
+	if (held && (held.mode === 'kv' || isPlacementManifestFresh(s.placement))) {
+		return held;
+	}
+
+	return held && !forWrite && isPlacementBackingOff(s.placement) ? held : null;
+}
+
+/**
+ * Errors from publishing the manifest that are not a verification failure.
+ * @private
+ */
+const PUBLISH_ERRORS = new Set(['TOO_MANY_EPOCHS', 'PLACEMENT_CONFLICT', 'MANIFEST_CORRUPT']);
+
+/**
+ * The slow path of {@link resolvePlacement}: decides the mode, reads the manifest
+ * and, on a cold start, publishes the current topology.
+ * @private
+ */
+async function refreshPlacement(
+	s: RouterState,
+	config: CollegeDBConfig
+): Promise<{ mode: 'computed' | 'kv'; manifest: PlacementManifest | null }> {
+	const token = s.placementToken;
+	const held = s.placementDecision;
+	const shards = Object.keys(config.shards);
+	const remember = <T extends { mode: 'computed' | 'kv'; manifest: PlacementManifest | null }>(decision: T): T => {
+		if (token === s.placementToken) {
+			s.placementDecision = decision;
+		}
+		return decision;
+	};
+
+	if (!held) {
+		const strategyIsHash = resolveStrategy(config, 'read') === 'hash' && resolveStrategy(config, 'write') === 'hash';
+
+		if (config.placement !== 'computed' || !strategyIsHash || shards.length === 0) {
+			return remember({ mode: 'kv', manifest: null });
+		}
+	}
+
+	const journal = placementJournal(config);
+	const stored = await loadPlacementManifest(config.kv, undefined, undefined, journal, s.placement);
+
+	const base = held?.manifest ? advancedManifest(held.manifest, stored) : stored;
+	if (held?.manifest && base && !s.placementReadOnly) {
+		return remember({ mode: 'computed', manifest: base });
+	}
+
+	// the newest epoch names the eligible shards, so a draining one stops owning new keys
+	let eligible: string[];
+	try {
+		eligible = await selectEligibleShards(s, config, 'publish');
+	} catch (error) {
+		// nothing to publish: the epochs that exist keep serving reads and writes are refused
+		if (base && error instanceof CollegeDBError && error.code === 'NO_ELIGIBLE_SHARD') {
+			if (token === s.placementToken) {
+				s.placementReadOnly = true;
+			}
+			return remember({ mode: 'computed', manifest: base });
+		}
+
+		throw error;
 	}
 
 	try {
-		const stored = await loadPlacementManifest(config.kv);
-		const base = stored ?? createManifest(shards, 'hrw');
-		const refreshed = withCurrentTopology(base, shards, 'hrw');
-
-		if (!stored || refreshed !== base) {
-			await savePlacementManifest(config.kv, refreshed);
+		const published = (await publishPlacementEpoch(config.kv, journal, base, eligible, s.placement)).manifest;
+		if (token === s.placementToken) {
+			s.placementReadOnly = false;
 		}
-
-		placementDecision = { mode: 'computed', manifest: refreshed };
-		return placementDecision;
+		return remember({ mode: 'computed', manifest: published });
 	} catch (error) {
-		if (config.debug) {
-			console.warn('Placement manifest unavailable, falling back to KV mappings:', error);
+		if (error instanceof CollegeDBError && PUBLISH_ERRORS.has(error.code ?? '')) {
+			throw error;
 		}
-		placementDecision = { mode: 'kv', manifest: null };
-		return placementDecision;
+
+		throw placementUnverified('manifest', error, journal ? 'the journal' : 'KV');
 	}
+}
+
+/**
+ * Evaluates eligibility again and publishes a new placement snapshot when the
+ * eligible set differs from the newest epoch's shard set.
+ *
+ * Under computed placement the eligible set is part of the topology: it is
+ * computed when a snapshot is published, never inside the hash. A cold start
+ * publishes one, and this publishes another on demand, for example from a health
+ * job after the `eligible` predicate started answering differently. The predicate
+ * runs with `operation: 'publish'`. A changed set adds an epoch and keeps every
+ * older one, so keys placed under an earlier epoch keep resolving; shards that
+ * dropped out stay readable.
+ *
+ * With a journal the swap is a compare-and-swap, so of two callers that find the
+ * same change, one publishes and the other reports `published: false`. Without
+ * one, both may report `true`.
+ *
+ * Under kv placement there is no snapshot: it returns the shards eligible now,
+ * `published: false` and `epoch: 0`.
+ *
+ * @returns The eligible shards, whether this call added an epoch, and the newest epoch number
+ * @throws {CollegeDBError} `NO_ELIGIBLE_SHARD`, `ELIGIBILITY_FAILED`, `TOO_MANY_EPOCHS` when the manifest is full (the manifest is left as it was), `PLACEMENT_UNVERIFIED` when KV or the journal fails, `PLACEMENT_CONFLICT`
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const { eligible, published, epoch } = await publishEligibility();
+ * ```
+ */
+export function publishEligibility(): Promise<{ eligible: string[]; published: boolean; epoch: number }> {
+	return publishEligibilityIn(currentState());
+}
+
+async function publishEligibilityIn(s: RouterState): Promise<{ eligible: string[]; published: boolean; epoch: number }> {
+	const config = getConfig(s);
+	const eligible = await selectEligibleShards(s, config, 'publish');
+	const strategyIsHash = resolveStrategy(config, 'read') === 'hash' && resolveStrategy(config, 'write') === 'hash';
+
+	if (config.placement !== 'computed' || !strategyIsHash) {
+		return { eligible, published: false, epoch: 0 };
+	}
+
+	const token = s.placementToken;
+	const held = s.placementDecision?.manifest ?? null;
+	const journal = placementJournal(config);
+	const loaded = await loadPlacementManifest(config.kv, undefined, { fresh: true }, journal, s.placement);
+	const base = held && loaded ? advancedManifest(held, loaded) : (loaded ?? held);
+
+	let result: { manifest: PlacementManifest; published: boolean };
+	try {
+		result = await publishPlacementEpoch(config.kv, journal, base, eligible, s.placement);
+	} catch (error) {
+		if (error instanceof CollegeDBError && PUBLISH_ERRORS.has(error.code ?? '')) {
+			throw error;
+		}
+
+		throw placementUnverified('manifest', error, journal ? 'the journal' : 'KV');
+	}
+
+	if (token === s.placementToken) {
+		s.placementDecision = { mode: 'computed', manifest: result.manifest };
+		s.placementReadOnly = false;
+	}
+
+	return { eligible, published: result.published, epoch: result.manifest.epochs[0]!.n };
+}
+
+/**
+ * Reads the manifest again, bypassing the cache, and adopts it when it is newer.
+ * A writer calls it after a topology fence turned its write away.
+ * @private
+ */
+async function reloadPlacement(s: RouterState, config: CollegeDBConfig): Promise<void> {
+	const held = s.placementDecision;
+	if (held?.mode !== 'computed' || !held.manifest) {
+		return;
+	}
+
+	const stored = await loadPlacementManifest(config.kv, undefined, { fresh: true }, placementJournal(config), s.placement);
+	s.placementDecision = { mode: 'computed', manifest: advancedManifest(held.manifest, stored) };
+}
+
+/**
+ * The manifest that is further along: the stored one when it has a newer epoch,
+ * or the same epoch with at least as many exceptions, else the one already held.
+ * @private
+ */
+function advancedManifest(held: PlacementManifest, stored: PlacementManifest | null): PlacementManifest {
+	if (!stored) {
+		return held;
+	}
+
+	const heldEpoch = held.epochs[0]!.n;
+	const storedEpoch = stored.epochs[0]!.n;
+	return storedEpoch > heldEpoch || (storedEpoch === heldEpoch && stored.exceptionsVersion >= held.exceptionsVersion) ? stored : held;
 }
 
 /**
@@ -1226,24 +1639,137 @@ async function resolvePlacement(config: CollegeDBConfig): Promise<{ mode: 'compu
  *
  * @private
  */
-async function resolveCandidates(primaryKey: string, operationType: OperationType = 'write'): Promise<string[]> {
-	const config = getConfig();
-	const decision = await resolvePlacement(config);
+async function resolveCandidates(
+	s: RouterState,
+	primaryKey: string,
+	operationType: OperationType = 'write',
+	resolved?: { mode: 'computed' | 'kv'; manifest: PlacementManifest | null }
+): Promise<string[]> {
+	const config = getConfig(s);
+	const forWrite = operationType === 'write';
+	const decision = resolved ?? heldDecision(s, forWrite) ?? (await resolvePlacement(s, config, forWrite));
 
 	if (decision.mode !== 'computed' || !decision.manifest) {
-		return [await getShardForKey(primaryKey, operationType)];
+		return [await getShardForKey(s, primaryKey, operationType)];
 	}
 
-	const mapper = getMapper(config);
+	if (forWrite && s.placementReadOnly) {
+		throw new CollegeDBError(
+			'No shard is eligible for writes: every configured shard is read-only, draining, retired or turned down by the eligible predicate. Reads still work.',
+			'NO_ELIGIBLE_SHARD'
+		);
+	}
+
+	const mapper = getMapper(s, config);
 	const hashedKey = await mapper.hashKey(primaryKey);
-	const exceptions = await loadPlacementExceptions(config.kv, decision.manifest.exceptionsVersion);
+	const exceptions = await loadPlacementExceptions(
+		config.kv,
+		decision.manifest.exceptionsVersion,
+		undefined,
+		{ staleOk: !forWrite },
+		s.placement
+	);
 
 	if (exceptions.has(hashedKey)) {
-		return [await getShardForKey(primaryKey, operationType)];
+		return [await getShardForKey(s, primaryKey, operationType)];
 	}
 
 	const candidates = candidateShards(primaryKey, decision.manifest, Object.keys(config.shards));
-	return candidates.length > 0 ? candidates : [await getShardForKey(primaryKey, operationType)];
+	return candidates.length > 0 ? candidates : [await getShardForKey(s, primaryKey, operationType)];
+}
+
+const WRITE_TABLE =
+	/^\s*(?:(?:insert|replace)(?:\s+or\s+\w+|\s+ignore)?\s+into|update(?:\s+or\s+\w+)?|delete\s+from)\s+((?:["`]?[\w$]+["`]?\.)*["`]?[\w$]+["`]?)/i;
+
+/**
+ * The table an INSERT, REPLACE, UPDATE or DELETE statement writes to: `undefined`
+ * for any other statement, `null` for one of those that does not parse.
+ * @private
+ */
+function statementTable(sql: string): string | null | undefined {
+	if (!/^\s*(?:insert|replace|update|delete)\b/i.test(sql)) {
+		return undefined;
+	}
+
+	const match = WRITE_TABLE.exec(sql);
+	return match ? match[1]!.replace(/["`]/g, '') : null;
+}
+
+/**
+ * Picks the shard a write goes to among the candidates of a computed placement.
+ *
+ * One candidate is the steady state and costs nothing. Several mean the key
+ * computes a different owner than an older epoch did, and the row may still sit
+ * on the older one, where a write to the newest owner would match nothing or
+ * create a second row. The candidates are probed by primary key, newest first,
+ * and the write follows the row, which is then recorded as an exception so the
+ * probe is not repeated. A key no shard holds goes to the newest owner. A probe that
+ * fails (table or key column missing) cannot prove the key absent, so it refuses.
+ *
+ * @private
+ * @throws {CollegeDBError} `WRITE_UNRESOLVED` when no shard holds the key and a probe failed or the table is unknown
+ */
+async function locateWriteShard(
+	s: RouterState,
+	config: CollegeDBConfig,
+	key: string,
+	table: string | null | undefined,
+	candidates: string[]
+): Promise<string> {
+	if (candidates.length <= 1 || table === undefined) {
+		return candidates[0]!;
+	}
+
+	const unresolved = (detail: string) =>
+		new CollegeDBError(
+			`Could not tell which shard holds ${key}${table ? ` in ${table}` : ''} (${detail}). After a topology change a write first finds the row, so the table must exist on every shard and its key column must be named in keyColumns when it is not id. The write was not applied.`,
+			'WRITE_UNRESOLVED'
+		);
+
+	if (table === null) {
+		throw unresolved('the statement names no table CollegeDB can read');
+	}
+
+	const column = config.keyColumns?.[table] ?? 'id';
+	let failure: string | undefined;
+
+	for (let i = 0; i < candidates.length; i++) {
+		const binding = candidates[i]!;
+		const database = config.shards[binding]!;
+
+		try {
+			const row = await database
+				.prepare(
+					`SELECT 1 AS found FROM ${quoteIdentifier(table, database.dialect)} WHERE ${quoteIdentifier(column, database.dialect)} = ? LIMIT 1`
+				)
+				.bind(key)
+				.first();
+
+			if (row) {
+				if (i > 0) {
+					await memoizePlacementException(s, key, binding);
+				}
+				return binding;
+			}
+		} catch (error) {
+			failure ??= `${binding}: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	if (failure) {
+		throw unresolved(failure);
+	}
+
+	return candidates[0]!;
+}
+
+/**
+ * The shard a write for `key` goes to under computed placement, found before the
+ * write runs. `table` is what the statement writes to, as {@link statementTable} reads it.
+ * @private
+ */
+async function resolveWriteShard(s: RouterState, config: CollegeDBConfig, key: string, table: string | null | undefined): Promise<string> {
+	return await locateWriteShard(s, config, key, table, await resolveCandidates(s, key, 'write'));
 }
 
 /**
@@ -1252,19 +1778,29 @@ async function resolveCandidates(primaryKey: string, operationType: OperationTyp
  *
  * @private
  */
-async function memoizePlacementException(primaryKey: string, shard: string): Promise<void> {
-	const config = getConfig();
-	const decision = await resolvePlacement(config);
-	if (decision.mode !== 'computed' || !decision.manifest) {
+async function memoizePlacementException(s: RouterState, primaryKey: string, shard: string): Promise<void> {
+	const config = getConfig(s);
+	const decision = s.placementDecision;
+	if (decision?.mode !== 'computed' || !decision.manifest) {
 		return;
 	}
 
-	const mapper = getMapper(config);
+	const mapper = getMapper(s, config);
 
 	try {
 		await mapper.setShardMapping(primaryKey, shard);
-		const updated = await addPlacementException(config.kv, decision.manifest, await mapper.hashKey(primaryKey));
-		placementDecision = { mode: 'computed', manifest: updated };
+		if (config.journalShard !== undefined) {
+			await ensureJournalSchema(config.shards, config.journalShard);
+		}
+
+		// saved from the newest manifest KV has, so a stale copy cannot overwrite a newer epoch
+		const journal = placementJournal(config);
+		const base = advancedManifest(
+			decision.manifest,
+			await loadPlacementManifest(config.kv, undefined, { fresh: true }, journal, s.placement)
+		);
+		const updated = await addPlacementException(config.kv, base, await mapper.hashKey(primaryKey), journal, s.placement);
+		s.placementDecision = { mode: 'computed', manifest: updated };
 	} catch (error) {
 		if (config.debug) {
 			console.warn(`Failed to record placement exception for ${primaryKey}:`, error);
@@ -1272,9 +1808,9 @@ async function memoizePlacementException(primaryKey: string, shard: string): Pro
 	}
 }
 
-async function getShardForKey(primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
-	const config = getConfig();
-	const mapper = getMapper(config);
+async function getShardForKey(s: RouterState, primaryKey: string, operationType: OperationType = 'write'): Promise<string> {
+	const config = getConfig(s);
+	const mapper = getMapper(s, config);
 
 	// Check if mapping already exists
 	const existingMapping = await mapper.getShardMapping(primaryKey);
@@ -1282,7 +1818,7 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
 		return existingMapping.shard;
 	}
 
-	const selectedShard = await allocateShardForKey(config, primaryKey, operationType);
+	const selectedShard = await allocateShardForKey(s, config, primaryKey, operationType);
 
 	// A read that finds no mapping does not need to leave one behind. Recording
 	// it costs a KV write and pins a key that may have no row at all, which is
@@ -1303,15 +1839,23 @@ async function getShardForKey(primaryKey: string, operationType: OperationType =
  *
  * @private
  */
-async function allocateShardForKey(config: CollegeDBConfig, primaryKey: string, operationType: OperationType): Promise<string> {
+async function allocateShardForKey(
+	s: RouterState,
+	config: CollegeDBConfig,
+	primaryKey: string,
+	operationType: OperationType
+): Promise<string> {
 	// Before allocating a new shard, check if any existing shards contain this key
 	const availableShards = Object.keys(config.shards);
 	if (availableShards.length === 0) {
 		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
 	}
 
-	// Filter shards by size limit if configured
-	const eligibleShards = await filterShardsBySize(availableShards, config);
+	// a read that records no mapping picks no owner, so only a persisted choice is held to eligibility
+	const persists = operationType === 'write' || config.allocateOnRead === true;
+	const eligibleShards = persists
+		? await selectEligibleShards(s, config, 'allocate', primaryKey)
+		: await filterShardsBySize(s, availableShards, config);
 
 	// If no existing mapping found after auto-migration, allocate a new shard
 	let selectedShard: string;
@@ -1319,9 +1863,9 @@ async function allocateShardForKey(config: CollegeDBConfig, primaryKey: string, 
 
 	// Use coordinator if available for allocation
 	if (config.coordinator) {
-		const started = phaseStart();
+		const started = phaseStart(s.sink);
 		try {
-			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 			const coordinator = config.coordinator.get(coordinatorId);
 
 			const response = await coordinator.fetch('http://coordinator/allocate', {
@@ -1341,16 +1885,16 @@ async function allocateShardForKey(config: CollegeDBConfig, primaryKey: string, 
 				const result = (await response.json()) as { shard: string };
 				selectedShard = result.shard;
 			} else {
-				selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
+				selectedShard = selectShardByStrategy(s, effectiveStrategy, primaryKey, eligibleShards, config);
 			}
 		} catch (error) {
 			console.warn('Coordinator allocation failed, falling back to local strategy:', error);
-			selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
+			selectedShard = selectShardByStrategy(s, effectiveStrategy, primaryKey, eligibleShards, config);
 		} finally {
-			phaseEnd('coordinator.fetch', started, 'allocate');
+			phaseEnd('coordinator.fetch', started, 'allocate', s.sink);
 		}
 	} else {
-		selectedShard = selectShardByStrategy(effectiveStrategy, primaryKey, eligibleShards, config);
+		selectedShard = selectShardByStrategy(s, effectiveStrategy, primaryKey, eligibleShards, config);
 	}
 
 	return selectedShard;
@@ -1370,13 +1914,23 @@ async function allocateShardForKey(config: CollegeDBConfig, primaryKey: string, 
  * @returns Promise resolving to the database instance
  * @throws {Error} If shard routing fails or database instance not found
  */
-async function getDatabase(primaryKey: string, operationType: OperationType = 'write'): Promise<SQLDatabase> {
-	const config = getConfig();
-	const decision = placementDecision ?? (await resolvePlacement(config));
-	const shard =
-		decision.mode === 'computed' && decision.manifest
-			? (await resolveCandidates(primaryKey, operationType))[0]!
-			: await getShardForKey(primaryKey, operationType);
+async function getDatabase(s: RouterState, primaryKey: string, operationType: OperationType = 'write', sql?: string): Promise<SQLDatabase> {
+	const config = getConfig(s);
+	const decision = heldDecision(s, operationType === 'write') ?? (await resolvePlacement(s, config, operationType === 'write'));
+	let shard: string;
+
+	if (decision.mode === 'computed' && decision.manifest) {
+		const candidates = await resolveCandidates(s, primaryKey, operationType, decision);
+
+		// the statement is parsed only when there is more than one owner to tell apart
+		shard =
+			operationType === 'write' && sql !== undefined && candidates.length > 1
+				? await locateWriteShard(s, config, primaryKey, statementTable(sql), candidates)
+				: candidates[0]!;
+	} else {
+		shard = await getShardForKey(s, primaryKey, operationType);
+	}
+
 	const database = config.shards[shard];
 
 	if (!database) {
@@ -1418,11 +1972,253 @@ export async function createSchema(db: SQLDatabase, schema: string): Promise<voi
  * @returns Promise that resolves to a prepared statement
  * @throws {Error} If preparation fails
  */
-export async function prepare(key: string, sql: string): Promise<PreparedStatement> {
+export function prepare(key: string, sql: string): Promise<PreparedStatement> {
+	return prepareIn(currentState(), key, sql);
+}
+
+async function prepareIn(s: RouterState, key: string, sql: string): Promise<PreparedStatement> {
 	const operationType = getOperationType(sql);
-	const db = await getDatabase(key, operationType);
+	const db = await getDatabase(s, key, operationType, sql);
 	const result = db.prepare(sql);
 	return result;
+}
+
+/**
+ * Where the migration journal lives for this configuration, or `null` when
+ * `journalShard` is not set. Builder writes and reads only pay for the
+ * tombstone check when it is set.
+ * @private
+ */
+function explicitJournal(config: CollegeDBConfig): { binding: string; db: SQLDatabase; scope: string } | null {
+	if (config.journalShard === undefined) {
+		return null;
+	}
+
+	const db = config.shards[config.journalShard];
+	if (!db) {
+		throw new CollegeDBError(`journalShard ${config.journalShard} is not a configured shard`, 'INVALID_JOURNAL_SHARD');
+	}
+
+	return { binding: config.journalShard, db, scope: config.journalScope ?? 'default' };
+}
+
+/**
+ * The journal a move needs: the configured shard, or the only shard of a
+ * single-shard config.
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
+ * @private
+ */
+function requireJournal(config: CollegeDBConfig): { binding: string; db: SQLDatabase; scope: string } {
+	const explicit = explicitJournal(config);
+	if (explicit) {
+		return explicit;
+	}
+
+	const bindings = Object.keys(config.shards);
+	const only = bindings.length === 1 ? config.shards[bindings[0]!] : undefined;
+	if (!only) {
+		throw new CollegeDBError(
+			'Moving a key between shards needs a journal. Set journalShard in the configuration to the binding that should hold it.',
+			'JOURNAL_NOT_CONFIGURED'
+		);
+	}
+
+	return { binding: bindings[0]!, db: only, scope: config.journalScope ?? 'default' };
+}
+
+/**
+ * Follows a tombstone from a shard that no longer holds the key to the shard it
+ * moved to, so a read in the cutover window still finds the row. Returns
+ * `undefined` when there is nothing to follow or the lookup cannot be made.
+ * @private
+ */
+async function followTombstone<T>(
+	config: CollegeDBConfig,
+	binding: string,
+	key: string,
+	execute: (database: SQLDatabase) => Promise<T>,
+	isEmpty: (value: T) => boolean
+): Promise<T | undefined> {
+	const journal = explicitJournal(config);
+	if (!journal) {
+		return undefined;
+	}
+
+	let current = binding;
+	for (let hop = 0; hop < MAX_TOMBSTONE_HOPS; hop++) {
+		const database = config.shards[current];
+		if (!database || !isProvenJournalDialect(database.dialect)) {
+			return undefined;
+		}
+
+		let moved: string | undefined;
+		try {
+			await ensureShardTables(database);
+			moved = (await findTombstone(database, journal.scope, key))?.movedTo;
+		} catch {
+			return undefined;
+		}
+
+		const next = moved === undefined ? undefined : config.shards[moved];
+		if (!next || moved === undefined) {
+			return undefined;
+		}
+
+		const result = await execute(next);
+		if (!isEmpty(result)) {
+			return result;
+		}
+		current = moved;
+	}
+
+	return undefined;
+}
+
+/** Longest chain of tombstones a read follows. @private */
+const MAX_TOMBSTONE_HOPS = 4;
+
+/**
+ * What a read runs on: the shard, or a read session opened on it.
+ * @private
+ */
+interface ReadTarget {
+	prepare(sql: string): PreparedStatement;
+	getBookmark?(): string | null;
+}
+
+/**
+ * The read targets of one logical operation, one per shard and reused by every
+ * query the operation makes on that shard.
+ * @private
+ */
+interface ReadSessions {
+	on(database: SQLDatabase): ReadTarget;
+	/** Copy of `result` carrying the shard's latest bookmark, or `result` when it has none */
+	stamp<R extends QueryResult<any>>(database: SQLDatabase, result: R): R;
+	/** Latest bookmark of every session opened so far, keyed by database id */
+	bookmarks(): Record<string, string> | undefined;
+}
+
+type InternalReadOptions = ReadOptions & { sessions?: ReadSessions };
+
+const PLAIN_SESSIONS: ReadSessions = { on: (database) => database, stamp: (_database, result) => result, bookmarks: () => undefined };
+
+/**
+ * Turns a consistency request into the object reads run on, per shard.
+ *
+ * With no request the shard itself is returned, so the default call path stays
+ * the one it always was. Anything the shard cannot honor throws here, before a
+ * query runs.
+ *
+ * @private
+ */
+function readSessions(config: CollegeDBConfig, consistency: ReadConsistency | undefined): ReadSessions {
+	if (!consistency) {
+		return PLAIN_SESSIONS;
+	}
+
+	const mode = consistency.mode;
+	if (mode !== 'primary' && mode !== 'session' && mode !== 'eventual') {
+		throw new CollegeDBError(`Unknown read consistency mode: ${String(mode)}`, 'INVALID_CONSISTENCY');
+	}
+
+	// keyed by database so a caller holding only the provider (the tombstone walk) finds its session
+	const opened = new Map<SQLDatabase, ReadTarget>();
+	const bindingOf = (database: SQLDatabase): string =>
+		Object.keys(config.shards).find((binding) => config.shards[binding] === database) ?? '<unknown>';
+	const idOf = (database: SQLDatabase): string | undefined => config.shardState?.[bindingOf(database)]?.id;
+
+	return {
+		on(database) {
+			const existing = opened.get(database);
+			if (existing) {
+				return existing;
+			}
+
+			const binding = bindingOf(database);
+			const sessionCapable = typeof database.withSession === 'function' && database.consistency?.session !== false;
+			const supported = mode === 'session' ? sessionCapable : database.consistency?.[mode] !== false;
+			if (!supported) {
+				throw new CollegeDBError(`Shard ${binding} cannot serve a ${mode} read`, 'CONSISTENCY_UNSUPPORTED');
+			}
+
+			let constraint = mode === 'primary' ? 'first-primary' : 'first-unconstrained';
+			if (consistency.mode === 'session' && consistency.bookmarks && Object.keys(consistency.bookmarks).length > 0) {
+				const id = idOf(database);
+				if (!id) {
+					throw new CollegeDBError(
+						`Shard ${binding} has no database id in shardState, so a bookmark cannot be matched to it`,
+						'BOOKMARK_IDENTITY_UNVERIFIED'
+					);
+				}
+				const bookmark = consistency.bookmarks[id];
+				if (typeof bookmark === 'string' && bookmark) {
+					constraint = bookmark;
+				}
+			}
+
+			const target: ReadTarget = sessionCapable ? database.withSession!(constraint) : database;
+			opened.set(database, target);
+			return target;
+		},
+		stamp(database, result) {
+			const bookmark = opened.get(database)?.getBookmark?.();
+			return bookmark ? { ...result, meta: { ...result.meta, bookmark } } : result;
+		},
+		bookmarks() {
+			let out: Record<string, string> | undefined;
+			for (const [database, target] of opened) {
+				const id = idOf(database);
+				const bookmark = target.getBookmark?.();
+				if (id && bookmark) {
+					(out ??= {})[id] = bookmark;
+				}
+			}
+			return out;
+		}
+	};
+}
+
+/**
+ * Sessions for one operation: the ones its caller already opened, or new ones.
+ * @private
+ */
+function sessionsFor(s: RouterState, options: ReadOptions | undefined): ReadSessions {
+	if (!options) {
+		return PLAIN_SESSIONS;
+	}
+
+	return (options as InternalReadOptions).sessions ?? readSessions(getConfig(s), options.consistency);
+}
+
+/**
+ * Options for the inner calls of an operation, so they share its sessions.
+ * @private
+ */
+function sharing(s: RouterState, options: ReadOptions | undefined): ReadOptions {
+	if (!options?.consistency || (options as InternalReadOptions).sessions) {
+		return options ?? {};
+	}
+
+	return { consistency: options.consistency, sessions: readSessions(getConfig(s), options.consistency) } as ReadOptions;
+}
+
+/**
+ * Stamps a read's result with its session bookmark. Plain sessions have none, so
+ * the statement's own promise is returned and the default path adds no hop.
+ * @private
+ */
+function stamped<R extends QueryResult<any>>(sessions: ReadSessions, database: SQLDatabase, pending: Promise<R>): Promise<R> {
+	return sessions === PLAIN_SESSIONS ? pending : pending.then((result) => sessions.stamp(database, result));
+}
+
+/**
+ * Adds the bookmarks of every database a merged read touched to its meta.
+ * @private
+ */
+function withBookmarks<R extends QueryResult<any>>(result: R, sessions: ReadSessions): R {
+	const bookmarks = sessions.bookmarks();
+	return bookmarks ? { ...result, meta: { ...result.meta, bookmarks } } : result;
 }
 
 /**
@@ -1438,31 +2234,40 @@ export async function prepare(key: string, sql: string): Promise<PreparedStateme
  * @private
  */
 async function readAcrossCandidates<T>(
+	s: RouterState,
 	key: string,
 	sql: string,
-	bindings: any[],
 	execute: (database: SQLDatabase) => Promise<T>,
 	isEmpty: (value: T) => boolean
 ): Promise<T> {
-	const config = getConfig();
+	const config = getConfig(s);
 	const operationType = getOperationType(sql);
 
 	// KV placement resolves to exactly one shard, which is the steady state for
 	// every deployment that has not opted into computed placement. Taking it
 	// here skips the candidate array, the epoch walk and the empty-result
 	// bookkeeping below, none of which can do anything with one candidate.
-	const decision = placementDecision ?? (await resolvePlacement(config));
+	const decision = heldDecision(s, operationType === 'write') ?? (await resolvePlacement(s, config, operationType === 'write'));
 	if (decision.mode !== 'computed' || !decision.manifest) {
-		const binding = await getShardForKey(key, operationType);
+		const binding = await getShardForKey(s, key, operationType);
 		const database = config.shards[binding];
 		if (!database) {
 			throw new CollegeDBError(`Shard ${binding} not found in configuration`, 'SHARD_NOT_FOUND');
 		}
 
-		return await execute(database);
+		const result = await execute(database);
+		// no journal means no tombstones, so the async walk is skipped
+		return isEmpty(result) && config.journalShard !== undefined
+			? ((await followTombstone(config, binding, key, execute, isEmpty)) ?? result)
+			: result;
 	}
 
-	const candidates = await resolveCandidates(key, operationType);
+	let candidates = await resolveCandidates(s, key, operationType, decision);
+
+	// a write statement passed through here must not run on a shard that does not hold the row
+	if (operationType === 'write' && candidates.length > 1) {
+		candidates = [await locateWriteShard(s, config, key, statementTable(sql), candidates)];
+	}
 
 	let firstResult: T | undefined;
 
@@ -1475,7 +2280,7 @@ async function readAcrossCandidates<T>(
 
 		if (!isEmpty(result)) {
 			if (i > 0) {
-				await memoizePlacementException(key, binding);
+				await memoizePlacementException(s, key, binding);
 			}
 			return result;
 		}
@@ -1486,7 +2291,9 @@ async function readAcrossCandidates<T>(
 	}
 
 	if (firstResult !== undefined) {
-		return firstResult;
+		return config.journalShard === undefined
+			? firstResult
+			: ((await followTombstone(config, candidates[0] ?? '', key, execute, isEmpty)) ?? firstResult);
 	}
 
 	const fallback = config.shards[candidates[0] ?? ''];
@@ -1563,8 +2370,12 @@ async function readAcrossCandidates<T>(
  * );
  * ```
  */
-export async function run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
-	const prepared = await prepare(key, sql);
+export function run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	return runIn<T>(currentState(), key, sql, bindings);
+}
+
+async function runIn<T = Record<string, unknown>>(s: RouterState, key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	const prepared = await prepareIn(s, key, sql);
 	const result = await prepared.bind(...bindings).run<T>();
 
 	if (!result.success) {
@@ -1634,15 +2445,15 @@ function createInsertAllocatorKey(): string {
 	return `insert:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 }
 
-async function allocateInsertShard(): Promise<string> {
-	const config = getConfig();
+async function allocateInsertShard(s: RouterState): Promise<string> {
+	const config = getConfig(s);
 	const availableShards = Object.keys(config.shards);
 
 	if (availableShards.length === 0) {
 		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
 	}
 
-	const eligibleShards = await filterShardsBySize(availableShards, config);
+	const eligibleShards = await selectEligibleShards(s, config, 'allocate');
 	if (eligibleShards.length === 0) {
 		throw new CollegeDBError('No shards available for insert', 'NO_SHARDS');
 	}
@@ -1652,7 +2463,7 @@ async function allocateInsertShard(): Promise<string> {
 
 	if (config.coordinator) {
 		try {
-			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 			const coordinator = config.coordinator.get(coordinatorId);
 
 			const response = await coordinator.fetch('http://coordinator/allocate', {
@@ -1677,22 +2488,23 @@ async function allocateInsertShard(): Promise<string> {
 		}
 	}
 
-	return selectShardByStrategy(effectiveStrategy, allocatorKey, eligibleShards, config);
+	return selectShardByStrategy(s, effectiveStrategy, allocatorKey, eligibleShards, config);
 }
 
 async function executeInsertOnShard<T = Record<string, unknown>>(
+	s: RouterState,
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
 	options: IdColumnOptions = {}
 ): Promise<InsertResult<T>> {
-	const config = getConfig();
+	const config = getConfig(s);
 	if (!config.shards[shardBinding]) {
 		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
 	const returning = /\breturning\b/i.test(sql);
-	const result = returning ? await allShard<T>(shardBinding, sql, bindings) : await runShard<T>(shardBinding, sql, bindings);
+	const result = returning ? await allShardIn<T>(s, shardBinding, sql, bindings) : await runShardIn<T>(s, shardBinding, sql, bindings);
 	const generatedId = extractGeneratedId(result, options.idColumn);
 
 	if (generatedId === undefined) {
@@ -1704,7 +2516,7 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 		);
 	}
 
-	const mapper = getMapper(config);
+	const mapper = getMapper(s, config);
 	const idKey = String(generatedId);
 
 	// Each shard mints its own sequence, so two shards both hand out 1, then 2,
@@ -1766,13 +2578,22 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
  * const row = await first(String(created.generatedId), 'SELECT * FROM auto_users WHERE id = ?', [created.generatedId]);
  * ```
  */
-export async function insert<T = Record<string, unknown>>(
+export function insert<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	options: IdColumnOptions = {}
 ): Promise<InsertResult<T>> {
-	const shardBinding = await allocateInsertShard();
-	return await executeInsertOnShard<T>(shardBinding, sql, bindings, options);
+	return insertIn<T>(currentState(), sql, bindings, options);
+}
+
+async function insertIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	options: IdColumnOptions = {}
+): Promise<InsertResult<T>> {
+	const shardBinding = await allocateInsertShard(s);
+	return await executeInsertOnShard<T>(s, shardBinding, sql, bindings, options);
 }
 
 /**
@@ -1806,13 +2627,23 @@ export async function insert<T = Record<string, unknown>>(
  * );
  * ```
  */
-export async function insertShard<T = Record<string, unknown>>(
+export function insertShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
 	options: IdColumnOptions = {}
 ): Promise<InsertResult<T>> {
-	return await executeInsertOnShard<T>(shardBinding, sql, bindings, options);
+	return insertShardIn<T>(currentState(), shardBinding, sql, bindings, options);
+}
+
+async function insertShardIn<T = Record<string, unknown>>(
+	s: RouterState,
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options: IdColumnOptions = {}
+): Promise<InsertResult<T>> {
+	return await executeInsertOnShard<T>(s, shardBinding, sql, bindings, options);
 }
 
 /**
@@ -1845,17 +2676,40 @@ export async function insertShard<T = Record<string, unknown>>(
  *
  * console.log(`User has ${postsResult.meta.count} posts`);
  * ```
+ *
+ * @param options - Read guarantee for this call; the shard's bookmark comes back on `meta.bookmark`
  */
-export async function all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+export function all<T = Record<string, unknown>>(
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<QueryResult<T>> {
+	return allIn<T>(currentState(), key, sql, bindings, options);
+}
+
+async function allIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<QueryResult<T>> {
+	const sessions = sessionsFor(s, options);
 	const result = await readAcrossCandidates<QueryResult<T>>(
+		s,
 		key,
 		sql,
-		bindings,
 		(database) =>
-			database
-				.prepare(sql)
-				.bind(...bindings)
-				.all<T>(),
+			stamped(
+				sessions,
+				database,
+				sessions
+					.on(database)
+					.prepare(sql)
+					.bind(...bindings)
+					.all<T>()
+			),
 		(value) => value.success && value.results.length === 0
 	);
 
@@ -1896,14 +2750,34 @@ export async function all<T = Record<string, unknown>>(key: string, sql: string,
  * if (userResult) {
  *   console.log(`Found user: ${userResult.name}`);
  * }
+ * ```
+ *
+ * @param options - Read guarantee for this call. A bare row has no meta, so use {@link all} to get a bookmark back
  */
-export async function first<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<T | null> {
+export function first<T = Record<string, unknown>>(
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	return firstIn<T>(currentState(), key, sql, bindings, options);
+}
+
+async function firstIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	const sessions = sessionsFor(s, options);
 	return await readAcrossCandidates<T | null>(
+		s,
 		key,
 		sql,
-		bindings,
 		(database) =>
-			database
+			sessions
+				.on(database)
 				.prepare(sql)
 				.bind(...bindings)
 				.first<T>(),
@@ -1924,31 +2798,45 @@ export async function first<T = Record<string, unknown>>(key: string, sql: strin
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
  * @param batchSize - Number of concurrent shard queries during fanout (default: 50)
+ * @param options - Read guarantee for this call. The mapped shard and the fanout share one session per shard
  * @returns Promise resolving to merged query results
  * @since 1.1.4
  */
-export async function allByLookupKey<T = Record<string, unknown>>(
+export function allByLookupKey<T = Record<string, unknown>>(
 	lookupKey: string,
 	sql: string,
 	bindings: any[] = [],
-	batchSize: number = 50
+	batchSize: number = 50,
+	options?: ReadOptions
 ): Promise<QueryResult<T>> {
-	const config = getConfig();
-	const mapper = getMapper(config);
+	return allByLookupKeyIn<T>(currentState(), lookupKey, sql, bindings, batchSize, options);
+}
+
+async function allByLookupKeyIn<T = Record<string, unknown>>(
+	s: RouterState,
+	lookupKey: string,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<QueryResult<T>> {
+	const config = getConfig(s);
+	const mapper = getMapper(s, config);
 	const mapping = await mapper.getShardMapping(lookupKey);
+	const shared = sharing(s, options);
 
 	if (mapping) {
 		const mappedShardDb = config.shards[mapping.shard];
 		if (mappedShardDb) {
-			const mappedResult = await allShard<T>(mapping.shard, sql, bindings);
+			const mappedResult = await allShardIn<T>(s, mapping.shard, sql, bindings, shared);
 			if (mappedResult.success && mappedResult.results.length > 0) {
 				return mappedResult;
 			}
 		}
 	}
 
-	const shardResults = await allAllShards<T>(sql, bindings, batchSize);
-	return mergeAllShardQueryResults(shardResults);
+	const shardResults = await allAllShardsIn<T>(s, sql, bindings, batchSize, shared);
+	return withBookmarks(mergeAllShardQueryResults(shardResults), sessionsFor(s, shared));
 }
 
 /**
@@ -1964,30 +2852,44 @@ export async function allByLookupKey<T = Record<string, unknown>>(
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
  * @param batchSize - Number of concurrent shard queries during fanout (default: 50)
+ * @param options - Read guarantee for this call. The mapped shard and the fanout share one session per shard
  * @returns Promise resolving to the first matching record, or null
  * @since 1.1.4
  */
-export async function firstByLookupKey<T = Record<string, unknown>>(
+export function firstByLookupKey<T = Record<string, unknown>>(
 	lookupKey: string,
 	sql: string,
 	bindings: any[] = [],
-	batchSize: number = 50
+	batchSize: number = 50,
+	options?: ReadOptions
 ): Promise<T | null> {
-	const config = getConfig();
-	const mapper = getMapper(config);
+	return firstByLookupKeyIn<T>(currentState(), lookupKey, sql, bindings, batchSize, options);
+}
+
+async function firstByLookupKeyIn<T = Record<string, unknown>>(
+	s: RouterState,
+	lookupKey: string,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<T | null> {
+	const config = getConfig(s);
+	const mapper = getMapper(s, config);
 	const mapping = await mapper.getShardMapping(lookupKey);
+	const shared = sharing(s, options);
 
 	if (mapping) {
 		const mappedShardDb = config.shards[mapping.shard];
 		if (mappedShardDb) {
-			const mappedFirst = await firstShard<T>(mapping.shard, sql, bindings);
+			const mappedFirst = await firstShardIn<T>(s, mapping.shard, sql, bindings, shared);
 			if (mappedFirst !== null) {
 				return mappedFirst;
 			}
 		}
 	}
 
-	const fanoutResults = await firstAllShards<T>(sql, bindings, batchSize);
+	const fanoutResults = await firstAllShardsIn<T>(s, sql, bindings, batchSize, shared);
 	return fanoutResults.find((row): row is T => row !== null) ?? null;
 }
 
@@ -2006,7 +2908,7 @@ export async function firstByLookupKey<T = Record<string, unknown>>(
  *
  * @param key - Logical key to drop, or omit to drop every cached mapping
  * @throws {CollegeDBError} If CollegeDB is not initialized
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const mapper = new KVShardMapper(env.KV, { hashShardMappings: true });
@@ -2015,8 +2917,12 @@ export async function firstByLookupKey<T = Record<string, unknown>>(
  * invalidateMappingCache('user-123'); // this process now reads the new shard
  * ```
  */
-export async function invalidateMappingCache(key?: string): Promise<void> {
-	const mapper = getMapper(getConfig());
+export function invalidateMappingCache(key?: string): Promise<void> {
+	return invalidateMappingCacheIn(currentState(), key);
+}
+
+async function invalidateMappingCacheIn(s: RouterState, key?: string): Promise<void> {
+	const mapper = getMapper(s, getConfig(s));
 
 	if (key === undefined) {
 		mapper.clearMappingCache();
@@ -2036,17 +2942,23 @@ export async function invalidateMappingCache(key?: string): Promise<void> {
  * The reassignment process:
  * 1. Validates the target shard exists in configuration
  * 2. Checks that a mapping exists for the primary key
- * 3. If target shard differs from current, migrates the data
- * 4. Updates the KV mapping to point to the new shard
+ * 3. If the target shard differs from the current one, moves the row through the
+ *    migration journal (see `docs/migration-protocol.md`)
+ * 4. Updates the KV mapping, and the placement exception set when the target is
+ *    not the shard placement computes
  *
- * **Note**: This operation involves data migration and should be used
- * carefully in production environments. Consider the impact on ongoing queries.
+ * A move needs a journal: set `journalShard` in the configuration. With several
+ * shards and none set it throws `JOURNAL_NOT_CONFIGURED`. A crash at any step is
+ * finished or rolled back by {@link recoverMigrations}. Only one table row moves;
+ * related rows in other tables are the caller's to move.
  *
  * @param primaryKey - Primary key to reassign to a different shard
  * @param newBinding - New shard binding name where the data should be moved
  * @param tableName - Name of the table containing the record to migrate
+ * @param options - Primary-key column, conflict policy, version column and retention
  * @returns Promise that resolves when reassignment and migration are complete
- * @throws {Error} If target shard not found, mapping doesn't exist, or migration fails
+ * @throws {CollegeDBError} `SHARD_NOT_FOUND`, `MAPPING_NOT_FOUND`, `JOURNAL_NOT_CONFIGURED`,
+ * `MIGRATION_IN_PROGRESS`, `MIGRATION_ABORTED`, `MIGRATION_PUBLISH_FAILED`, or the errors of the move itself
  * @example
  * ```typescript
  * // Move a user from east to west coast for better latency
@@ -2061,16 +2973,26 @@ export async function invalidateMappingCache(key?: string): Promise<void> {
  * await reassignShard('user-enterprise-456', 'db-dedicated', 'users');
  * ```
  */
-export async function reassignShard(primaryKey: string, newBinding: string, tableName: string): Promise<void> {
-	const config = getConfig();
+export function reassignShard(primaryKey: string, newBinding: string, tableName: string, options: MoveRecordOptions = {}): Promise<void> {
+	return reassignShardIn(currentState(), primaryKey, newBinding, tableName, options);
+}
+
+async function reassignShardIn(
+	s: RouterState,
+	primaryKey: string,
+	newBinding: string,
+	tableName: string,
+	options: MoveRecordOptions = {}
+): Promise<void> {
+	const config = getConfig(s);
 
 	if (!config.shards[newBinding]) {
 		throw new CollegeDBError(`Shard ${newBinding} not found in configuration`, 'SHARD_NOT_FOUND');
 	}
 
-	const mapper = getMapper(config);
+	const mapper = getMapper(s, config);
 	const currentMapping = await mapper.getShardMapping(primaryKey);
-	const decision = await resolvePlacement(config);
+	const decision = await resolvePlacement(s, config, true);
 
 	// Under computed placement there is no stored mapping to read, so the current
 	// shard comes from the placement function instead of being an error.
@@ -2083,40 +3005,306 @@ export async function reassignShard(primaryKey: string, newBinding: string, tabl
 		throw new CollegeDBError(`No existing mapping found for primary key: ${primaryKey}`, 'MAPPING_NOT_FOUND');
 	}
 
-	// Migrate data if different shard
-	if (currentShard !== newBinding) {
-		const { migrateRecord } = await import('./migrations');
-		const sourceDb = config.shards[currentShard];
-		const targetDb = config.shards[newBinding];
-
-		if (!sourceDb || !targetDb) {
-			throw new CollegeDBError('Source or target shard not available', 'SHARD_UNAVAILABLE');
-		}
-
-		await migrateRecord(sourceDb, targetDb, primaryKey, tableName);
+	if (currentShard === newBinding) {
+		await publishMove(s, config, explicitJournal(config), { key: primaryKey, destination: newBinding });
+		return;
 	}
 
-	// Update mapping. A key moved off the shard its placement function computes
-	// has to be recorded as an exception, or the next read would look at the
-	// computed shard and find nothing there.
-	if (currentMapping) {
-		await mapper.updateShardMapping(primaryKey, newBinding);
+	const journal = requireJournal(config);
+	const result = await moveRecord(migrationEnv(s, config, journal), {
+		table: tableName,
+		key: primaryKey,
+		source: currentShard,
+		destination: newBinding,
+		options: { pkColumn: config.keyColumns?.[tableName], ...options }
+	});
+
+	if (result.outcome === 'aborted') {
+		throw new CollegeDBError(
+			`Move of ${primaryKey} to ${newBinding} aborted (${result.reason}); ${currentShard} still owns the key`,
+			'MIGRATION_ABORTED'
+		);
+	}
+}
+
+/**
+ * Builds the engine's view of the active configuration.
+ * @private
+ */
+function migrationEnv(s: RouterState, config: CollegeDBConfig, journal: { binding: string; db: SQLDatabase; scope: string }): MigrationEnv {
+	return {
+		scope: journal.scope,
+		journalBinding: journal.binding,
+		shards: config.shards,
+		placementEpoch: () => s.placementDecision?.manifest?.epochs[0]?.n ?? null,
+		publish: (info) => publishMove(s, config, journal, info)
+	};
+}
+
+/**
+ * Updates the state derived from a committed move: the KV mapping, the placement
+ * exception, the coordinator ledger and the mapping cache. Safe to run again.
+ *
+ * A key moved off the shard its placement function computes is recorded as an
+ * exception, or the next read would look at the computed shard and find nothing.
+ * A key moved onto its computed shard needs no exception.
+ * @private
+ */
+async function publishMove(
+	s: RouterState,
+	config: CollegeDBConfig,
+	journal: { binding: string; db: SQLDatabase; scope: string } | null,
+	info: Pick<PublishInfo, 'key' | 'destination'>
+): Promise<void> {
+	const mapper = getMapper(s, config);
+	const decision = await resolvePlacement(s, config, true);
+
+	if (await mapper.getShardMapping(info.key)) {
+		await mapper.updateShardMapping(info.key, info.destination);
 	} else {
-		await mapper.setShardMapping(primaryKey, newBinding);
+		await mapper.setShardMapping(info.key, info.destination);
 	}
 
 	if (decision.mode === 'computed' && decision.manifest) {
-		placementDecision = {
-			mode: 'computed',
-			manifest: await addPlacementException(config.kv, decision.manifest, await mapper.hashKey(primaryKey))
-		};
+		const owner = candidateShards(info.key, decision.manifest, Object.keys(config.shards))[0];
+		if (owner !== info.destination) {
+			if (journal) {
+				await ensureJournalSchema(config.shards, journal.binding);
+			}
+
+			// saved from the newest manifest, so a stale copy cannot overwrite a newer epoch
+			const authority = journal ? { db: journal.db, scope: journal.scope } : undefined;
+			const base = advancedManifest(
+				decision.manifest,
+				await loadPlacementManifest(config.kv, undefined, { fresh: true }, authority, s.placement)
+			);
+			s.placementDecision = {
+				mode: 'computed',
+				manifest: await addPlacementException(config.kv, base, await mapper.hashKey(info.key), authority, s.placement)
+			};
+		}
 	}
 
 	// Drop any coordinator-recorded allocation so a later first touch of this key
 	// is not handed the shard it has just been moved off.
-	await forgetCoordinatorAllocation(config, primaryKey);
+	await forgetCoordinatorAllocation(config, info.key);
 
-	await mapper.invalidateCachedMapping(primaryKey);
+	await mapper.invalidateCachedMapping(info.key);
+}
+
+/**
+ * Rebuilds the KV copy of the exception set from the journal, so a copy that
+ * another isolate overwrote with an older snapshot is repaired. Best effort.
+ * @private
+ */
+async function republishExceptions(s: RouterState, config: CollegeDBConfig): Promise<void> {
+	const journal = explicitJournal(config);
+	const decision = s.placementDecision;
+	if (!journal || decision?.mode !== 'computed' || !decision.manifest) {
+		return;
+	}
+
+	try {
+		s.placementDecision = {
+			mode: 'computed',
+			manifest: await republishPlacementExceptions(config.kv, decision.manifest, { db: journal.db, scope: journal.scope }, s.placement)
+		};
+	} catch (error) {
+		if (config.debug) {
+			console.warn('Could not rebuild the placement exception set:', error);
+		}
+	}
+}
+
+/**
+ * Resumes every unfinished move recorded in the journal.
+ *
+ * A crash can stop a move at any step. This reads each active claim, decides what
+ * the move already did from the shards and the journal, and finishes it or aborts
+ * it, per the rules in `docs/migration-protocol.md`. A move that cannot be
+ * resolved is reported in `failed` and left for an operator. Run it on a timer, or
+ * after a deploy that may have interrupted a move. Run one recovery at a time.
+ *
+ * @param options - `olderThanMs` leaves alone moves that changed more recently than that
+ * @returns What happened to each active claim
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`; `JOURNAL_UNAVAILABLE` when the journal cannot be read
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const report = await recoverMigrations();
+ * if (report.failed.length > 0) {
+ *   console.error('moves needing attention', report.failed);
+ * }
+ * ```
+ */
+export function recoverMigrations(options: { olderThanMs?: number } = {}): Promise<RecoveryReport> {
+	return recoverMigrationsIn(currentState(), options);
+}
+
+async function recoverMigrationsIn(s: RouterState, options: { olderThanMs?: number } = {}): Promise<RecoveryReport> {
+	const config = getConfig(s);
+	const report = await recoverJournal(migrationEnv(s, config, requireJournal(config)), options);
+	await republishExceptions(s, config);
+	return report;
+}
+
+/**
+ * Checks the journal against the shards. Observational unless `repair` is set.
+ *
+ * Reports unfinished moves, live rows left on a shard the key moved off, and
+ * tombstones the journal does not know. With `repair: true` it resumes unfinished
+ * moves and removes a ghost row only when it equals the archived copy. The pass
+ * is recorded; {@link purgeRetired} waits for a clean one.
+ *
+ * @param options - `repair` to act on what it finds
+ * @returns The findings
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
+ * @since 1.4.0
+ */
+export function verifyMigrations(options: { repair?: boolean } = {}): Promise<VerifyReport> {
+	return verifyMigrationsIn(currentState(), options);
+}
+
+async function verifyMigrationsIn(s: RouterState, options: { repair?: boolean } = {}): Promise<VerifyReport> {
+	const config = getConfig(s);
+	const report = await verifyJournal(migrationEnv(s, config, requireJournal(config)), options);
+	if (options.repair) {
+		await republishExceptions(s, config);
+	}
+	return report;
+}
+
+/**
+ * Reports where the journal says a key stands.
+ *
+ * @param key - Routing key
+ * @param table - Restrict to one table
+ * @returns The newest move of the key, or `null` when it was never moved
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
+ * @since 1.4.0
+ */
+export function getMigrationStatus(key: string, table?: string): Promise<MigrationStatus | null> {
+	return getMigrationStatusIn(currentState(), key, table);
+}
+
+async function getMigrationStatusIn(s: RouterState, key: string, table?: string): Promise<MigrationStatus | null> {
+	const config = getConfig(s);
+	return await getJournalStatus(migrationEnv(s, config, requireJournal(config)), key, table);
+}
+
+/**
+ * Clears the archived copy of moved rows once it is safe to.
+ *
+ * A move is refused until its retention window has passed and a clean
+ * {@link verifyMigrations} pass finished after it. The tombstone stays, so a stale
+ * writer is still turned away.
+ *
+ * @returns The moves purged and the ones refused, with the reason
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
+ * @since 1.4.0
+ */
+export function purgeRetired(): Promise<PurgeReport> {
+	return purgeRetiredIn(currentState());
+}
+
+async function purgeRetiredIn(s: RouterState): Promise<PurgeReport> {
+	const config = getConfig(s);
+	return await purgeJournal(migrationEnv(s, config, requireJournal(config)));
+}
+
+/**
+ * Drops the placement epochs no row depends on.
+ *
+ * An epoch is removed only when a complete ownership census proves it. The fence
+ * goes up on every shard first, so a writer on an older topology generation can no
+ * longer create a row that only a discarded epoch would find. Then every named
+ * table on every shard is read in keyset pages, and each row is attributed to the
+ * newest epoch whose owner is the shard it sits on. A row pinned by a placement
+ * exception that has a mapping to its shard depends on no epoch. The census runs
+ * twice, and the pruned manifest is published with a compare-and-swap only when
+ * both passes agree. The newest epoch is never removed. A zero-move
+ * {@link rebalance} is not proof and is not accepted in its place.
+ *
+ * The fence covers builder writes ({@link insertInto}, {@link upsert} and the
+ * helpers on them). Raw SQL issued outside CollegeDB, and raw `run()` statements,
+ * bypass it; stop those writers before pruning.
+ *
+ * @param options - Tables to scan, key columns, `dryRun`, `pageSize` and `concurrency`
+ * @returns The epochs removed and retained, the rows depending on each, and the rows read
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` without `journalShard`; `PRUNE_REFUSED` when the proof is incomplete
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const preview = await pruneEpochs({ tables: ['users', 'posts'], dryRun: true });
+ * if (preview.dependents[1] === 0) {
+ *   await pruneEpochs({ tables: ['users', 'posts'] });
+ * }
+ * ```
+ */
+export function pruneEpochs(options: PruneOptions): Promise<PruneReport> {
+	return pruneEpochsIn(currentState(), options);
+}
+
+async function pruneEpochsIn(s: RouterState, options: PruneOptions): Promise<PruneReport> {
+	const config = getConfig(s);
+	const journal = explicitJournal(config);
+	if (!journal) {
+		throw new CollegeDBError(
+			'Pruning epochs needs a journal. Set journalShard in the configuration to the binding that should hold it.',
+			'JOURNAL_NOT_CONFIGURED'
+		);
+	}
+
+	await ensureJournalSchema(config.shards, journal.binding);
+
+	const mapper = getMapper(s, config);
+	let pinned: Set<string>;
+	try {
+		const rows = await journal.db
+			.prepare('SELECT hashed_key FROM collegedb_placement_exceptions WHERE scope = ?')
+			.bind(journal.scope)
+			.all<{ hashed_key: string }>();
+		const kvSet = await loadPlacementExceptions(config.kv, 0, 0, { fresh: true }, s.placement);
+		pinned = new Set([...kvSet, ...rows.results.map((row) => row.hashed_key)]);
+	} catch (error) {
+		throw new CollegeDBError(
+			`pruneEpochs refused: the exception set could not be read (${error instanceof Error ? error.message : String(error)})`,
+			'PRUNE_REFUSED'
+		);
+	}
+
+	const { report, published } = await runPrune(
+		{
+			journal: { db: journal.db, scope: journal.scope },
+			shards: config.shards,
+			keyColumns: config.keyColumns,
+			epochOwner: shardForEpoch,
+			isPinned: async (key, shard) => pinned.has(await mapper.hashKey(key)) && (await mapper.getShardMapping(key))?.shard === shard
+		},
+		options
+	);
+
+	if (published) {
+		s.placementDecision = { mode: 'computed', manifest: published };
+		try {
+			await savePlacementManifest(config.kv, published, undefined, s.placement);
+		} catch (error) {
+			if (config.debug) {
+				console.warn('Could not refresh the KV copy of the pruned manifest:', error);
+			}
+		}
+	}
+
+	return report;
+}
+
+/**
+ * The journal handle placement exceptions are written through, if configured.
+ * @private
+ */
+function placementJournal(config: CollegeDBConfig): { db: SQLDatabase; scope: string } | undefined {
+	const journal = explicitJournal(config);
+	return journal ? { db: journal.db, scope: journal.scope } : undefined;
 }
 
 /**
@@ -2133,7 +3321,7 @@ async function forgetCoordinatorAllocation(config: CollegeDBConfig, primaryKey: 
 	}
 
 	try {
-		const coordinatorId = config.coordinator.idFromName('default');
+		const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 		const coordinator = config.coordinator.get(coordinatorId);
 		await coordinator.fetch('http://coordinator/forget', {
 			method: 'POST',
@@ -2168,13 +3356,17 @@ async function forgetCoordinatorAllocation(config: CollegeDBConfig, primaryKey: 
  * }
  * ```
  */
-export async function listKnownShards(): Promise<string[]> {
-	const config = getConfig();
+export function listKnownShards(): Promise<string[]> {
+	return listKnownShardsIn(currentState());
+}
+
+async function listKnownShardsIn(s: RouterState): Promise<string[]> {
+	const config = getConfig(s);
 
 	// Try to get from coordinator first
 	if (config.coordinator) {
 		try {
-			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 			const coordinator = config.coordinator.get(coordinatorId);
 
 			const response = await coordinator.fetch('http://coordinator/shards');
@@ -2188,7 +3380,7 @@ export async function listKnownShards(): Promise<string[]> {
 
 	// Fallback: merge configured shards with KV-known shards
 	try {
-		const mapper = getMapper(config);
+		const mapper = getMapper(s, config);
 		const kvShards = await mapper.getKnownShards();
 		const merged = new Set<string>([...Object.keys(config.shards), ...kvShards]);
 		return Array.from(merged);
@@ -2229,13 +3421,17 @@ export async function listKnownShards(): Promise<string[]> {
  * console.log(`Most loaded shard: ${mostLoaded.binding} (${mostLoaded.count} keys)`);
  * ```
  */
-export async function getShardStats(): Promise<ShardStats[]> {
-	const config = getConfig();
+export function getShardStats(): Promise<ShardStats[]> {
+	return getShardStatsIn(currentState());
+}
+
+async function getShardStatsIn(s: RouterState): Promise<ShardStats[]> {
+	const config = getConfig(s);
 
 	// Try to get from coordinator first
 	if (config.coordinator) {
 		try {
-			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 			const coordinator = config.coordinator.get(coordinatorId);
 
 			const response = await coordinator.fetch('http://coordinator/stats');
@@ -2248,7 +3444,7 @@ export async function getShardStats(): Promise<ShardStats[]> {
 	}
 
 	// Fallback to KV-based counting
-	const mapper = getMapper(config);
+	const mapper = getMapper(s, config);
 	const counts = await mapper.getShardKeyCounts();
 
 	// Merge shards from config and KV known shards
@@ -2287,12 +3483,17 @@ export async function getShardStats(): Promise<ShardStats[]> {
  * console.log(`Inserted user with ID: ${result.lastInsertId}`);
  * ```
  */
-export async function runShard<T = Record<string, unknown>>(
+export function runShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	return runShardIn<T>(currentState(), shardBinding, sql, bindings);
+}
+
+async function runShardIn<T = Record<string, unknown>>(
+	s: RouterState,
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = []
 ): Promise<QueryResult<T>> {
-	const config = getConfig();
+	const config = getConfig(s);
 	const db = config.shards[shardBinding];
 
 	if (!db) {
@@ -2322,6 +3523,7 @@ export async function runShard<T = Record<string, unknown>>(
  * @param shardBinding - The shard binding name to execute the query on
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Read guarantee for this call; the shard's bookmark comes back on `meta.bookmark`
  * @returns Promise resolving to structured query results
  * @throws {Error} If shard not found or query fails
  * @example
@@ -2344,24 +3546,47 @@ export async function runShard<T = Record<string, unknown>>(
  * );
  * ```
  */
-export async function allShard<T = Record<string, unknown>>(
+export function allShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
-	bindings: any[] = []
+	bindings: any[] = [],
+	options?: ReadOptions
 ): Promise<QueryResult<T>> {
-	const config = getConfig();
+	return allShardIn<T>(currentState(), shardBinding, sql, bindings, options);
+}
+
+async function allShardIn<T = Record<string, unknown>>(
+	s: RouterState,
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<QueryResult<T>> {
+	const config = getConfig(s);
 	const db = config.shards[shardBinding];
 
 	if (!db) {
 		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
-	const result = await db
+	if (!options) {
+		return await db
+			.prepare(sql)
+			.bind(...bindings)
+			.all<T>();
+	}
+
+	return await allShardOnSession<T>(sessionsFor(s, options), db, sql, bindings);
+}
+
+async function allShardOnSession<T>(sessions: ReadSessions, db: SQLDatabase, sql: string, bindings: any[]): Promise<QueryResult<T>> {
+	const result = await sessions
+		.on(db)
 		.prepare(sql)
 		.bind(...bindings)
 		.all<T>();
 
-	return result;
+	return sessions.stamp(db, result);
 }
 
 /**
@@ -2375,6 +3600,7 @@ export async function allShard<T = Record<string, unknown>>(
  * @param shardBinding - The shard binding name to execute the query on
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Read guarantee for this call
  * @returns Promise resolving to the first matching record, or null if not found
  * @throws {Error} If shard not found or query fails
  * @example
@@ -2390,15 +3616,31 @@ export async function allShard<T = Record<string, unknown>>(
  * }
  * ```
  */
-export async function firstShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<T | null> {
-	const config = getConfig();
+export function firstShard<T = Record<string, unknown>>(
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	return firstShardIn<T>(currentState(), shardBinding, sql, bindings, options);
+}
+
+async function firstShardIn<T = Record<string, unknown>>(
+	s: RouterState,
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	const config = getConfig(s);
 	const db = config.shards[shardBinding];
 
 	if (!db) {
 		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
 	}
 
-	const result = await db
+	const result = await sessionsFor(s, options)
+		.on(db)
 		.prepare(sql)
 		.bind(...bindings)
 		.first<T>();
@@ -2418,12 +3660,21 @@ export async function firstShard<T = Record<string, unknown>>(shardBinding: stri
  * @returns Promise resolving to an array of results from each shard
  * @since 1.0.4
  */
-export async function runAllShards<T = Record<string, unknown>>(
+export function runAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	batchSize: number = 50
 ): Promise<QueryResult<T>[]> {
-	const config = getConfig();
+	return runAllShardsIn<T>(currentState(), sql, bindings, batchSize);
+}
+
+async function runAllShardsIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50
+): Promise<QueryResult<T>[]> {
+	const config = getConfig(s);
 	const tasks: Array<() => Promise<QueryResult<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
@@ -2467,15 +3718,28 @@ export async function runAllShards<T = Record<string, unknown>>(
  * @param sql - The SQL statement to execute on each shard
  * @param bindings - Parameter values to bind to the SQL statement
  * @param batchSize - Number of concurrent queries to run at once (default: 50)
+ * @param options - Read guarantee for this call. Each result carries its shard's bookmark on `meta.bookmark`, in `config.shards` order
  * @returns Promise resolving to an array of results from each shard
  * @since 1.0.4
  */
-export async function allAllShards<T = Record<string, unknown>>(
+export function allAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
-	batchSize: number = 50
+	batchSize: number = 50,
+	options?: ReadOptions
 ): Promise<QueryResult<T>[]> {
-	const config = getConfig();
+	return allAllShardsIn<T>(currentState(), sql, bindings, batchSize, options);
+}
+
+async function allAllShardsIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<QueryResult<T>[]> {
+	const config = getConfig(s);
+	const sessions = sessionsFor(s, options);
 	const tasks: Array<() => Promise<QueryResult<T>>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
@@ -2484,20 +3748,29 @@ export async function allAllShards<T = Record<string, unknown>>(
 			continue;
 		}
 
+		if (sessions === PLAIN_SESSIONS) {
+			tasks.push(() =>
+				db
+					.prepare(sql)
+					.bind(...bindings)
+					.all<T>()
+					.catch((error) => failedShard<T>(binding, error))
+			);
+			continue;
+		}
+
+		// opened outside the catch below: a refused consistency must throw, not become a failed shard
+		const target = sessions.on(db);
+
 		tasks.push(() =>
-			db
-				.prepare(sql)
-				.bind(...bindings)
-				.all<T>()
-				.catch((error) => {
-					console.error(`Error executing query on shard ${binding}:`, error);
-					return {
-						success: false,
-						results: [],
-						error: error instanceof Error ? error.message : String(error),
-						meta: { duration: 0 }
-					} satisfies QueryResult<T>;
-				})
+			stamped(
+				sessions,
+				db,
+				target
+					.prepare(sql)
+					.bind(...bindings)
+					.all<T>()
+			).catch((error) => failedShard<T>(binding, error))
 		);
 	}
 
@@ -2511,6 +3784,20 @@ export async function allAllShards<T = Record<string, unknown>>(
 }
 
 /**
+ * The result a fan-out reports for a shard whose query threw.
+ * @private
+ */
+function failedShard<T>(binding: string, error: unknown): QueryResult<T> {
+	console.error(`Error executing query on shard ${binding}:`, error);
+	return {
+		success: false,
+		results: [],
+		error: error instanceof Error ? error.message : String(error),
+		meta: { duration: 0 }
+	} satisfies QueryResult<T>;
+}
+
+/**
  * Runs an all-shards query whose SQL is built per shard.
  *
  * `allAllShards` takes one statement for every shard, which cannot be right
@@ -2521,11 +3808,14 @@ export async function allAllShards<T = Record<string, unknown>>(
  * @private
  */
 async function allAllShardsBuilt<T = Record<string, unknown>>(
+	s: RouterState,
 	build: (dialect: SQLDialect | undefined) => string,
 	bindings: any[] = [],
-	batchSize: number = 50
+	batchSize: number = 50,
+	options?: ReadOptions
 ): Promise<QueryResult<T>[]> {
-	const config = getConfig();
+	const config = getConfig(s);
+	const sessions = sessionsFor(s, options);
 	const tasks: Array<() => Promise<QueryResult<T>>> = [];
 
 	// One statement per distinct dialect rather than one per shard. A cluster
@@ -2546,20 +3836,25 @@ async function allAllShardsBuilt<T = Record<string, unknown>>(
 			continue;
 		}
 
+		const target = sessions.on(db);
+
 		tasks.push(() =>
-			db
-				.prepare(statementFor(db.dialect))
-				.bind(...bindings)
-				.all<T>()
-				.catch((error) => {
-					console.error(`Error executing query on shard ${binding}:`, error);
-					return {
-						success: false,
-						results: [],
-						error: error instanceof Error ? error.message : String(error),
-						meta: { duration: 0 }
-					} satisfies QueryResult<T>;
-				})
+			stamped(
+				sessions,
+				db,
+				target
+					.prepare(statementFor(db.dialect))
+					.bind(...bindings)
+					.all<T>()
+			).catch((error) => {
+				console.error(`Error executing query on shard ${binding}:`, error);
+				return {
+					success: false,
+					results: [],
+					error: error instanceof Error ? error.message : String(error),
+					meta: { duration: 0 }
+				} satisfies QueryResult<T>;
+			})
 		);
 	}
 
@@ -2596,6 +3891,12 @@ export interface GlobalAllShardsOptions<T = Record<string, unknown>> {
 	 * @since 1.2.4
 	 */
 	includeTotal?: boolean;
+	/**
+	 * Read guarantee for every shard query. Each shard gets one session; the merged
+	 * `meta.bookmarks` holds one bookmark per database, not one snapshot token.
+	 * @since 1.4.0
+	 */
+	consistency?: ReadConsistency;
 }
 
 /**
@@ -2788,7 +4089,16 @@ function pushDownGlobalLimit<T>(
 	return `${trimmed} LIMIT ${perShard}`;
 }
 
-export async function allAllShardsGlobal<T = Record<string, unknown>>(
+export function allAllShardsGlobal<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: GlobalAllShardsOptions<T> = {}
+): Promise<QueryResult<T>> {
+	return allAllShardsGlobalIn<T>(currentState(), sql, bindings, options);
+}
+
+async function allAllShardsGlobalIn<T = Record<string, unknown>>(
+	s: RouterState,
 	sql: string,
 	bindings: any[] = [],
 	options: GlobalAllShardsOptions<T> = {}
@@ -2797,8 +4107,12 @@ export async function allAllShardsGlobal<T = Record<string, unknown>>(
 	const offset = normalizeOffset(options.offset);
 	const limit = normalizeLimit(options.limit);
 
-	const merged = mergeAllShardQueryResults(
-		await allAllShardsBuilt<T>((dialect) => pushDownGlobalLimit(sql, options, offset, limit, dialect), bindings, batchSize)
+	const shared = sharing(s, options);
+	const merged = withBookmarks(
+		mergeAllShardQueryResults(
+			await allAllShardsBuilt<T>(s, (dialect) => pushDownGlobalLimit(sql, options, offset, limit, dialect), bindings, batchSize, shared)
+		),
+		sessionsFor(s, shared)
 	);
 	let rows = merged.results;
 
@@ -2837,15 +4151,28 @@ export async function allAllShardsGlobal<T = Record<string, unknown>>(
  * @param sql - The SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
  * @param batchSize - Number of concurrent queries to run at once (default: 50)
+ * @param options - Read guarantee for this call
  * @returns Promise resolving to an array of first matching records from each shard
  * @since 1.0.4
  */
-export async function firstAllShards<T = Record<string, unknown>>(
+export function firstAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
-	batchSize: number = 50
+	batchSize: number = 50,
+	options?: ReadOptions
 ): Promise<(T | null)[]> {
-	const config = getConfig();
+	return firstAllShardsIn<T>(currentState(), sql, bindings, batchSize, options);
+}
+
+async function firstAllShardsIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<(T | null)[]> {
+	const config = getConfig(s);
+	const sessions = sessionsFor(s, options);
 	const tasks: Array<() => Promise<T | null>> = [];
 
 	for (const [binding, db] of Object.entries(config.shards)) {
@@ -2854,8 +4181,10 @@ export async function firstAllShards<T = Record<string, unknown>>(
 			continue;
 		}
 
+		const target = sessions.on(db);
+
 		tasks.push(() =>
-			db
+			target
 				.prepare(sql)
 				.bind(...bindings)
 				.first<T>()
@@ -2886,12 +4215,21 @@ export async function firstAllShards<T = Record<string, unknown>>(
  * @returns Promise resolving to the first globally-processed row, or null
  * @since 1.1.4
  */
-export async function firstAllShardsGlobal<T = Record<string, unknown>>(
+export function firstAllShardsGlobal<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	options: Omit<GlobalAllShardsOptions<T>, 'limit'> = {}
 ): Promise<T | null> {
-	const merged = await allAllShardsGlobal<T>(sql, bindings, {
+	return firstAllShardsGlobalIn<T>(currentState(), sql, bindings, options);
+}
+
+async function firstAllShardsGlobalIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<GlobalAllShardsOptions<T>, 'limit'> = {}
+): Promise<T | null> {
+	const merged = await allAllShardsGlobalIn<T>(s, sql, bindings, {
 		...options,
 		limit: 1
 	});
@@ -2929,20 +4267,24 @@ export async function firstAllShardsGlobal<T = Record<string, unknown>>(
  * }
  * ```
  */
-export async function flush(): Promise<void> {
-	const config = getConfig();
-	const mapper = getMapper(config);
+export function flush(): Promise<void> {
+	return flushIn(currentState());
+}
+
+async function flushIn(s: RouterState): Promise<void> {
+	const config = getConfig(s);
+	const mapper = getMapper(s, config);
 
 	await mapper.clearAllMappings();
-	shardSizeCache.clear();
+	s.shardSizeCache.clear();
 	// The known-shard registration is memoized per process, so a flush has to
 	// let the next initialize re-register rather than assume it already did.
-	syncedShardSets.clear();
+	s.syncedShardSets.clear();
 
 	// Also flush coordinator if available
 	if (config.coordinator) {
 		try {
-			const coordinatorId = config.coordinator.idFromName('default');
+			const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 			const coordinator = config.coordinator.get(coordinatorId);
 
 			await coordinator.fetch('http://coordinator/flush', { method: 'POST' });
@@ -2966,8 +4308,12 @@ export async function flush(): Promise<void> {
  * console.log(`Database size: ${Math.round(sizeInBytes / 1024 / 1024)} MB`);
  * ```
  */
-export async function getDatabaseSizeForShard(shardBinding: string): Promise<number> {
-	const config = getConfig();
+export function getDatabaseSizeForShard(shardBinding: string): Promise<number> {
+	return getDatabaseSizeForShardIn(currentState(), shardBinding);
+}
+
+async function getDatabaseSizeForShardIn(s: RouterState, shardBinding: string): Promise<number> {
+	const config = getConfig(s);
 	const database = config.shards[shardBinding];
 
 	if (!database) {
@@ -2994,20 +4340,20 @@ function quoteIdentifier(identifier: string, dialect?: SQLDialect): string {
  *
  * @private
  */
-function dialectOf(binding: string | undefined): SQLDialect | undefined {
+function dialectOf(s: RouterState, binding: string | undefined): SQLDialect | undefined {
 	if (!binding) {
 		return undefined;
 	}
-	return globalConfig?.shards[binding]?.dialect;
+	return s.config?.shards[binding]?.dialect;
 }
 
 /**
  * Dialect of the shard a key routes to.
  * @private
  */
-async function dialectForKey(key: string, operationType: OperationType = 'write'): Promise<SQLDialect | undefined> {
-	const candidates = await resolveCandidates(key, operationType);
-	return dialectOf(candidates[0]);
+async function dialectForKey(s: RouterState, key: string, operationType: OperationType = 'write'): Promise<SQLDialect | undefined> {
+	const candidates = await resolveCandidates(s, key, operationType);
+	return dialectOf(s, candidates[0]);
 }
 
 function normalizeIndexNameSegment(value: string): string {
@@ -3117,14 +4463,24 @@ function buildCreateIndexSQL(
  * @returns Query result for the DDL statement
  * @since 1.1.4
  */
-export async function index<T = Record<string, unknown>>(
+export function index<T = Record<string, unknown>>(
 	key: string,
 	table: string,
 	columns: string | string[] | IndexColumnDefinition[],
 	options: Omit<CreateIndexOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	const sql = buildCreateIndexSQL(table, columns, options, await dialectForKey(key));
-	return run<T>(key, sql);
+	return indexIn<T>(currentState(), key, table, columns, options);
+}
+
+async function indexIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: Omit<CreateIndexOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	const sql = buildCreateIndexSQL(table, columns, options, await dialectForKey(s, key));
+	return runIn<T>(s, key, sql);
 }
 
 /**
@@ -3137,14 +4493,24 @@ export async function index<T = Record<string, unknown>>(
  * @returns Query result for the DDL statement
  * @since 1.1.4
  */
-export async function indexShard<T = Record<string, unknown>>(
+export function indexShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	table: string,
 	columns: string | string[] | IndexColumnDefinition[],
 	options: Omit<CreateIndexOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	const sql = buildCreateIndexSQL(table, columns, options, dialectOf(shardBinding));
-	return runShard<T>(shardBinding, sql);
+	return indexShardIn<T>(currentState(), shardBinding, table, columns, options);
+}
+
+async function indexShardIn<T = Record<string, unknown>>(
+	s: RouterState,
+	shardBinding: string,
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: Omit<CreateIndexOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	const sql = buildCreateIndexSQL(table, columns, options, dialectOf(s, shardBinding));
+	return runShardIn<T>(s, shardBinding, sql);
 }
 
 /**
@@ -3156,18 +4522,27 @@ export async function indexShard<T = Record<string, unknown>>(
  * @returns Per-shard query results
  * @since 1.1.4
  */
-export async function indexAllShards<T = Record<string, unknown>>(
+export function indexAllShards<T = Record<string, unknown>>(
 	table: string,
 	columns: string | string[] | IndexColumnDefinition[],
 	options: CreateIndexOptions = {}
 ): Promise<QueryResult<T>[]> {
-	const config = getConfig();
+	return indexAllShardsIn<T>(currentState(), table, columns, options);
+}
+
+async function indexAllShardsIn<T = Record<string, unknown>>(
+	s: RouterState,
+	table: string,
+	columns: string | string[] | IndexColumnDefinition[],
+	options: CreateIndexOptions = {}
+): Promise<QueryResult<T>[]> {
+	const config = getConfig(s);
 	const batchSize = normalizeBatchSize(options.batchSize);
 	const tasks = Object.entries(config.shards)
 		.filter(([binding, db]) => binding && db)
 		.map(([binding, db]) => async () => {
 			const sql = buildCreateIndexSQL(table, columns, options, db.dialect);
-			return await runShard<T>(binding, sql);
+			return await runShardIn<T>(s, binding, sql);
 		});
 
 	const out: QueryResult<T>[] = [];
@@ -3210,13 +4585,23 @@ function buildExplainSQL(sql: string, mode: ExplainOptions['mode'] = 'query-plan
  * @returns Explain rows as a QueryResult
  * @since 1.1.4
  */
-export async function explain<T = Record<string, unknown>>(
+export function explain<T = Record<string, unknown>>(
 	key: string,
 	sql: string,
 	bindings: any[] = [],
 	options: Omit<ExplainOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	return all<T>(key, buildExplainSQL(sql, options.mode), bindings);
+	return explainIn<T>(currentState(), key, sql, bindings, options);
+}
+
+async function explainIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<ExplainOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	return allIn<T>(s, key, buildExplainSQL(sql, options.mode), bindings);
 }
 
 /**
@@ -3229,13 +4614,23 @@ export async function explain<T = Record<string, unknown>>(
  * @returns Explain rows as a QueryResult
  * @since 1.1.4
  */
-export async function explainShard<T = Record<string, unknown>>(
+export function explainShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
 	options: Omit<ExplainOptions, 'batchSize'> = {}
 ): Promise<QueryResult<T>> {
-	return allShard<T>(shardBinding, buildExplainSQL(sql, options.mode), bindings);
+	return explainShardIn<T>(currentState(), shardBinding, sql, bindings, options);
+}
+
+async function explainShardIn<T = Record<string, unknown>>(
+	s: RouterState,
+	shardBinding: string,
+	sql: string,
+	bindings: any[] = [],
+	options: Omit<ExplainOptions, 'batchSize'> = {}
+): Promise<QueryResult<T>> {
+	return allShardIn<T>(s, shardBinding, buildExplainSQL(sql, options.mode), bindings);
 }
 
 /**
@@ -3247,12 +4642,21 @@ export async function explainShard<T = Record<string, unknown>>(
  * @returns Per-shard explain query results
  * @since 1.1.4
  */
-export async function explainAllShards<T = Record<string, unknown>>(
+export function explainAllShards<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
 	options: ExplainOptions = {}
 ): Promise<QueryResult<T>[]> {
-	return allAllShards<T>(buildExplainSQL(sql, options.mode), bindings, normalizeBatchSize(options.batchSize));
+	return explainAllShardsIn<T>(currentState(), sql, bindings, options);
+}
+
+async function explainAllShardsIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	options: ExplainOptions = {}
+): Promise<QueryResult<T>[]> {
+	return allAllShardsIn<T>(s, buildExplainSQL(sql, options.mode), bindings, normalizeBatchSize(options.batchSize));
 }
 
 /**
@@ -3271,12 +4675,17 @@ export interface ShardTableCount {
  *
  * @param key - Primary key used for shard routing
  * @param table - Table name to count
+ * @param options - Read guarantee for this call
  * @returns Row count for that routed shard
  * @since 1.1.4
  */
-export async function count(key: string, table: string): Promise<number> {
-	const quotedTable = quoteIdentifier(table, await dialectForKey(key, 'read'));
-	const row = await first<{ row_count?: number | string }>(key, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
+export function count(key: string, table: string, options?: ReadOptions): Promise<number> {
+	return countIn(currentState(), key, table, options);
+}
+
+async function countIn(s: RouterState, key: string, table: string, options?: ReadOptions): Promise<number> {
+	const quotedTable = quoteIdentifier(table, await dialectForKey(s, key, 'read'));
+	const row = await firstIn<{ row_count?: number | string }>(s, key, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`, [], options);
 	if (!row || row.row_count === undefined || row.row_count === null) {
 		return 0;
 	}
@@ -3289,12 +4698,23 @@ export async function count(key: string, table: string): Promise<number> {
  *
  * @param shardBinding - Shard binding name
  * @param table - Table name to count
+ * @param options - Read guarantee for this call
  * @returns Row count for the shard
  * @since 1.1.4
  */
-export async function countShard(shardBinding: string, table: string): Promise<number> {
-	const quotedTable = quoteIdentifier(table, dialectOf(shardBinding));
-	const row = await firstShard<{ row_count?: number | string }>(shardBinding, `SELECT COUNT(*) AS row_count FROM ${quotedTable}`);
+export function countShard(shardBinding: string, table: string, options?: ReadOptions): Promise<number> {
+	return countShardIn(currentState(), shardBinding, table, options);
+}
+
+async function countShardIn(s: RouterState, shardBinding: string, table: string, options?: ReadOptions): Promise<number> {
+	const quotedTable = quoteIdentifier(table, dialectOf(s, shardBinding));
+	const row = await firstShardIn<{ row_count?: number | string }>(
+		s,
+		shardBinding,
+		`SELECT COUNT(*) AS row_count FROM ${quotedTable}`,
+		[],
+		options
+	);
 	if (!row || row.row_count === undefined || row.row_count === null) {
 		return 0;
 	}
@@ -3307,14 +4727,29 @@ export async function countShard(shardBinding: string, table: string): Promise<n
  *
  * @param table - Table name to count
  * @param batchSize - Number of concurrent shard queries (default: 50)
+ * @param options - Read guarantee for this call; per-database bookmarks come back as `bookmarks`
  * @returns Per-shard counts and global total
  * @since 1.1.4
  */
-export async function countAllShards(table: string, batchSize: number = 50): Promise<{ total: number; shards: ShardTableCount[] }> {
-	const config = getConfig();
+export function countAllShards(
+	table: string,
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<{ total: number; shards: ShardTableCount[]; bookmarks?: Record<string, string> }> {
+	return countAllShardsIn(currentState(), table, batchSize, options);
+}
+
+async function countAllShardsIn(
+	s: RouterState,
+	table: string,
+	batchSize: number = 50,
+	options?: ReadOptions
+): Promise<{ total: number; shards: ShardTableCount[]; bookmarks?: Record<string, string> }> {
+	const config = getConfig(s);
 	const normalizedBatchSize = normalizeBatchSize(batchSize);
 	const tasks: Array<() => Promise<ShardTableCount>> = [];
 	const quoter = tableQuoter(config, table);
+	const sessions = sessionsFor(s, options);
 
 	for (const [binding, db] of Object.entries(config.shards)) {
 		if (!binding || !db) {
@@ -3322,10 +4757,12 @@ export async function countAllShards(table: string, batchSize: number = 50): Pro
 		}
 
 		const probeSql = `SELECT COUNT(*) AS row_count FROM ${quoter(db)}`;
+		// opened outside the try below: a refused consistency must throw, not become a failed shard
+		const target = sessions.on(db);
 
 		tasks.push(async () => {
 			try {
-				const row = await db.prepare(probeSql).first<{ row_count?: number | string }>();
+				const row = await target.prepare(probeSql).first<{ row_count?: number | string }>();
 				const parsed = Number(row?.row_count ?? 0);
 				return {
 					shard: binding,
@@ -3350,7 +4787,8 @@ export async function countAllShards(table: string, batchSize: number = 50): Pro
 	}
 
 	const total = shards.reduce((sum, shard) => sum + (shard.count ?? 0), 0);
-	return { total, shards };
+	const bookmarks = sessions.bookmarks();
+	return bookmarks ? { total, shards, bookmarks } : { total, shards };
 }
 
 /**
@@ -3371,9 +4809,13 @@ export interface ShardSizeResult {
  * @returns Database size in bytes
  * @since 1.1.4
  */
-export async function getDatabaseSizeForKey(key: string): Promise<number> {
-	const config = getConfig();
-	const shardBinding = await getShardForKey(key, 'read');
+export function getDatabaseSizeForKey(key: string): Promise<number> {
+	return getDatabaseSizeForKeyIn(currentState(), key);
+}
+
+async function getDatabaseSizeForKeyIn(s: RouterState, key: string): Promise<number> {
+	const config = getConfig(s);
+	const shardBinding = await getShardForKey(s, key, 'read');
 	const database = config.shards[shardBinding];
 
 	if (!database) {
@@ -3390,8 +4832,12 @@ export async function getDatabaseSizeForKey(key: string): Promise<number> {
  * @returns Per-shard size results with success/error status
  * @since 1.1.4
  */
-export async function getDatabaseSizesAllShards(batchSize: number = 50): Promise<ShardSizeResult[]> {
-	const config = getConfig();
+export function getDatabaseSizesAllShards(batchSize: number = 50): Promise<ShardSizeResult[]> {
+	return getDatabaseSizesAllShardsIn(currentState(), batchSize);
+}
+
+async function getDatabaseSizesAllShardsIn(s: RouterState, batchSize: number = 50): Promise<ShardSizeResult[]> {
+	const config = getConfig(s);
 	const normalizedBatchSize = normalizeBatchSize(batchSize);
 	const tasks: Array<() => Promise<ShardSizeResult>> = [];
 
@@ -3436,8 +4882,12 @@ export async function getDatabaseSizesAllShards(batchSize: number = 50): Promise
  * @returns Total size in bytes across successfully measured shards
  * @since 1.1.4
  */
-export async function getTotalDatabaseSize(batchSize: number = 50): Promise<number> {
-	const sizes = await getDatabaseSizesAllShards(batchSize);
+export function getTotalDatabaseSize(batchSize: number = 50): Promise<number> {
+	return getTotalDatabaseSizeIn(currentState(), batchSize);
+}
+
+async function getTotalDatabaseSizeIn(s: RouterState, batchSize: number = 50): Promise<number> {
+	const sizes = await getDatabaseSizesAllShardsIn(s, batchSize);
 	return sizes.reduce((sum, result) => sum + (result.size ?? 0), 0);
 }
 
@@ -3454,6 +4904,7 @@ export async function getTotalDatabaseSize(batchSize: number = 50): Promise<numb
  * @param key - Primary key used for routing the fast-path read
  * @param sql - SQL statement to execute
  * @param bindings - Parameter values to bind to the SQL statement
+ * @param options - Read guarantee for this call. The routed read and the fallback share one session per shard
  * @returns The first matching row, or `null` when neither path finds one
  * @since 1.2.4
  * @example
@@ -3461,13 +4912,29 @@ export async function getTotalDatabaseSize(batchSize: number = 50): Promise<numb
  * const user = await firstResilient<User>('user-123', 'SELECT * FROM users WHERE id = ?', ['user-123']);
  * ```
  */
-export async function firstResilient<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<T | null> {
-	const routed = await first<T>(key, sql, bindings);
+export function firstResilient<T = Record<string, unknown>>(
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	return firstResilientIn<T>(currentState(), key, sql, bindings, options);
+}
+
+async function firstResilientIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	const shared = sharing(s, options);
+	const routed = await firstIn<T>(s, key, sql, bindings, shared);
 	if (routed) {
 		return routed;
 	}
 
-	return (await firstAllShardsGlobal<T>(sql, bindings)) ?? null;
+	return (await firstAllShardsGlobalIn<T>(s, sql, bindings, shared)) ?? null;
 }
 
 /**
@@ -3496,7 +4963,7 @@ export async function firstResilient<T = Record<string, unknown>>(key: string, s
  * @param bindings - Positional bindings for the statement
  * @returns The result, merged across shards when the statement routes to several
  * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * await query('INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
@@ -3504,22 +4971,29 @@ export async function firstResilient<T = Record<string, unknown>>(key: string, s
  * await query('DELETE FROM users WHERE id IN (?, ?)', ['user-1', 'user-2']);
  * ```
  */
-export async function query<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
-	const config = getConfig();
+export function query<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	return queryIn<T>(currentState(), sql, bindings);
+}
+
+async function queryIn<T = Record<string, unknown>>(s: RouterState, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+	const config = getConfig(s);
 	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
 
 	if (!plan) {
 		if ((config.onUnroutable ?? 'throw') === 'throw') {
 			throw unroutableError(sql);
 		}
-		return mergeAllShardQueryResults(await allAllShards<T>(sql, bindings));
+		return mergeAllShardQueryResults(await allAllShardsIn<T>(s, sql, bindings));
 	}
 
 	if (plan.keys.length === 1) {
-		return plan.readOnly ? await all<T>(plan.keys[0]!, sql, bindings) : await run<T>(plan.keys[0]!, sql, bindings);
+		return plan.readOnly ? await allIn<T>(s, plan.keys[0]!, sql, bindings) : await runIn<T>(s, plan.keys[0]!, sql, bindings);
 	}
 
-	const grouped = await batch<T>(plan.keys.map((key) => ({ key, sql, bindings })));
+	const grouped = await batchIn<T>(
+		s,
+		plan.keys.map((key) => ({ key, sql, bindings }))
+	);
 	return mergeAllShardQueryResults(grouped.flatMap((group) => group.results));
 }
 
@@ -3529,32 +5003,43 @@ export async function query<T = Record<string, unknown>>(sql: string, bindings: 
  * @template T - Type of the result record
  * @param sql - Statement text using `?` placeholders
  * @param bindings - Positional bindings for the statement
+ * @param options - Read guarantee for this call
  * @returns The first matching row, or `null`
  * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const user = await queryFirst<User>('SELECT * FROM users WHERE id = ?', ['user-1']);
  * ```
  */
-export async function queryFirst<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<T | null> {
-	const config = getConfig();
+export function queryFirst<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options?: ReadOptions): Promise<T | null> {
+	return queryFirstIn<T>(currentState(), sql, bindings, options);
+}
+
+async function queryFirstIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<T | null> {
+	const config = getConfig(s);
 	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
 
 	if (!plan) {
 		if ((config.onUnroutable ?? 'throw') === 'throw') {
 			throw unroutableError(sql);
 		}
-		const rows = await firstAllShards<T>(sql, bindings);
+		const rows = await firstAllShardsIn<T>(s, sql, bindings, 50, options);
 		return rows.find((row): row is T => row !== null) ?? null;
 	}
 
 	if (plan.keys.length === 1) {
-		return await first<T>(plan.keys[0]!, sql, bindings);
+		return await firstIn<T>(s, plan.keys[0]!, sql, bindings, options);
 	}
 
+	const shared = sharing(s, options);
 	for (const key of plan.keys) {
-		const row = await first<T>(key, sql, bindings);
+		const row = await firstIn<T>(s, key, sql, bindings, shared);
 		if (row !== null) {
 			return row;
 		}
@@ -3569,36 +5054,47 @@ export async function queryFirst<T = Record<string, unknown>>(sql: string, bindi
  * @template T - Type of the result records
  * @param sql - Statement text using `?` placeholders
  * @param bindings - Positional bindings for the statement
+ * @param options - Read guarantee for this call. A statement spanning shards gets one session per shard and `meta.bookmarks`
  * @returns Rows from every shard the statement routes to
  * @throws {CollegeDBError} If the routing key cannot be determined and `onUnroutable` is `throw`
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const { results } = await queryAll<User>('SELECT * FROM users WHERE id IN (?, ?)', ['user-1', 'user-2']);
  * ```
  */
-export async function queryAll<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
-	const config = getConfig();
+export function queryAll<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options?: ReadOptions): Promise<QueryResult<T>> {
+	return queryAllIn<T>(currentState(), sql, bindings, options);
+}
+
+async function queryAllIn<T = Record<string, unknown>>(
+	s: RouterState,
+	sql: string,
+	bindings: any[] = [],
+	options?: ReadOptions
+): Promise<QueryResult<T>> {
+	const config = getConfig(s);
 	const plan = planQuery(sql, bindings, { keyColumns: config.keyColumns });
+	const shared = sharing(s, options);
 
 	if (!plan) {
 		if ((config.onUnroutable ?? 'throw') === 'throw') {
 			throw unroutableError(sql);
 		}
-		return mergeAllShardQueryResults(await allAllShards<T>(sql, bindings));
+		return withBookmarks(mergeAllShardQueryResults(await allAllShardsIn<T>(s, sql, bindings, 50, shared)), sessionsFor(s, shared));
 	}
 
 	if (plan.keys.length === 1) {
-		return await all<T>(plan.keys[0]!, sql, bindings);
+		return await allIn<T>(s, plan.keys[0]!, sql, bindings, shared);
 	}
 
-	const perKey = await Promise.all(plan.keys.map((key) => all<T>(key, sql, bindings)));
-	return mergeAllShardQueryResults(perKey);
+	const perKey = await Promise.all(plan.keys.map((key) => allIn<T>(s, key, sql, bindings, shared)));
+	return withBookmarks(mergeAllShardQueryResults(perKey), sessionsFor(s, shared));
 }
 
 /**
  * One routed statement in a {@link batch}.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface BatchEntry {
 	/** Primary key used to choose the shard */
@@ -3614,7 +5110,7 @@ export interface BatchEntry {
  *
  * There is no combined success flag on purpose: a batch spanning three shards is
  * three independent transactions, so "did it work" is a per-shard question.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface BatchShardResult<T = Record<string, unknown>> {
 	/** Shard the statements ran against */
@@ -3650,7 +5146,7 @@ export interface BatchShardResult<T = Record<string, unknown>> {
  * @param entries - Routed statements to execute
  * @returns One entry per shard that ran statements
  * @throws {CollegeDBError} If CollegeDB is not initialized
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const results = await batch([
@@ -3676,15 +5172,40 @@ export interface BatchShardResult<T = Record<string, unknown>> {
  *
  * @private
  */
-async function resolveBatchShards(config: CollegeDBConfig, entries: BatchEntry[]): Promise<string[]> {
-	const decision = placementDecision ?? (await resolvePlacement(config));
+async function resolveBatchShards(s: RouterState, config: CollegeDBConfig, entries: BatchEntry[]): Promise<string[]> {
+	// a held decision serves reads and writes alike, so the statements are classified only when a refresh may be due
+	const decision =
+		heldDecision(s, true) ??
+		(await resolvePlacement(
+			s,
+			config,
+			entries.some((entry) => getOperationType(entry.sql) === 'write')
+		));
 
-	// Computed placement reads no mappings at all, and the epoch walk is per key.
+	// Computed placement reads no mappings at all, and a write finds the shard that holds its row.
 	if (decision.mode === 'computed' && decision.manifest) {
-		return await Promise.all(entries.map((entry) => getShardForKey(entry.key, getOperationType(entry.sql))));
+		const located = new Map<string, string>();
+		const shards: string[] = [];
+
+		for (const entry of entries) {
+			const operationType = getOperationType(entry.sql);
+			if (operationType !== 'write') {
+				shards.push(await getShardForKey(s, entry.key, operationType));
+				continue;
+			}
+
+			const table = statementTable(entry.sql);
+			const id = `${entry.key}\u0000${table}`;
+			if (!located.has(id)) {
+				located.set(id, await resolveWriteShard(s, config, entry.key, table));
+			}
+			shards.push(located.get(id)!);
+		}
+
+		return shards;
 	}
 
-	const mapper = getMapper(config);
+	const mapper = getMapper(s, config);
 	const known = await mapper.getShardMappings(entries.map((entry) => entry.key));
 
 	const shards: string[] = new Array(entries.length);
@@ -3709,7 +5230,7 @@ async function resolveBatchShards(config: CollegeDBConfig, entries: BatchEntry[]
 		}
 
 		const operationType = getOperationType(entry.sql);
-		const shard = await allocateShardForKey(config, entry.key, operationType);
+		const shard = await allocateShardForKey(s, config, entry.key, operationType);
 		shards[i] = shard;
 		allocated.set(entry.key, shard);
 
@@ -3725,15 +5246,19 @@ async function resolveBatchShards(config: CollegeDBConfig, entries: BatchEntry[]
 	return shards;
 }
 
-export async function batch<T = Record<string, unknown>>(entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
-	const config = getConfig();
+export function batch<T = Record<string, unknown>>(entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
+	return batchIn<T>(currentState(), entries);
+}
+
+async function batchIn<T = Record<string, unknown>>(s: RouterState, entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
+	const config = getConfig(s);
 
 	if (entries.length === 0) {
 		return [];
 	}
 
 	const groups = new Map<string, number[]>();
-	const shards = await resolveBatchShards(config, entries);
+	const shards = await resolveBatchShards(s, config, entries);
 
 	shards.forEach((shard, index) => {
 		const existing = groups.get(shard);
@@ -3802,6 +5327,13 @@ export interface PaginatedResult<T = Record<string, unknown>> {
 	limit: number;
 	/** Total number of pages for `total`/`limit` */
 	pages: number;
+	/**
+	 * Latest bookmark per database, keyed by database id, when the call used a
+	 * read session. These are separate sessions: two shards, or a later page, are
+	 * never one snapshot.
+	 * @since 1.4.0
+	 */
+	bookmarks?: Record<string, string>;
 }
 
 /**
@@ -3812,6 +5344,10 @@ export interface PaginatedResult<T = Record<string, unknown>> {
  * but discards the pre-slice count. `paginate` keeps that count so list
  * endpoints can return `{ results, total, page, limit, pages }` for a UI in one
  * call instead of issuing a second COUNT query.
+ *
+ * With `consistency` set, each shard runs its query in one session. The
+ * sessions are separate: the page is not a snapshot across shards, and two
+ * calls for two pages are not one snapshot either.
  *
  * @template T - Type of the result records
  * @param sql - SQL statement to execute on each shard
@@ -3828,7 +5364,16 @@ export interface PaginatedResult<T = Record<string, unknown>> {
  * );
  * ```
  */
-export async function paginate<T = Record<string, unknown>>(
+export function paginate<T = Record<string, unknown>>(
+	sql: string,
+	bindings: any[] = [],
+	options: PaginateOptions<T> = {}
+): Promise<PaginatedResult<T>> {
+	return paginateIn<T>(currentState(), sql, bindings, options);
+}
+
+async function paginateIn<T = Record<string, unknown>>(
+	s: RouterState,
 	sql: string,
 	bindings: any[] = [],
 	options: PaginateOptions<T> = {}
@@ -3837,7 +5382,7 @@ export async function paginate<T = Record<string, unknown>>(
 	const page = Math.max(1, Math.floor(options.page ?? 1));
 	const offset = (page - 1) * limit;
 
-	const merged = await allAllShardsGlobal<T>(sql, bindings, {
+	const merged = await allAllShardsGlobalIn<T>(s, sql, bindings, {
 		...options,
 		offset,
 		limit,
@@ -3852,13 +5397,14 @@ export async function paginate<T = Record<string, unknown>>(
 		total: Number.isFinite(total) ? total : merged.results.length,
 		page,
 		limit,
-		pages
+		pages,
+		...(merged.meta.bookmarks ? { bookmarks: merged.meta.bookmarks } : {})
 	};
 }
 
 /**
  * Outcome of a {@link rebalance} pass.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface RebalanceResult {
 	/** Keys examined */
@@ -3887,20 +5433,32 @@ export interface RebalanceResult {
  * @param options - Concurrency and a dry-run switch
  * @returns Counts of agreed, moved, and failed keys
  * @throws {CollegeDBError} If CollegeDB is not initialized
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * const result = await rebalance('users', { dryRun: true });
  * console.log(`${result.agreed}/${result.examined} keys already agree`);
  * ```
  */
-export async function rebalance(table: string, options: { concurrency?: number; dryRun?: boolean } = {}): Promise<RebalanceResult> {
-	const config = getConfig();
-	const mapper = getMapper(config);
+export function rebalance(table: string, options: { concurrency?: number; dryRun?: boolean } = {}): Promise<RebalanceResult> {
+	return rebalanceIn(currentState(), table, options);
+}
+
+async function rebalanceIn(
+	s: RouterState,
+	table: string,
+	options: { concurrency?: number; dryRun?: boolean } = {}
+): Promise<RebalanceResult> {
+	const config = getConfig(s);
+	const mapper = getMapper(s, config);
 	const shards = Object.keys(config.shards);
 
 	if (shards.length === 0) {
 		throw new CollegeDBError('No shards configured', 'NO_SHARDS');
+	}
+
+	if (!options.dryRun) {
+		requireJournal(config);
 	}
 
 	const counts = await mapper.getShardKeyCounts();
@@ -3918,7 +5476,8 @@ export async function rebalance(table: string, options: { concurrency?: number; 
 
 			try {
 				const mapping = await mapper.getShardMapping(key);
-				const target = hrwShard(key, shards);
+				// a draining shard is not a target (the size limit never applied here)
+				const target = hrwShard(key, await selectEligibleShards(s, config, 'allocate', key, false));
 
 				if (!mapping || mapping.shard === target) {
 					result.agreed++;
@@ -3926,7 +5485,7 @@ export async function rebalance(table: string, options: { concurrency?: number; 
 				}
 
 				if (!options.dryRun) {
-					await reassignShard(key, target, table);
+					await reassignShardIn(s, key, target, table);
 				}
 				result.moved++;
 			} catch (error) {
@@ -3955,8 +5514,9 @@ export interface NextIdOptions {
  * Computes the greatest numeric value of `column` across every shard for a table.
  * @private
  */
-async function maxColumnAcrossShards(table: string, column: string): Promise<number> {
+async function maxColumnAcrossShards(s: RouterState, table: string, column: string): Promise<number> {
 	const results = await allAllShardsBuilt<{ max_value: number | string | null }>(
+		s,
 		(dialect) => `SELECT MAX(${quoteIdentifier(column, dialect)}) AS max_value FROM ${quoteIdentifier(table, dialect)}`
 	);
 	const rows = results.map((result) => result.results[0] ?? null);
@@ -3998,8 +5558,12 @@ async function maxColumnAcrossShards(table: string, column: string): Promise<num
  * await insertInto(String(id), 'tickets', { id, title, created_at: nowSeconds });
  * ```
  */
-export async function nextId(table: string, options: NextIdOptions = {}): Promise<number> {
-	const config = getConfig();
+export function nextId(table: string, options: NextIdOptions = {}): Promise<number> {
+	return nextIdIn(currentState(), table, options);
+}
+
+async function nextIdIn(s: RouterState, table: string, options: NextIdOptions = {}): Promise<number> {
+	const config = getConfig(s);
 	const column = options.column ?? 'id';
 	const min = Math.floor(options.min ?? 0);
 
@@ -4007,15 +5571,15 @@ export async function nextId(table: string, options: NextIdOptions = {}): Promis
 		// Ask the sequence first. Once it is seeded it is already ahead of every
 		// row in every shard, so computing the cross-shard MAX to seed it again
 		// would spend one query per shard on every id.
-		const seeded = await requestSequence(config, table, min, false);
+		const seeded = await requestSequence(s, config, table, min, false);
 		if (seeded !== undefined) {
 			return seeded;
 		}
 
 		try {
-			const base = await maxColumnAcrossShards(table, column);
+			const base = await maxColumnAcrossShards(s, table, column);
 			const floor = Math.max(base + 1, min);
-			const value = await requestSequence(config, table, floor, true);
+			const value = await requestSequence(s, config, table, floor, true);
 			if (value !== undefined) {
 				return value;
 			}
@@ -4025,7 +5589,7 @@ export async function nextId(table: string, options: NextIdOptions = {}): Promis
 		}
 	}
 
-	const base = await maxColumnAcrossShards(table, column);
+	const base = await maxColumnAcrossShards(s, table, column);
 	return Math.max(base + 1, min);
 }
 
@@ -4041,14 +5605,20 @@ export async function nextId(table: string, options: NextIdOptions = {}): Promis
  * @private
  * @returns The allocated value, or `undefined` when the sequence needs seeding
  */
-async function requestSequence(config: CollegeDBConfig, table: string, min: number, seed: boolean): Promise<number | undefined> {
+async function requestSequence(
+	s: RouterState,
+	config: CollegeDBConfig,
+	table: string,
+	min: number,
+	seed: boolean
+): Promise<number | undefined> {
 	if (!config.coordinator) {
 		return undefined;
 	}
 
-	const started = phaseStart();
+	const started = phaseStart(s.sink);
 	try {
-		const coordinatorId = config.coordinator.idFromName('default');
+		const coordinatorId = config.coordinator.idFromName(config.coordinatorScope ?? 'default');
 		const coordinator = config.coordinator.get(coordinatorId);
 		const response = await coordinator.fetch('http://coordinator/sequence', {
 			method: 'POST',
@@ -4072,7 +5642,7 @@ async function requestSequence(config: CollegeDBConfig, table: string, min: numb
 		}
 		return undefined;
 	} finally {
-		phaseEnd('coordinator.fetch', started, 'sequence');
+		phaseEnd('coordinator.fetch', started, 'sequence', s.sink);
 	}
 }
 
@@ -4096,9 +5666,6 @@ export interface EnsureSchemaOptions {
 	/** Version value paired with `versionKey` (default: `'1'`) */
 	version?: string;
 }
-
-/** In-process record of schema fingerprints already applied (for `once`). */
-const ensuredSchemaFingerprints = new Set<string>();
 
 /**
  * Creates schema across every configured shard, idempotently.
@@ -4124,8 +5691,12 @@ const ensuredSchemaFingerprints = new Set<string>();
  * );
  * ```
  */
-export async function ensureSchema(schema: string | string[], options: EnsureSchemaOptions = {}): Promise<void> {
-	const config = getConfig();
+export function ensureSchema(schema: string | string[], options: EnsureSchemaOptions = {}): Promise<void> {
+	return ensureSchemaIn(currentState(), schema, options);
+}
+
+async function ensureSchemaIn(s: RouterState, schema: string | string[], options: EnsureSchemaOptions = {}): Promise<void> {
+	const config = getConfig(s);
 	const schemaSql = Array.isArray(schema) ? schema.join(';\n') : schema;
 
 	if (options.versionKey) {
@@ -4151,11 +5722,11 @@ export async function ensureSchema(schema: string | string[], options: EnsureSch
 
 	if (options.once) {
 		const fingerprint = `${Object.keys(config.shards).sort().join(',')}::${schemaSql}`;
-		if (ensuredSchemaFingerprints.has(fingerprint)) {
+		if (s.ensuredSchemaFingerprints.has(fingerprint)) {
 			return;
 		}
 		await createSchemaAcrossShards(config.shards, schemaSql);
-		ensuredSchemaFingerprints.add(fingerprint);
+		s.ensuredSchemaFingerprints.add(fingerprint);
 		return;
 	}
 
@@ -4217,6 +5788,10 @@ const DEFAULT_RESERVED_BINDINGS = ['KV', 'CACHE', 'EMAIL', 'ShardCoordinator', '
  * ```
  */
 export function initializeFromEnv(env: Record<string, unknown>, options: InitializeFromEnvOptions = {}): string[] {
+	return initializeFromEnvIn(currentState(), env, options);
+}
+
+function initializeFromEnvIn(s: RouterState, env: Record<string, unknown>, options: InitializeFromEnvOptions = {}): string[] {
 	const { kv: kvOption, sql, shardPrefixes, reserved, primary, primaryName, ...configRest } = options;
 
 	const prefixes = shardPrefixes ?? DEFAULT_SHARD_PREFIXES;
@@ -4274,7 +5849,7 @@ export function initializeFromEnv(env: Record<string, unknown>, options: Initial
 		config.coordinator = env.ShardCoordinator as CollegeDBConfig['coordinator'];
 	}
 
-	initialize(config);
+	initializeIn(s, config);
 	return Object.keys(shards);
 }
 
@@ -4313,14 +5888,25 @@ export interface IdColumnOptions extends CrudReturningOptions {
  * });
  * ```
  */
-export async function insertInto<T = Record<string, unknown>>(
+export function insertInto<T = Record<string, unknown>>(
 	key: string,
 	table: string,
 	values: ColumnValues,
 	options: BuildInsertOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildInsert(table, values, { ...options, dialect: await dialectForKey(key) });
-	return await run<T>(key, sql, bindings);
+	return insertIntoIn<T>(currentState(), key, table, values, options);
+}
+
+async function insertIntoIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	table: string,
+	values: ColumnValues,
+	options: BuildInsertOptions = {}
+): Promise<QueryResult<T>> {
+	return await builderWrite<T>(s, key, table, 'insert', (dialect, guard) =>
+		guard ? buildGuardedInsert(table, values, guard, { ...options, dialect }) : buildInsert(table, values, { ...options, dialect })
+	);
 }
 
 /**
@@ -4343,18 +5929,30 @@ export async function insertInto<T = Record<string, unknown>>(
  * const created = await insertReturning('user-123', 'users', { id: 'user-123', username: 'ada' });
  * ```
  */
-export async function insertReturning<T = Record<string, unknown>>(
+export function insertReturning<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	values: ColumnValues,
+	options: BuildInsertOptions & { idColumn?: string } = {}
+): Promise<T | null> {
+	return insertReturningIn<T>(currentState(), key, table, values, options);
+}
+
+async function insertReturningIn<T = Record<string, unknown>>(
+	s: RouterState,
 	key: string,
 	table: string,
 	values: ColumnValues,
 	options: BuildInsertOptions & { idColumn?: string } = {}
 ): Promise<T | null> {
 	const idColumn = options.idColumn ?? 'id';
-	await insertInto(key, table, values, options);
+	await insertIntoIn(s, key, table, values, options);
 
 	const idValue = values[idColumn] ?? key;
-	const dialect = await dialectForKey(key, 'read');
-	return await first<T>(key, `SELECT * FROM ${quoteIdentifier(table, dialect)} WHERE ${quoteIdentifier(idColumn, dialect)} = ?`, [idValue]);
+	const dialect = await dialectForKey(s, key, 'read');
+	return await firstIn<T>(s, key, `SELECT * FROM ${quoteIdentifier(table, dialect)} WHERE ${quoteIdentifier(idColumn, dialect)} = ?`, [
+		idValue
+	]);
 }
 
 /**
@@ -4373,15 +5971,25 @@ export async function insertReturning<T = Record<string, unknown>>(
  * await updateRow('user-123', 'users', { username: 'ada2' }, { id: 'user-123' });
  * ```
  */
-export async function updateRow<T = Record<string, unknown>>(
+export function updateRow<T = Record<string, unknown>>(
 	key: string,
 	table: string,
 	values: ColumnValues,
 	where: ColumnValues,
 	options: CrudReturningOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildUpdate(table, values, where, { ...options, dialect: await dialectForKey(key) });
-	return await run<T>(key, sql, bindings);
+	return updateRowIn<T>(currentState(), key, table, values, where, options);
+}
+
+async function updateRowIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	table: string,
+	values: ColumnValues,
+	where: ColumnValues,
+	options: CrudReturningOptions = {}
+): Promise<QueryResult<T>> {
+	return await builderWrite<T>(s, key, table, 'mutate', (dialect) => buildUpdate(table, values, where, { ...options, dialect }));
 }
 
 /**
@@ -4401,7 +6009,18 @@ export async function updateRow<T = Record<string, unknown>>(
  * await patch('42', 'tickets', 42, { status: 'closed', priority: 'high' });
  * ```
  */
-export async function patch<T = Record<string, unknown>>(
+export function patch<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	id: string | number,
+	values: ColumnValues,
+	options: IdColumnOptions = {}
+): Promise<QueryResult<T>> {
+	return patchIn<T>(currentState(), key, table, id, values, options);
+}
+
+async function patchIn<T = Record<string, unknown>>(
+	s: RouterState,
 	key: string,
 	table: string,
 	id: string | number,
@@ -4409,7 +6028,7 @@ export async function patch<T = Record<string, unknown>>(
 	options: IdColumnOptions = {}
 ): Promise<QueryResult<T>> {
 	const idColumn = options.idColumn ?? 'id';
-	return await updateRow<T>(key, table, values, { [idColumn]: id }, { returning: options.returning });
+	return await updateRowIn<T>(s, key, table, values, { [idColumn]: id }, { returning: options.returning });
 }
 
 /**
@@ -4426,9 +6045,17 @@ export async function patch<T = Record<string, unknown>>(
  * await deleteRow('user-123', 'sessions', { user_id: 'user-123' });
  * ```
  */
-export async function deleteRow<T = Record<string, unknown>>(key: string, table: string, where: ColumnValues): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildDelete(table, where, { dialect: await dialectForKey(key) });
-	return await run<T>(key, sql, bindings);
+export function deleteRow<T = Record<string, unknown>>(key: string, table: string, where: ColumnValues): Promise<QueryResult<T>> {
+	return deleteRowIn<T>(currentState(), key, table, where);
+}
+
+async function deleteRowIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	table: string,
+	where: ColumnValues
+): Promise<QueryResult<T>> {
+	return await builderWrite<T>(s, key, table, 'mutate', (dialect) => buildDelete(table, where, { dialect }));
 }
 
 /**
@@ -4447,14 +6074,24 @@ export async function deleteRow<T = Record<string, unknown>>(key: string, table:
  * await deleteById('user-123', 'users', 'user-123');
  * ```
  */
-export async function deleteById<T = Record<string, unknown>>(
+export function deleteById<T = Record<string, unknown>>(
+	key: string,
+	table: string,
+	id: string | number,
+	options: { idColumn?: string } = {}
+): Promise<QueryResult<T>> {
+	return deleteByIdIn<T>(currentState(), key, table, id, options);
+}
+
+async function deleteByIdIn<T = Record<string, unknown>>(
+	s: RouterState,
 	key: string,
 	table: string,
 	id: string | number,
 	options: { idColumn?: string } = {}
 ): Promise<QueryResult<T>> {
 	const idColumn = options.idColumn ?? 'id';
-	return await deleteRow<T>(key, table, { [idColumn]: id });
+	return await deleteRowIn<T>(s, key, table, { [idColumn]: id });
 }
 
 /**
@@ -4474,15 +6111,150 @@ export async function deleteById<T = Record<string, unknown>>(
  * await upsert('settings:theme', 'settings', { key: 'theme', value: 'dark' }, 'key');
  * ```
  */
-export async function upsert<T = Record<string, unknown>>(
+export function upsert<T = Record<string, unknown>>(
 	key: string,
 	table: string,
 	values: ColumnValues,
 	conflictColumns: string | string[],
 	options: BuildUpsertOptions = {}
 ): Promise<QueryResult<T>> {
-	const { sql, bindings } = buildUpsert(table, values, conflictColumns, { ...options, dialect: await dialectForKey(key) });
-	return await run<T>(key, sql, bindings);
+	return upsertIn<T>(currentState(), key, table, values, conflictColumns, options);
+}
+
+async function upsertIn<T = Record<string, unknown>>(
+	s: RouterState,
+	key: string,
+	table: string,
+	values: ColumnValues,
+	conflictColumns: string | string[],
+	options: BuildUpsertOptions = {}
+): Promise<QueryResult<T>> {
+	return await builderWrite<T>(s, key, table, 'upsert', (dialect, guard) =>
+		guard
+			? buildGuardedUpsert(table, values, conflictColumns, guard, { ...options, dialect })
+			: buildUpsert(table, values, conflictColumns, { ...options, dialect })
+	);
+}
+
+/**
+ * Generation of a writer that routes through KV mappings. Mapped keys do not
+ * depend on an epoch, so the topology fence never turns such a writer away.
+ * @private
+ */
+const MAPPED_WRITER_GENERATION = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Runs a builder-issued write on the shard that owns the key.
+ *
+ * Without `journalShard` this is the plain routed statement. With it, inserts
+ * and upserts carry the tombstone guard and the writer's topology generation, and
+ * a write that changes no row is explained before it is allowed to count as done.
+ * A tombstone means the route was stale, so the key is resolved again once and the
+ * write retried on a different shard, or refused with `MIGRATION_CUTOVER_PENDING`.
+ * A raised fence means the writer's manifest is older than a pruning client's, so
+ * the manifest is reloaded and the write retried once, then refused with
+ * `STALE_TOPOLOGY`. Anything else is a genuine conflict and is returned.
+ * Shards on a dialect the journal is not proven on keep the plain statement.
+ *
+ * @private
+ */
+async function builderWrite<T>(
+	s: RouterState,
+	key: string,
+	table: string,
+	kind: 'insert' | 'upsert' | 'mutate',
+	build: (dialect: SQLDialect | undefined, guard: TombstoneGuard | null) => BuiltQuery
+): Promise<QueryResult<T>> {
+	const config = getConfig(s);
+	const journal = explicitJournal(config);
+
+	if (!journal) {
+		const { sql, bindings } = build(await dialectForKey(s, key), null);
+		return await runIn<T>(s, key, sql, bindings);
+	}
+
+	let rerouted = false;
+	let reloaded = false;
+
+	for (;;) {
+		const target = await resolveWriteTarget(s, config, key, table);
+
+		if (!isProvenJournalDialect(target.db.dialect)) {
+			const { sql, bindings } = build(target.db.dialect, null);
+			return await runIn<T>(s, key, sql, bindings);
+		}
+
+		await ensureShardTables(target.db);
+		const identity = { scope: journal.scope, table, key, generation: target.generation };
+		const guard = kind === 'mutate' ? null : identity;
+		const result = await runGuardedWrite<T>(target.db, identity, build(target.db.dialect, guard));
+
+		if (!result.success) {
+			throw new CollegeDBError(`Query failed: ${result.error || 'Unknown error'}`, 'QUERY_FAILED');
+		}
+
+		const changes = result.meta.changes;
+		if (typeof changes === 'number' && changes > 0) {
+			return result;
+		}
+
+		// zero rows, or a driver that does not say: only a tombstone explains it
+		if (!(await findTombstone(target.db, journal.scope, key, table))) {
+			if (guard && (await readFence(target.db)) > target.generation) {
+				if (!reloaded) {
+					reloaded = true;
+					await reloadPlacement(s, config);
+					continue;
+				}
+
+				throw new CollegeDBError(
+					`Key ${key} in ${table}: ${target.binding} only accepts writers on a newer topology than generation ${target.generation}, even after reloading the manifest. The write was not applied; retry it.`,
+					'STALE_TOPOLOGY'
+				);
+			}
+
+			return result;
+		}
+
+		if (!rerouted) {
+			rerouted = true;
+			await getMapper(s, config).invalidateCachedMapping(key);
+			if ((await resolveWriteTarget(s, config, key, table)).binding !== target.binding) {
+				continue;
+			}
+		}
+
+		throw new CollegeDBError(
+			`Key ${key} in ${table} moved off ${target.binding} and its new owner is not published yet. The write was not applied; retry it, or run recoverMigrations() if it keeps failing.`,
+			'MIGRATION_CUTOVER_PENDING'
+		);
+	}
+}
+
+/**
+ * Resolves the shard a write for `key` goes to, with its binding name.
+ * @private
+ */
+async function resolveWriteTarget(
+	s: RouterState,
+	config: CollegeDBConfig,
+	key: string,
+	table: string
+): Promise<{ binding: string; db: SQLDatabase; generation: number }> {
+	const decision = await resolvePlacement(s, config, true);
+	const binding =
+		decision.mode === 'computed' && decision.manifest
+			? await resolveWriteShard(s, config, key, table)
+			: await getShardForKey(s, key, 'write');
+	const db = config.shards[binding];
+
+	if (!db) {
+		throw new CollegeDBError(`Shard ${binding} not found in configuration`, 'SHARD_NOT_FOUND');
+	}
+
+	// read after the candidates, which may have adopted a newer manifest
+	const manifest = s.placementDecision?.manifest;
+	return { binding, db, generation: manifest ? manifest.epochs[0]!.n : MAPPED_WRITER_GENERATION };
 }
 
 const DEFAULT_LOOKUP_NAMESPACE = 'collegedb:lookup:';
@@ -4501,8 +6273,8 @@ export interface LookupOptions {
  * Resolves the KV store to use, preferring an explicit override.
  * @private
  */
-function resolveKV(explicit?: KVStorage): KVStorage {
-	const kv = explicit ?? getActiveConfig()?.kv;
+function resolveKV(s: RouterState, explicit?: KVStorage): KVStorage {
+	const kv = explicit ?? getActiveConfigIn(s)?.kv;
 	if (!kv) {
 		throw new CollegeDBError('CollegeDB not initialized. Call initialize() first or pass options.kv.', 'NOT_INITIALIZED');
 	}
@@ -4530,8 +6302,12 @@ function lookupKey(key: string, namespace?: string): string {
  * await setLookup(emailHash, String(customerId));
  * ```
  */
-export async function setLookup(key: string, value: string, options: LookupOptions = {}): Promise<void> {
-	const kv = resolveKV(options.kv);
+export function setLookup(key: string, value: string, options: LookupOptions = {}): Promise<void> {
+	return setLookupIn(currentState(), key, value, options);
+}
+
+async function setLookupIn(s: RouterState, key: string, value: string, options: LookupOptions = {}): Promise<void> {
+	const kv = resolveKV(s, options.kv);
 	await kv.put(lookupKey(key, options.namespace), value);
 }
 
@@ -4548,8 +6324,12 @@ export async function setLookup(key: string, value: string, options: LookupOptio
  * const customerId = await getLookup(emailHash);
  * ```
  */
-export async function getLookup(key: string, options: LookupOptions = {}): Promise<string | null> {
-	const kv = resolveKV(options.kv);
+export function getLookup(key: string, options: LookupOptions = {}): Promise<string | null> {
+	return getLookupIn(currentState(), key, options);
+}
+
+async function getLookupIn(s: RouterState, key: string, options: LookupOptions = {}): Promise<string | null> {
+	const kv = resolveKV(s, options.kv);
 	return await kv.get(lookupKey(key, options.namespace), 'text');
 }
 
@@ -4565,7 +6345,514 @@ export async function getLookup(key: string, options: LookupOptions = {}): Promi
  * await deleteLookup(oldEmailHash);
  * ```
  */
-export async function deleteLookup(key: string, options: LookupOptions = {}): Promise<void> {
-	const kv = resolveKV(options.kv);
+export function deleteLookup(key: string, options: LookupOptions = {}): Promise<void> {
+	return deleteLookupIn(currentState(), key, options);
+}
+
+async function deleteLookupIn(s: RouterState, key: string, options: LookupOptions = {}): Promise<void> {
+	const kv = resolveKV(s, options.kv);
 	await kv.delete(lookupKey(key, options.namespace));
 }
+
+/**
+ * Creates a client: the router API bound to a configuration of its own.
+ *
+ * A client behaves as if it ran in a separate process. It shares no mapper,
+ * mapping cache, placement manifest or epoch, shard size cache, schema record,
+ * migration cache or phase observer with the module-level API, a scoped
+ * `collegedb(config, callback)` or any other client, even when they are
+ * given the same providers. Every method works the same as the function of the
+ * same name, and `cached`, `invalidate` and `reconcileAllocations` use the
+ * client's KV store, placement cache and coordinator.
+ *
+ * Nothing about a client needs `AsyncLocalStorage`: state travels with the
+ * object, so it is the isolation-safe choice on runtimes without an async context,
+ * and the one to use when several configurations serve requests in one isolate.
+ * The sync part of the configuration is applied before it returns, like
+ * {@link initialize}. Call `initializeAsync` on the client to wait for the
+ * background checks.
+ *
+ * @param config - Configuration the client routes with
+ * @returns The client
+ * @throws {CollegeDBError} `INVALID_JOURNAL_SHARD` when `journalShard` is not a configured shard
+ * @since 1.4.0
+ * @example
+ * ```typescript
+ * const tenantA = createClient({ kv: env.KV_A, shards: { 'db-a1': env.DB_A1, 'db-a2': env.DB_A2 } });
+ * const tenantB = createClient({ kv: env.KV_B, shards: { 'db-b1': env.DB_B1 } });
+ *
+ * await Promise.all([tenantA.run('user-1', 'INSERT INTO users (id) VALUES (?)', ['user-1']), tenantB.first('user-9', 'SELECT * FROM users WHERE id = ?', ['user-9'])]);
+ * ```
+ */
+export function createClient(config: CollegeDBConfig) {
+	const s = createRouterState();
+	initializeIn(s, config);
+
+	return {
+		/** Same as {@link initialize}, on this client. */
+		initialize(config: CollegeDBConfig) {
+			return initializeIn(s, config);
+		},
+
+		/** Same as `resetConfig`, on this client. */
+		resetConfig(): void {
+			resetConfigIn(s);
+		},
+
+		/** Same as {@link isInitialized}, on this client. */
+		isInitialized(): boolean {
+			return isInitializedIn(s);
+		},
+
+		/** Same as {@link getActiveConfig}, on this client. */
+		getActiveConfig(): CollegeDBConfig | null {
+			return getActiveConfigIn(s);
+		},
+
+		/** Same as {@link publishEligibility}, on this client. */
+		publishEligibility(): Promise<{ eligible: string[]; published: boolean; epoch: number }> {
+			return publishEligibilityIn(s);
+		},
+
+		/** Same as {@link pruneEpochs}, on this client. */
+		pruneEpochs(options: PruneOptions): Promise<PruneReport> {
+			return pruneEpochsIn(s, options);
+		},
+
+		/** Same as {@link flush}, on this client. */
+		flush(): Promise<void> {
+			return flushIn(s);
+		},
+
+		/** Same as {@link ensureSchema}, on this client. */
+		ensureSchema(schema: string | string[], options: EnsureSchemaOptions = {}): Promise<void> {
+			return ensureSchemaIn(s, schema, options);
+		},
+
+		/** Same as {@link initializeAsync}, on this client. */
+		initializeAsync(config: CollegeDBConfig) {
+			return initializeAsyncIn(s, config);
+		},
+
+		/** Same as {@link prepare}, on this client. */
+		prepare(key: string, sql: string): Promise<PreparedStatement> {
+			return prepareIn(s, key, sql);
+		},
+
+		/** Same as {@link run}, on this client. */
+		run<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+			return runIn<T>(s, key, sql, bindings);
+		},
+
+		/** Same as {@link insert}, on this client. */
+		insert<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options: IdColumnOptions = {}): Promise<InsertResult<T>> {
+			return insertIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link insertShard}, on this client. */
+		insertShard<T = Record<string, unknown>>(
+			shardBinding: string,
+			sql: string,
+			bindings: any[] = [],
+			options: IdColumnOptions = {}
+		): Promise<InsertResult<T>> {
+			return insertShardIn<T>(s, shardBinding, sql, bindings, options);
+		},
+
+		/** Same as {@link all}, on this client. */
+		all<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = [], options?: ReadOptions): Promise<QueryResult<T>> {
+			return allIn<T>(s, key, sql, bindings, options);
+		},
+
+		/** Same as {@link first}, on this client. */
+		first<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = [], options?: ReadOptions): Promise<T | null> {
+			return firstIn<T>(s, key, sql, bindings, options);
+		},
+
+		/** Same as {@link allByLookupKey}, on this client. */
+		allByLookupKey<T = Record<string, unknown>>(
+			lookupKey: string,
+			sql: string,
+			bindings: any[] = [],
+			batchSize: number = 50,
+			options?: ReadOptions
+		): Promise<QueryResult<T>> {
+			return allByLookupKeyIn<T>(s, lookupKey, sql, bindings, batchSize, options);
+		},
+
+		/** Same as {@link firstByLookupKey}, on this client. */
+		firstByLookupKey<T = Record<string, unknown>>(
+			lookupKey: string,
+			sql: string,
+			bindings: any[] = [],
+			batchSize: number = 50,
+			options?: ReadOptions
+		): Promise<T | null> {
+			return firstByLookupKeyIn<T>(s, lookupKey, sql, bindings, batchSize, options);
+		},
+
+		/** Same as {@link invalidateMappingCache}, on this client. */
+		invalidateMappingCache(key?: string): Promise<void> {
+			return invalidateMappingCacheIn(s, key);
+		},
+
+		/** Same as {@link reassignShard}, on this client. */
+		reassignShard(primaryKey: string, newBinding: string, tableName: string, options: MoveRecordOptions = {}): Promise<void> {
+			return reassignShardIn(s, primaryKey, newBinding, tableName, options);
+		},
+
+		/** Same as {@link recoverMigrations}, on this client. */
+		recoverMigrations(options: { olderThanMs?: number } = {}): Promise<RecoveryReport> {
+			return recoverMigrationsIn(s, options);
+		},
+
+		/** Same as {@link verifyMigrations}, on this client. */
+		verifyMigrations(options: { repair?: boolean } = {}): Promise<VerifyReport> {
+			return verifyMigrationsIn(s, options);
+		},
+
+		/** Same as {@link getMigrationStatus}, on this client. */
+		getMigrationStatus(key: string, table?: string): Promise<MigrationStatus | null> {
+			return getMigrationStatusIn(s, key, table);
+		},
+
+		/** Same as {@link purgeRetired}, on this client. */
+		purgeRetired(): Promise<PurgeReport> {
+			return purgeRetiredIn(s);
+		},
+
+		/** Same as {@link listKnownShards}, on this client. */
+		listKnownShards(): Promise<string[]> {
+			return listKnownShardsIn(s);
+		},
+
+		/** Same as {@link getShardStats}, on this client. */
+		getShardStats(): Promise<ShardStats[]> {
+			return getShardStatsIn(s);
+		},
+
+		/** Same as {@link runShard}, on this client. */
+		runShard<T = Record<string, unknown>>(shardBinding: string, sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+			return runShardIn<T>(s, shardBinding, sql, bindings);
+		},
+
+		/** Same as {@link allShard}, on this client. */
+		allShard<T = Record<string, unknown>>(
+			shardBinding: string,
+			sql: string,
+			bindings: any[] = [],
+			options?: ReadOptions
+		): Promise<QueryResult<T>> {
+			return allShardIn<T>(s, shardBinding, sql, bindings, options);
+		},
+
+		/** Same as {@link firstShard}, on this client. */
+		firstShard<T = Record<string, unknown>>(
+			shardBinding: string,
+			sql: string,
+			bindings: any[] = [],
+			options?: ReadOptions
+		): Promise<T | null> {
+			return firstShardIn<T>(s, shardBinding, sql, bindings, options);
+		},
+
+		/** Same as {@link runAllShards}, on this client. */
+		runAllShards<T = Record<string, unknown>>(sql: string, bindings: any[] = [], batchSize: number = 50): Promise<QueryResult<T>[]> {
+			return runAllShardsIn<T>(s, sql, bindings, batchSize);
+		},
+
+		/** Same as {@link allAllShards}, on this client. */
+		allAllShards<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			batchSize: number = 50,
+			options?: ReadOptions
+		): Promise<QueryResult<T>[]> {
+			return allAllShardsIn<T>(s, sql, bindings, batchSize, options);
+		},
+
+		/** Same as {@link allAllShardsGlobal}, on this client. */
+		allAllShardsGlobal<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			options: GlobalAllShardsOptions<T> = {}
+		): Promise<QueryResult<T>> {
+			return allAllShardsGlobalIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link firstAllShards}, on this client. */
+		firstAllShards<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			batchSize: number = 50,
+			options?: ReadOptions
+		): Promise<(T | null)[]> {
+			return firstAllShardsIn<T>(s, sql, bindings, batchSize, options);
+		},
+
+		/** Same as {@link firstAllShardsGlobal}, on this client. */
+		firstAllShardsGlobal<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			options: Omit<GlobalAllShardsOptions<T>, 'limit'> = {}
+		): Promise<T | null> {
+			return firstAllShardsGlobalIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link getDatabaseSizeForShard}, on this client. */
+		getDatabaseSizeForShard(shardBinding: string): Promise<number> {
+			return getDatabaseSizeForShardIn(s, shardBinding);
+		},
+
+		/** Same as {@link index}, on this client. */
+		index<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			columns: string | string[] | IndexColumnDefinition[],
+			options: Omit<CreateIndexOptions, 'batchSize'> = {}
+		): Promise<QueryResult<T>> {
+			return indexIn<T>(s, key, table, columns, options);
+		},
+
+		/** Same as {@link indexShard}, on this client. */
+		indexShard<T = Record<string, unknown>>(
+			shardBinding: string,
+			table: string,
+			columns: string | string[] | IndexColumnDefinition[],
+			options: Omit<CreateIndexOptions, 'batchSize'> = {}
+		): Promise<QueryResult<T>> {
+			return indexShardIn<T>(s, shardBinding, table, columns, options);
+		},
+
+		/** Same as {@link indexAllShards}, on this client. */
+		indexAllShards<T = Record<string, unknown>>(
+			table: string,
+			columns: string | string[] | IndexColumnDefinition[],
+			options: CreateIndexOptions = {}
+		): Promise<QueryResult<T>[]> {
+			return indexAllShardsIn<T>(s, table, columns, options);
+		},
+
+		/** Same as {@link explain}, on this client. */
+		explain<T = Record<string, unknown>>(
+			key: string,
+			sql: string,
+			bindings: any[] = [],
+			options: Omit<ExplainOptions, 'batchSize'> = {}
+		): Promise<QueryResult<T>> {
+			return explainIn<T>(s, key, sql, bindings, options);
+		},
+
+		/** Same as {@link explainShard}, on this client. */
+		explainShard<T = Record<string, unknown>>(
+			shardBinding: string,
+			sql: string,
+			bindings: any[] = [],
+			options: Omit<ExplainOptions, 'batchSize'> = {}
+		): Promise<QueryResult<T>> {
+			return explainShardIn<T>(s, shardBinding, sql, bindings, options);
+		},
+
+		/** Same as {@link explainAllShards}, on this client. */
+		explainAllShards<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			options: ExplainOptions = {}
+		): Promise<QueryResult<T>[]> {
+			return explainAllShardsIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link count}, on this client. */
+		count(key: string, table: string, options?: ReadOptions): Promise<number> {
+			return countIn(s, key, table, options);
+		},
+
+		/** Same as {@link countShard}, on this client. */
+		countShard(shardBinding: string, table: string, options?: ReadOptions): Promise<number> {
+			return countShardIn(s, shardBinding, table, options);
+		},
+
+		/** Same as {@link countAllShards}, on this client. */
+		countAllShards(
+			table: string,
+			batchSize: number = 50,
+			options?: ReadOptions
+		): Promise<{ total: number; shards: ShardTableCount[]; bookmarks?: Record<string, string> }> {
+			return countAllShardsIn(s, table, batchSize, options);
+		},
+
+		/** Same as {@link getDatabaseSizeForKey}, on this client. */
+		getDatabaseSizeForKey(key: string): Promise<number> {
+			return getDatabaseSizeForKeyIn(s, key);
+		},
+
+		/** Same as {@link getDatabaseSizesAllShards}, on this client. */
+		getDatabaseSizesAllShards(batchSize: number = 50): Promise<ShardSizeResult[]> {
+			return getDatabaseSizesAllShardsIn(s, batchSize);
+		},
+
+		/** Same as {@link getTotalDatabaseSize}, on this client. */
+		getTotalDatabaseSize(batchSize: number = 50): Promise<number> {
+			return getTotalDatabaseSizeIn(s, batchSize);
+		},
+
+		/** Same as {@link firstResilient}, on this client. */
+		firstResilient<T = Record<string, unknown>>(key: string, sql: string, bindings: any[] = [], options?: ReadOptions): Promise<T | null> {
+			return firstResilientIn<T>(s, key, sql, bindings, options);
+		},
+
+		/** Same as {@link query}, on this client. */
+		query<T = Record<string, unknown>>(sql: string, bindings: any[] = []): Promise<QueryResult<T>> {
+			return queryIn<T>(s, sql, bindings);
+		},
+
+		/** Same as {@link queryFirst}, on this client. */
+		queryFirst<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options?: ReadOptions): Promise<T | null> {
+			return queryFirstIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link queryAll}, on this client. */
+		queryAll<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options?: ReadOptions): Promise<QueryResult<T>> {
+			return queryAllIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link batch}, on this client. */
+		batch<T = Record<string, unknown>>(entries: BatchEntry[]): Promise<BatchShardResult<T>[]> {
+			return batchIn<T>(s, entries);
+		},
+
+		/** Same as {@link paginate}, on this client. */
+		paginate<T = Record<string, unknown>>(
+			sql: string,
+			bindings: any[] = [],
+			options: PaginateOptions<T> = {}
+		): Promise<PaginatedResult<T>> {
+			return paginateIn<T>(s, sql, bindings, options);
+		},
+
+		/** Same as {@link rebalance}, on this client. */
+		rebalance(table: string, options: { concurrency?: number; dryRun?: boolean } = {}): Promise<RebalanceResult> {
+			return rebalanceIn(s, table, options);
+		},
+
+		/** Same as {@link nextId}, on this client. */
+		nextId(table: string, options: NextIdOptions = {}): Promise<number> {
+			return nextIdIn(s, table, options);
+		},
+
+		/** Same as {@link initializeFromEnv}, on this client. */
+		initializeFromEnv(env: Record<string, unknown>, options: InitializeFromEnvOptions = {}): string[] {
+			return initializeFromEnvIn(s, env, options);
+		},
+
+		/** Same as {@link insertReturning}, on this client. */
+		insertReturning<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			values: ColumnValues,
+			options: BuildInsertOptions & { idColumn?: string } = {}
+		): Promise<T | null> {
+			return insertReturningIn<T>(s, key, table, values, options);
+		},
+
+		/** Same as {@link setLookup}, on this client. */
+		setLookup(key: string, value: string, options: LookupOptions = {}): Promise<void> {
+			return setLookupIn(s, key, value, options);
+		},
+
+		/** Same as {@link getLookup}, on this client. */
+		getLookup(key: string, options: LookupOptions = {}): Promise<string | null> {
+			return getLookupIn(s, key, options);
+		},
+
+		/** Same as {@link deleteLookup}, on this client. */
+		deleteLookup(key: string, options: LookupOptions = {}): Promise<void> {
+			return deleteLookupIn(s, key, options);
+		},
+
+		/** Same as {@link insertInto}, on this client. */
+		insertInto<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			values: ColumnValues,
+			options: BuildInsertOptions = {}
+		): Promise<QueryResult<T>> {
+			return insertIntoIn<T>(s, key, table, values, options);
+		},
+
+		/** Same as {@link updateRow}, on this client. */
+		updateRow<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			values: ColumnValues,
+			where: ColumnValues,
+			options: CrudReturningOptions = {}
+		): Promise<QueryResult<T>> {
+			return updateRowIn<T>(s, key, table, values, where, options);
+		},
+
+		/** Same as {@link patch}, on this client. */
+		patch<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			id: string | number,
+			values: ColumnValues,
+			options: IdColumnOptions = {}
+		): Promise<QueryResult<T>> {
+			return patchIn<T>(s, key, table, id, values, options);
+		},
+
+		/** Same as {@link deleteRow}, on this client. */
+		deleteRow<T = Record<string, unknown>>(key: string, table: string, where: ColumnValues): Promise<QueryResult<T>> {
+			return deleteRowIn<T>(s, key, table, where);
+		},
+
+		/** Same as {@link deleteById}, on this client. */
+		deleteById<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			id: string | number,
+			options: { idColumn?: string } = {}
+		): Promise<QueryResult<T>> {
+			return deleteByIdIn<T>(s, key, table, id, options);
+		},
+
+		/** Same as {@link upsert}, on this client. */
+		upsert<T = Record<string, unknown>>(
+			key: string,
+			table: string,
+			values: ColumnValues,
+			conflictColumns: string | string[],
+			options: BuildUpsertOptions = {}
+		): Promise<QueryResult<T>> {
+			return upsertIn<T>(s, key, table, values, conflictColumns, options);
+		},
+
+		/** Same as {@link getClosestRegionFromIP}. */
+		getClosestRegionFromIP,
+
+		/** Same as {@link createSchema}. */
+		createSchema,
+
+		/** Same as `cached`, reading and writing this client's KV store unless `options.kv` is set. */
+		async cached<T>(key: string, fetcher: () => Promise<T>, options: CacheOptions = {}): Promise<T> {
+			return await cacheValue<T>(key, fetcher, { ...options, kv: options.kv ?? getConfig(s).kv });
+		},
+
+		/** Same as `invalidate`, on this client's KV store unless `options.kv` is set. */
+		async invalidate(prefix: string, options: { kv?: KVStorage; concurrency?: number } = {}): Promise<number> {
+			return await invalidateCache(prefix, { ...options, kv: options.kv ?? getConfig(s).kv });
+		},
+
+		/** Same as `reconcileAllocations`, on this client's coordinator and placement cache. */
+		async reconcileAllocations(options: ReconcileOptions = {}): Promise<ReconcileReport> {
+			return await reconcileAllocationsIn(s.config, s.placement, options);
+		}
+	};
+}
+
+/**
+ * The type of the object {@link createClient} returns.
+ * @since 1.4.0
+ */
+export type CollegeDBClient = ReturnType<typeof createClient>;

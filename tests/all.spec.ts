@@ -47,6 +47,8 @@ import {
 	validateTableForSharding
 } from '../src/migrations';
 import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy } from '../src/types';
+import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
+import { MockDurableObjectState } from './helpers/durable-storage';
 
 // Test schema for creating tables
 const TEST_SCHEMA = `
@@ -496,8 +498,8 @@ describe('CollegeDB', () => {
 			// First insert to establish mapping
 			await run(primaryKey, 'INSERT INTO users (id, name) VALUES (?, ?)', [primaryKey, 'Test User']);
 
-			// Reassign to different shard
-			await expect(reassignShard(primaryKey, 'db-west', 'users')).resolves.toBeUndefined();
+			// A move between shards needs a journal; the journaled path is in migration-journal.spec.ts
+			await expect(reassignShard(primaryKey, 'db-west', 'users')).rejects.toMatchObject({ code: 'JOURNAL_NOT_CONFIGURED' });
 		});
 	});
 
@@ -516,22 +518,7 @@ describe('CollegeDB', () => {
 		let mockState: any;
 
 		beforeEach(async () => {
-			// Create mock durable object state
-			const mockStorage = new Map();
-			mockState = {
-				storage: {
-					get: async (key: string) => Promise.resolve(mockStorage.get(key)),
-					put: async (key: string, value: any) => {
-						mockStorage.set(key, value);
-						return Promise.resolve();
-					},
-					delete: async (key: string) => Promise.resolve(mockStorage.delete(key)),
-					deleteAll: async () => {
-						mockStorage.clear();
-						return Promise.resolve();
-					}
-				}
-			};
+			mockState = new MockDurableObjectState();
 
 			// Import and create coordinator
 			const { ShardCoordinator } = await import('../src/durable');
@@ -3147,13 +3134,15 @@ describe('CollegeDB', () => {
 
 		it('migrates the underlying record and updates the mapping', async () => {
 			const kv = createInMemoryKVProvider();
+			// moves run through the journal, which needs a real SQL engine
 			initialize({
 				kv,
 				shards: {
-					'db-a': createInMemorySQLProvider(),
-					'db-b': createInMemorySQLProvider()
+					'db-a': createNodeSqliteProvider(openNodeSqlite()),
+					'db-b': createNodeSqliteProvider(openNodeSqlite())
 				},
 				strategy: 'hash',
+				journalShard: 'db-a',
 				disableAutoMigration: true,
 				hashShardMappings: false
 			});

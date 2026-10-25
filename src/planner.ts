@@ -18,14 +18,14 @@
  * provider.
  *
  * @author Gregory Mitchell
- * @since 1.4.0
+ * @since 1.3.0
  */
 
 import { CollegeDBError } from './errors';
 
 /**
  * What a statement was found to be, and which keys it routes to.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface QueryPlan {
 	/** Statement kind that was recognized */
@@ -45,7 +45,7 @@ export interface QueryPlan {
 
 /**
  * Options for {@link planQuery}.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export interface PlanQueryOptions {
 	/** Primary-key column per table. Tables not listed use `defaultKeyColumn`. */
@@ -380,7 +380,7 @@ function parseWherePredicate(scrubbed: string): Pick<ParsedStatement, 'placehold
  * @param bindings - Positional bindings for the statement
  * @param options - Key-column configuration
  * @returns The plan, or `null` when the routing key cannot be proven
- * @since 1.4.0
+ * @since 1.3.0
  * @example
  * ```typescript
  * planQuery('SELECT * FROM users WHERE id = ?', ['user-1']);
@@ -472,7 +472,7 @@ export function planQuery(sql: string, bindings: any[] = [], options: PlanQueryO
  *
  * @param sql - The statement that could not be planned
  * @returns The error to throw
- * @since 1.4.0
+ * @since 1.3.0
  */
 export function unroutableError(sql: string): CollegeDBError {
 	const preview = sql.length > 120 ? `${sql.slice(0, 117)}...` : sql;

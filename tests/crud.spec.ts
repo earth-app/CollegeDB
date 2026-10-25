@@ -1,18 +1,24 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+	KVShardMapper,
 	createInMemoryKVProvider,
 	createInMemorySQLProvider,
 	deleteById,
 	deleteRow,
 	first,
 	initialize,
+	initializeAsync,
 	insertInto,
 	insertReturning,
+	invalidateMappingCache,
 	patch,
+	reassignShard,
 	resetConfig,
 	updateRow,
 	upsert
 } from '../src/index';
+import type { SQLDatabase } from '../src/types';
+import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
 
 const SCHEMA = `CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, qty INTEGER, note TEXT)`;
 
@@ -96,5 +102,77 @@ describe('Object CRUD helpers', () => {
 
 	it('rejects an unfiltered delete before touching a shard', async () => {
 		await expect(deleteRow('item-8', 'items', {})).rejects.toThrow('A WHERE condition is required');
+	});
+});
+
+describe('Object CRUD helpers with a journal', () => {
+	let east: SQLDatabase;
+	let west: SQLDatabase;
+	let kv: ReturnType<typeof createInMemoryKVProvider>;
+
+	beforeEach(async () => {
+		resetConfig();
+		kv = createInMemoryKVProvider();
+		east = createNodeSqliteProvider(openNodeSqlite());
+		west = createNodeSqliteProvider(openNodeSqlite());
+		for (const db of [east, west]) {
+			await db.prepare(SCHEMA).run();
+		}
+
+		await initializeAsync({
+			kv,
+			shards: { 'db-east': east, 'db-west': west },
+			strategy: 'hash',
+			journalShard: 'db-east',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+		await new KVShardMapper(kv, { hashShardMappings: false }).setShardMapping('moved', 'db-east');
+		await east.prepare('INSERT INTO items (id, name, qty) VALUES (?, ?, ?)').bind('moved', 'Widget', 1).run();
+		await reassignShard('moved', 'db-west', 'items');
+
+		// a caller whose cached mapping still says the old shard
+		await new KVShardMapper(kv, { hashShardMappings: false }).updateShardMapping('moved', 'db-east');
+		await invalidateMappingCache('moved');
+	});
+
+	const code = async (work: Promise<unknown>) =>
+		await work.then(
+			() => undefined,
+			(error: { code?: string }) => error.code
+		);
+
+	it('insertInto does not recreate a row on the shard the key left', async () => {
+		expect(await code(insertInto('moved', 'items', { id: 'moved', name: 'ghost' }))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await east.prepare('SELECT * FROM items WHERE id = ?').bind('moved').first()).toBeNull();
+	});
+
+	it('insertReturning surfaces the refusal rather than returning a phantom row', async () => {
+		expect(await code(insertReturning('moved', 'items', { id: 'moved', name: 'ghost' }))).toBe('MIGRATION_CUTOVER_PENDING');
+	});
+
+	it('upsert does not recreate or update a row on the shard the key left', async () => {
+		expect(await code(upsert('moved', 'items', { id: 'moved', name: 'ghost' }, 'id'))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await east.prepare('SELECT * FROM items WHERE id = ?').bind('moved').first()).toBeNull();
+	});
+
+	it('updateRow, patch, deleteRow and deleteById refuse instead of acknowledging zero rows', async () => {
+		expect(await code(updateRow('moved', 'items', { name: 'x' }, { id: 'moved' }))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await code(patch('moved', 'items', 'moved', { name: 'x' }))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await code(deleteRow('moved', 'items', { id: 'moved' }))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await code(deleteById('moved', 'items', 'moved'))).toBe('MIGRATION_CUTOVER_PENDING');
+		expect(await west.prepare('SELECT name FROM items WHERE id = ?').bind('moved').first()).toMatchObject({ name: 'Widget' });
+	});
+
+	it('still writes keys that never moved', async () => {
+		await new KVShardMapper(kv, { hashShardMappings: false }).setShardMapping('plain', 'db-east');
+
+		await insertInto('plain', 'items', { id: 'plain', name: 'A' });
+		await patch('plain', 'items', 'plain', { name: 'B' });
+		await upsert('plain', 'items', { id: 'plain', name: 'C' }, 'id');
+
+		expect(await east.prepare('SELECT name FROM items WHERE id = ?').bind('plain').first()).toMatchObject({ name: 'C' });
+		await deleteById('plain', 'items', 'plain');
+		expect(await east.prepare('SELECT * FROM items WHERE id = ?').bind('plain').first()).toBeNull();
 	});
 });

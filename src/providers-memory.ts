@@ -1317,6 +1317,7 @@ function parsePrimary(parser: NumericParser, record: Record<string, unknown>): n
  * features supported.
  */
 export class InMemorySQLDatabase implements SQLDatabase {
+	readonly consistency = { primary: true, session: false, eventual: true };
 	private tables = new Map<string, Map<string, Record<string, unknown>>>();
 	private schemas = new Map<string, Map<string, ColumnInfo>>();
 	private autoIncrementCounters = new Map<string, number>();
@@ -2384,7 +2385,7 @@ export class InMemoryKVStorage implements KVStorage {
 	 * Present so the in-memory store exercises the same code path the Redis and
 	 * Valkey adapters take, rather than quietly leaving every test on the
 	 * one-key-at-a-time fallback.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	async getMany<T = unknown>(keys: string[], type: 'json'): Promise<(T | null)[]>;
 	async getMany(keys: string[], type?: 'text'): Promise<(string | null)[]>;
@@ -2398,7 +2399,7 @@ export class InMemoryKVStorage implements KVStorage {
 
 	/**
 	 * Writes many entries at once.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	async putMany(entries: Array<{ key: string; value: string }>): Promise<void> {
 		for (const entry of entries) {
@@ -2408,7 +2409,7 @@ export class InMemoryKVStorage implements KVStorage {
 
 	/**
 	 * Deletes many keys at once.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	async deleteMany(keys: string[]): Promise<void> {
 		for (const key of keys) {

@@ -17,7 +17,7 @@
  */
 
 import { CollegeDBError } from './errors';
-import { getActiveConfig } from './router';
+import { currentState } from './state';
 import type { KVStorage } from './types';
 
 /**
@@ -39,6 +39,13 @@ export interface CacheOptions {
 	ttl?: number;
 	/** KV store override; defaults to the store passed to {@link initialize} */
 	kv?: KVStorage;
+	/**
+	 * Milliseconds a fetch may run before every caller waiting on it rejects with
+	 * `CACHE_FETCH_TIMEOUT`. The fetch is not cancelled; if it resolves later, its
+	 * value is still stored. Omit to wait indefinitely.
+	 * @since 1.4.0
+	 */
+	fetchTimeoutMs?: number;
 }
 
 /**
@@ -48,18 +55,33 @@ export interface CacheOptions {
 const DEFAULT_INVALIDATE_CONCURRENCY = 16;
 
 /**
- * In-flight fetches, keyed by cache key, so concurrent misses on the same key
- * share one call to the fetcher.
+ * In-flight fetches per store, keyed by cache key, so concurrent misses on the
+ * same key share one call to the fetcher. Scoped by store so two stores that
+ * share a key never share a promise.
  * @private
  */
-const inFlight = new Map<string, Promise<unknown>>();
+const inFlight = new WeakMap<KVStorage, Map<string, Promise<unknown>>>();
+
+/**
+ * Rejects with `CACHE_FETCH_TIMEOUT` if `work` has not settled within `ms`.
+ * @private
+ */
+function raceTimeout<T>(work: Promise<T>, ms: number, key: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			reject(new CollegeDBError(`cache fetch for "${key}" did not settle within ${ms} ms`, 'CACHE_FETCH_TIMEOUT'));
+		}, ms);
+	});
+	return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Resolves the KV store to use, preferring an explicit override.
  * @private
  */
 function resolveKV(explicit?: KVStorage): KVStorage {
-	const kv = explicit ?? getActiveConfig()?.kv;
+	const kv = explicit ?? currentState().config?.kv;
 	if (!kv) {
 		throw new CollegeDBError('CollegeDB not initialized. Call initialize() first or pass options.kv.', 'NOT_INITIALIZED');
 	}
@@ -78,7 +100,7 @@ function resolveKV(explicit?: KVStorage): KVStorage {
  * @param fetcher - Async producer invoked on a miss
  * @param options - TTL and KV override
  * @returns The cached or freshly computed value
- * @throws {CollegeDBError} If no KV store is available
+ * @throws {CollegeDBError} If no KV store is available, or with `CACHE_FETCH_TIMEOUT` when `fetchTimeoutMs` elapses
  * @since 1.2.4
  * @example
  * ```typescript
@@ -107,7 +129,13 @@ export async function cached<T>(key: string, fetcher: () => Promise<T>, options:
 	// Single-flight: concurrent callers that all miss share one fetcher call
 	// instead of each running it, which is the point at which a cold popular key
 	// otherwise stampedes whatever the fetcher talks to.
-	const pending = inFlight.get(key) as Promise<T> | undefined;
+	let calls = inFlight.get(kv);
+	if (!calls) {
+		calls = new Map();
+		inFlight.set(kv, calls);
+	}
+
+	const pending = calls.get(key) as Promise<T> | undefined;
 	if (pending) {
 		return await pending;
 	}
@@ -122,12 +150,13 @@ export async function cached<T>(key: string, fetcher: () => Promise<T>, options:
 		return data;
 	})();
 
-	inFlight.set(key, work);
+	const shared = options.fetchTimeoutMs ? raceTimeout(work, options.fetchTimeoutMs, key) : work;
+	calls.set(key, shared);
 
 	try {
-		return await work;
+		return await shared;
 	} finally {
-		inFlight.delete(key);
+		calls.delete(key);
 	}
 }
 

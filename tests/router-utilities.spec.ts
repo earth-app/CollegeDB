@@ -6,7 +6,9 @@ import {
 	ensureSchema,
 	first,
 	firstResilient,
+	getActiveConfig,
 	initialize,
+	initializeAsync,
 	initializeFromEnv,
 	insertInto,
 	isInitialized,
@@ -15,6 +17,7 @@ import {
 	resetConfig
 } from '../src/index';
 import { KVShardMapper } from '../src/kvmap';
+import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
 
 const ITEMS_SCHEMA = `CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, score INTEGER)`;
 const SEQ_SCHEMA = `CREATE TABLE seq_items (id INTEGER PRIMARY KEY, name TEXT)`;
@@ -308,6 +311,65 @@ describe('Router utility helpers', () => {
 
 		it('throws when no shard bindings are found', () => {
 			expect(() => initializeFromEnv({ KV: createInMemoryKVProvider() })).toThrow('No shard bindings found');
+		});
+
+		it('carries journalShard and journalScope into the configuration', () => {
+			const env: Record<string, unknown> = {
+				KV: createInMemoryKVProvider(),
+				DB_EAST: createNodeSqliteProvider(openNodeSqlite()),
+				DB_WEST: createNodeSqliteProvider(openNodeSqlite())
+			};
+
+			initializeFromEnv(env, { journalShard: 'db-east', journalScope: 'tenants', disableAutoMigration: true, hashShardMappings: false });
+
+			expect(getActiveConfig()).toMatchObject({ journalShard: 'db-east', journalScope: 'tenants' });
+		});
+	});
+
+	describe('journal configuration', () => {
+		const tables = async (db: SQLDatabase) =>
+			(
+				await db
+					.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'collegedb_%' ORDER BY name")
+					.all<{ name: string }>()
+			).results.map((row) => row.name);
+
+		it('rejects a journalShard that is not a configured shard', async () => {
+			const { kv, east } = makeShards();
+			const config = { kv, shards: { 'db-east': east }, journalShard: 'db-missing', disableAutoMigration: true };
+
+			expect(() => initialize(config)).toThrowError(expect.objectContaining({ code: 'INVALID_JOURNAL_SHARD' }));
+			await expect(initializeAsync(config)).rejects.toMatchObject({ code: 'INVALID_JOURNAL_SHARD' });
+			expect(isInitialized()).toBe(false);
+		});
+
+		it('creates the sidecar tables on every shard and the journal tables on the journal shard', async () => {
+			const east = createNodeSqliteProvider(openNodeSqlite());
+			const west = createNodeSqliteProvider(openNodeSqlite());
+
+			await initializeAsync({
+				kv: createInMemoryKVProvider(),
+				shards: { 'db-east': east, 'db-west': west },
+				journalShard: 'db-east',
+				disableAutoMigration: true
+			});
+
+			expect(await tables(west)).toEqual(['collegedb_retired', 'collegedb_topology']);
+			expect(await tables(east)).toEqual([
+				'collegedb_migration_active',
+				'collegedb_migration_history',
+				'collegedb_migration_verification',
+				'collegedb_placement_exceptions',
+				'collegedb_retired',
+				'collegedb_topology'
+			]);
+		});
+
+		it('creates nothing without a journalShard', async () => {
+			const east = createNodeSqliteProvider(openNodeSqlite());
+			await initializeAsync({ kv: createInMemoryKVProvider(), shards: { 'db-east': east }, disableAutoMigration: true });
+
+			expect(await tables(east)).toEqual([]);
 		});
 	});
 });

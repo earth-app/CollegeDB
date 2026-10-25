@@ -1,22 +1,37 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cached, invalidate } from '../src/cache';
 import { KVShardMapper } from '../src/kvmap';
-import { hrwShard } from '../src/placement';
+import {
+	addPlacementException,
+	candidateShards,
+	createManifest,
+	hrwShard,
+	loadPlacementManifest,
+	resetPlacementState,
+	savePlacementManifest,
+	swapPlacementCache,
+	withCurrentTopology
+} from '../src/placement';
 import { createInMemoryKVProvider, createInMemorySQLProvider } from '../src/providers-memory';
 import {
+	all,
 	allAllShardsGlobal,
 	batch,
 	countAllShards,
 	countShard,
+	deleteById,
+	deleteRow,
 	first,
 	getDatabaseSizesAllShards,
 	indexAllShards,
 	initialize,
 	insert,
 	insertInto,
+	insertReturning,
 	insertShard,
 	invalidateMappingCache,
 	nextId,
+	patch,
 	query,
 	queryAll,
 	queryFirst,
@@ -24,9 +39,12 @@ import {
 	rebalance,
 	resetConfig,
 	run,
-	runShard
+	runShard,
+	updateRow,
+	upsert
 } from '../src/router';
 import type { BatchStatement, KVStorage, QueryResult, SQLDatabase } from '../src/types';
+import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
 
 const SCHEMA = 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)';
 
@@ -192,6 +210,50 @@ describe('Reads do not allocate mappings', () => {
 
 		// The legacy multi-key probe used to double this.
 		expect(counts.get).toBe(1);
+	});
+
+	describe('on an empty result', () => {
+		async function absentRead(extra: Record<string, unknown>): Promise<{ row: unknown; log: string[] }> {
+			const log: string[] = [];
+			const shards = Object.fromEntries(
+				['db-a', 'db-b'].map((name) => {
+					const raw = openNodeSqlite();
+					raw.exec(SCHEMA);
+					const provider = createNodeSqliteProvider(raw);
+					return [name, { ...provider, prepare: (sql: string) => (log.push(sql), provider.prepare(sql)) } as SQLDatabase];
+				})
+			);
+
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards,
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false,
+				...extra
+			});
+			await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			log.length = 0;
+
+			const row = await first('absent', 'SELECT * FROM users WHERE id = ?', ['absent']);
+			return { row, log };
+		}
+
+		it('issues only the read when no journal is configured', async () => {
+			const { row, log } = await absentRead({});
+
+			expect(row).toBeNull();
+			expect(log).toEqual(['SELECT * FROM users WHERE id = ?']);
+		});
+
+		it('returns the same empty answer with a journal configured, after looking for a tombstone', async () => {
+			const { row, log } = await absentRead({ journalShard: 'db-a' });
+
+			expect(row).toBeNull();
+			expect(log.length).toBeGreaterThan(1);
+			expect(log[0]).toBe('SELECT * FROM users WHERE id = ?');
+		});
 	});
 
 	it('still probes the legacy record when legacyMultiKeyLookup is enabled', async () => {
@@ -875,8 +937,21 @@ describe('Computed placement', () => {
 	});
 
 	it('keeps a reassigned key reachable by recording it as an exception', async () => {
-		const { shards } = await setupComputed();
-		const names = Object.keys(shards);
+		// moves run through the journal, which needs a real SQL engine
+		const names = ['db-a', 'db-b', 'db-c'];
+		const shards = Object.fromEntries(names.map((name) => [name, createNodeSqliteProvider(openNodeSqlite())]));
+		initialize({
+			kv: createInMemoryKVProvider(),
+			shards,
+			strategy: 'hash',
+			placement: 'computed',
+			journalShard: 'db-a',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+		for (const name of names) {
+			await runShard(name, SCHEMA);
+		}
 
 		await run('user-7', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-7', 'Ada']);
 
@@ -889,8 +964,7 @@ describe('Computed placement', () => {
 		// keeps it reachable.
 		expect(await first<{ name: string }>('user-7', 'SELECT * FROM users WHERE id = ?', ['user-7'])).toMatchObject({ name: 'Ada' });
 
-		const onTarget = await runShard<{ c: number }>(target, 'SELECT COUNT(*) AS c FROM users WHERE id = ?', ['user-7']);
-		expect(Number(onTarget.results[0]?.c ?? 0)).toBe(1);
+		expect(await countShard(target, 'users')).toBe(1);
 	});
 
 	it('finds keys placed under the previous topology after a shard is added', async () => {
@@ -977,6 +1051,756 @@ describe('Computed placement', () => {
 		expect(result.moved).toBe(0);
 		expect(result.failed).toEqual([]);
 		expect(result.agreed).toBe(result.examined);
+	});
+
+	it('costs a cold isolate two KV round trips and rewrites nothing it already holds', async () => {
+		const { kv, counts } = countingKV(createInMemoryKVProvider());
+		const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+		const config = {
+			kv,
+			shards,
+			strategy: 'hash',
+			placement: 'computed',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		} as const;
+
+		initialize(config);
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+		await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		resetConfig();
+		const before = { get: counts.get, put: counts.put };
+		initialize(config);
+		await first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// one read of the shard list, one getMany for the manifest and exception set
+		expect(counts.get - before.get).toBe(2);
+		expect(counts.put - before.put).toBe(0);
+	});
+
+	it('shares one manifest read among the operations that find the cache expired', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] });
+
+		try {
+			const { counts } = await setupComputed();
+			await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			vi.setSystemTime(Date.now() + 11_000);
+			const before = counts.get;
+			await Promise.all(Array.from({ length: 20 }, (_, i) => first(`user-${i}`, 'SELECT * FROM users WHERE id = ?', [`user-${i}`])));
+
+			// one getMany for the manifest and exception set, not one per operation
+			expect(counts.get - before).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	describe('with KV failing', () => {
+		type KvMode = { state: 'up' | 'down' | 'hung'; calls?: number };
+
+		function switchableKV(inner: KVStorage, mode: KvMode): KVStorage {
+			const gate = async <T>(work: () => Promise<T>): Promise<T> => {
+				mode.calls = (mode.calls ?? 0) + 1;
+				if (mode.state === 'down') throw new Error('kv down');
+				if (mode.state === 'hung') return await new Promise<T>(() => {});
+				return await work();
+			};
+
+			const kv: KVStorage = {
+				get: ((key: string, type?: 'text' | 'json') =>
+					gate(async () => (type === 'json' ? await inner.get(key, 'json') : await inner.get(key, type)))) as KVStorage['get'],
+				put: (key, value) => gate(() => inner.put(key, value)),
+				delete: (key) => gate(() => inner.delete(key)),
+				list: (options) => gate(() => inner.list(options))
+			};
+
+			kv.getMany = ((keys: string[], type?: 'text' | 'json') =>
+				gate(async () =>
+					type === 'json' ? await inner.getMany!(keys, 'json') : await inner.getMany!(keys, type)
+				)) as KVStorage['getMany'];
+
+			return kv;
+		}
+
+		async function setupFlaky(extra: Record<string, unknown> = {}) {
+			const mode: KvMode = { state: 'up' };
+			const kv = switchableKV(createInMemoryKVProvider(), mode);
+			const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+			const config = {
+				kv,
+				shards,
+				strategy: 'hash',
+				placement: 'computed',
+				disableAutoMigration: true,
+				hashShardMappings: false,
+				...extra
+			} as Parameters<typeof initialize>[0];
+
+			initialize(config);
+			for (const name of Object.keys(shards)) {
+				await runShard(name, SCHEMA);
+			}
+			await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
+
+			return { mode, config, shards };
+		}
+
+		const insert2 = () => run('user-2', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-2', 'Grace']);
+		const read1 = () => first<{ name: string }>('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
+		const expectUnverified = (work: Promise<unknown>) => expect(work).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
+
+		beforeEach(() => {
+			vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('keeps serving cached keys, reads and writes, while the cached state is inside its TTL', async () => {
+			const { mode } = await setupFlaky();
+			mode.state = 'down';
+
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+			await insert2();
+			expect(await first<{ name: string }>('user-2', 'SELECT * FROM users WHERE id = ?', ['user-2'])).toMatchObject({ name: 'Grace' });
+		});
+
+		it('serves reads from the stale manifest and exception set once the TTL has passed', async () => {
+			const { mode } = await setupFlaky();
+			await vi.advanceTimersByTimeAsync(11_000);
+			mode.state = 'down';
+
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+		});
+
+		it('refuses a write on stale placement state and accepts it again once KV is back', async () => {
+			const { mode, shards } = await setupFlaky();
+			await vi.advanceTimersByTimeAsync(11_000);
+			mode.state = 'down';
+
+			await expectUnverified(insert2());
+			for (const name of Object.keys(shards)) {
+				expect(await countShard(name, 'users')).toBe(name === hrwShard('user-1', Object.keys(shards)) ? 1 : 0);
+			}
+
+			mode.state = 'up';
+			await insert2();
+			expect((await countAllShards('users')).total).toBe(2);
+		});
+
+		it('fails reads and writes on a cold isolate instead of computing against an assumed manifest', async () => {
+			const { mode, config, shards } = await setupFlaky();
+			await vi.advanceTimersByTimeAsync(0);
+			mode.state = 'down';
+
+			resetConfig();
+			initialize(config);
+
+			await expectUnverified(read1());
+			await expectUnverified(insert2());
+			for (const name of Object.keys(shards)) {
+				expect(await countShard(name, 'users')).toBe(name === hrwShard('user-1', Object.keys(shards)) ? 1 : 0);
+			}
+
+			mode.state = 'up';
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+		});
+
+		it('reports a hung KV as PLACEMENT_UNVERIFIED and never as a missing key', async () => {
+			const { mode, config } = await setupFlaky({ kvTimeoutMs: 100 });
+			await vi.advanceTimersByTimeAsync(0);
+			mode.state = 'hung';
+
+			resetConfig();
+			initialize(config);
+			const cold = expectUnverified(read1());
+			await vi.advanceTimersByTimeAsync(300);
+			await cold;
+
+			mode.state = 'up';
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+			await vi.advanceTimersByTimeAsync(11_000);
+			mode.state = 'hung';
+			const stale = expectUnverified(insert2());
+			await vi.advanceTimersByTimeAsync(300);
+			await stale;
+		});
+
+		it('lets stale reads skip a refresh for a second after one failed, so a hung KV is waited on once', async () => {
+			const { mode } = await setupFlaky({ kvTimeoutMs: 100 });
+			await vi.advanceTimersByTimeAsync(11_000);
+			mode.state = 'hung';
+
+			const callsBefore = mode.calls ?? 0;
+			const firstRead = read1();
+			await vi.advanceTimersByTimeAsync(150);
+			expect(await firstRead).toMatchObject({ name: 'Ada' });
+			const callsAfterFirst = mode.calls ?? 0;
+			expect(callsAfterFirst).toBeGreaterThan(callsBefore);
+
+			// no timer advances here, so a read that tried KV again would never settle
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+			expect(await read1()).toMatchObject({ name: 'Ada' });
+			expect(mode.calls).toBe(callsAfterFirst);
+
+			await vi.advanceTimersByTimeAsync(1_100);
+			const retried = read1();
+			await vi.advanceTimersByTimeAsync(150);
+			expect(await retried).toMatchObject({ name: 'Ada' });
+			expect(mode.calls).toBeGreaterThan(callsAfterFirst);
+		});
+
+		it('does not back writes off: each one tries KV, so a write sees the recovery at once', async () => {
+			const { mode } = await setupFlaky();
+			await vi.advanceTimersByTimeAsync(11_000);
+			mode.state = 'down';
+
+			await expectUnverified(insert2());
+			mode.state = 'up';
+			await insert2();
+			expect((await countAllShards('users')).total).toBe(2);
+		});
+
+		it('refuses to publish a ninth epoch and leaves the stored manifest alone', async () => {
+			const kv = createInMemoryKVProvider();
+			let manifest = createManifest(['x-0'], 'hrw');
+			for (let i = 2; i <= 8; i++) {
+				manifest = withCurrentTopology(
+					manifest,
+					Array.from({ length: i }, (_, index) => `x-${index}`),
+					'hrw'
+				);
+			}
+			await savePlacementManifest(kv, manifest);
+			resetPlacementState();
+
+			const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+			initialize({ kv, shards, strategy: 'hash', placement: 'computed', disableAutoMigration: true, hashShardMappings: false });
+
+			await expect(first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1'])).rejects.toMatchObject({ code: 'TOO_MANY_EPOCHS' });
+			expect(await kv.get('collegedb:placement:manifest', 'json')).toEqual(manifest);
+		});
+	});
+
+	describe('with two clients over one KV', () => {
+		const flags = {
+			strategy: 'hash',
+			placement: 'computed',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		} as const;
+
+		/** Runs `work` as a second isolate: its own empty placement cache, then restores the caller's. */
+		async function asOtherClient<T>(work: () => Promise<T>): Promise<T> {
+			const mine = swapPlacementCache();
+			try {
+				return await work();
+			} finally {
+				swapPlacementCache(mine);
+			}
+		}
+
+		beforeEach(() => {
+			vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('lands a write from the older epoch on an owner the newer client still finds', async () => {
+			const kv = createInMemoryKVProvider();
+			const all = await makeShards(['db-a', 'db-b', 'db-c', 'db-d']);
+			const older = ['db-a', 'db-b', 'db-c'];
+			const newer = Object.keys(all);
+
+			initialize({ kv, shards: Object.fromEntries(older.map((name) => [name, all[name]!])), ...flags });
+			for (const name of newer) {
+				await all[name]!.prepare(SCHEMA).run();
+			}
+			await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+
+			// client B adds db-d and publishes epoch 2 while A keeps epoch 1 cached
+			const published = await asOtherClient(async () => {
+				const stored = await loadPlacementManifest(kv, undefined, { fresh: true });
+				const next = withCurrentTopology(stored!, newer, 'hrw');
+				await savePlacementManifest(kv, next);
+				return next;
+			});
+			expect(published.epochs).toHaveLength(2);
+
+			let key = '';
+			for (let i = 0; i < 1000 && key === ''; i++) {
+				if (hrwShard(`user-${i}`, newer) === 'db-d') key = `user-${i}`;
+			}
+			expect(key).not.toBe('');
+			const owner = hrwShard(key, older);
+
+			await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, 'Ada']);
+			expect(await countShard(owner, 'users')).toBe(1);
+			expect(candidateShards(key, published, newer)).toContain(owner);
+
+			resetConfig();
+			initialize({ kv, shards: all, ...flags });
+			expect(await first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key])).toMatchObject({ name: 'Ada' });
+		});
+
+		it('adopts the exception another client published once its own manifest copy expires', async () => {
+			const kv = createInMemoryKVProvider();
+			const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+			const names = Object.keys(shards);
+			initialize({ kv, shards, ...flags });
+			for (const name of names) {
+				await runShard(name, SCHEMA);
+			}
+
+			const key = 'user-9';
+			const target = names.find((name) => name !== hrwShard(key, names))!;
+			await shards[target]!.prepare('INSERT INTO users (id, name) VALUES (?, ?)').bind(key, 'Ada').run();
+			const read = () => first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key]);
+			expect(await read()).toBeFalsy();
+
+			await asOtherClient(async () => {
+				const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+				await mapper.setShardMapping(key, target);
+				const stored = await loadPlacementManifest(kv, undefined, { fresh: true });
+				await addPlacementException(kv, stored!, await mapper.hashKey(key));
+			});
+
+			expect(await read()).toBeFalsy();
+			await vi.advanceTimersByTimeAsync(11_000);
+			expect(await read()).toMatchObject({ name: 'Ada' });
+		});
+
+		it('does not overwrite a newer epoch when it records an exception from a stale manifest', async () => {
+			const kv = createInMemoryKVProvider();
+			const all = await makeShards(['db-a', 'db-b', 'db-c', 'db-d']);
+			const pick = (names: string[]) => Object.fromEntries(names.map((name) => [name, all[name]!]));
+			for (const shard of Object.values(all)) {
+				await shard.prepare(SCHEMA).run();
+			}
+
+			// A starts on two shards, then runs on three, so it holds two epochs
+			initialize({ kv, shards: pick(['db-a', 'db-b']), ...flags });
+			await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+			initialize({ kv, shards: pick(['db-a', 'db-b', 'db-c']), ...flags });
+			await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+
+			let key = '';
+			for (let i = 0; i < 1000 && key === ''; i++) {
+				const candidate = `user-${i}`;
+				if (hrwShard(candidate, ['db-a', 'db-b']) !== hrwShard(candidate, ['db-a', 'db-b', 'db-c'])) key = candidate;
+			}
+			expect(key).not.toBe('');
+			await all[hrwShard(key, ['db-a', 'db-b'])]!.prepare('INSERT INTO users (id, name) VALUES (?, ?)').bind(key, 'Ada').run();
+
+			// client B publishes epoch 3 before A records anything
+			await asOtherClient(async () => {
+				const stored = await loadPlacementManifest(kv, undefined, { fresh: true });
+				await savePlacementManifest(kv, withCurrentTopology(stored!, Object.keys(all), 'hrw'));
+			});
+
+			// A finds the key through the walk and memoizes it as an exception
+			expect(await first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key])).toMatchObject({ name: 'Ada' });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const stored = await asOtherClient(() => loadPlacementManifest(kv, undefined, { fresh: true }));
+			expect(stored!.epochs.map((epoch) => epoch.n)).toEqual([3, 2, 1]);
+			expect(stored!.exceptionsVersion).toBe(1);
+		});
+	});
+});
+
+describe('Writes after a topology change', () => {
+	const PROBE = /SELECT 1 AS found/;
+
+	afterEach(() => {
+		resetConfig();
+		resetPlacementState();
+	});
+
+	interface Grown {
+		kv: KVStorage;
+		base: Record<string, SQLDatabase>;
+		log: string[];
+		moved: string[];
+		stayed: string[];
+		boot: (extra?: Record<string, unknown>) => void;
+	}
+
+	function recorded(db: SQLDatabase, log: string[]): SQLDatabase {
+		return {
+			...db,
+			prepare: (sql: string) => {
+				log.push(sql);
+				return db.prepare(sql);
+			}
+		} as SQLDatabase;
+	}
+
+	/** Two shards fill up, then a third joins, so some keys compute a new owner without moving. */
+	async function grow(extra: Record<string, unknown> = {}, count = 40): Promise<Grown> {
+		const kv = countingKV(createInMemoryKVProvider()).kv;
+		const base: Record<string, SQLDatabase> = {};
+		for (const name of ['db-a', 'db-b', 'db-c']) {
+			const raw = openNodeSqlite();
+			raw.exec(SCHEMA);
+			base[name] = createNodeSqliteProvider(raw);
+		}
+
+		const log: string[] = [];
+		const boot = (more: Record<string, unknown> = {}) => {
+			resetConfig();
+			resetPlacementState();
+			const names = more.names as string[];
+			delete more.names;
+			initialize({
+				kv,
+				shards: Object.fromEntries(names.map((name) => [name, recorded(base[name]!, log)])),
+				strategy: 'hash',
+				placement: 'computed',
+				disableAutoMigration: true,
+				hashShardMappings: false,
+				...extra,
+				...more
+			});
+		};
+
+		boot({ names: ['db-a', 'db-b'] });
+		const keys = Array.from({ length: count }, (_, i) => `user-${i}`);
+		for (const key of keys) {
+			await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, `name of ${key}`]);
+		}
+
+		boot({ names: ['db-a', 'db-b', 'db-c'] });
+		await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+
+		const moved = keys.filter((key) => hrwShard(key, ['db-a', 'db-b']) !== hrwShard(key, ['db-a', 'db-b', 'db-c']));
+		const stayed = keys.filter((key) => !moved.includes(key));
+		expect(moved.length).toBeGreaterThan(2);
+		expect(stayed.length).toBeGreaterThan(2);
+
+		log.length = 0;
+		return { kv, base, log, moved, stayed, boot };
+	}
+
+	async function holdersOf(world: Grown, key: string, table = 'users', column = 'id'): Promise<string[]> {
+		const found: string[] = [];
+		for (const [name, db] of Object.entries(world.base)) {
+			const result = await db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${column} = ?`).bind(key).all<{ c: number }>();
+			if (Number(result.results[0]?.c ?? 0) > 0) found.push(name);
+		}
+		return found;
+	}
+
+	async function nameOf(world: Grown, key: string): Promise<string | undefined> {
+		for (const db of Object.values(world.base)) {
+			const row = await db.prepare('SELECT name FROM users WHERE id = ?').bind(key).first<{ name: string }>();
+			if (row) return row.name;
+		}
+		return undefined;
+	}
+
+	const oldOwner = (key: string) => hrwShard(key, ['db-a', 'db-b']);
+
+	it('updates an old-epoch key that was never read, on the shard that holds the row', async () => {
+		const world = await grow();
+
+		for (const key of world.moved) {
+			const result = await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['changed', key]);
+			expect(result.meta.changes).toBe(1);
+			expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+			expect(await nameOf(world, key)).toBe('changed');
+		}
+	});
+
+	it('deletes an old-epoch key that was never read and says one row went', async () => {
+		const world = await grow();
+
+		for (const key of world.moved) {
+			const result = await run(key, 'DELETE FROM users WHERE id = ?', [key]);
+			expect(result.meta.changes).toBe(1);
+			expect(await holdersOf(world, key)).toEqual([]);
+		}
+	});
+
+	it('reports zero changed rows for a key that no shard holds, after walking every epoch', async () => {
+		const world = await grow();
+		const ghost = world.moved[0]! + '-ghost';
+		const walkers = [ghost, ...Array.from({ length: 200 }, (_, i) => `ghost-${i}`)].filter(
+			(key) => hrwShard(key, ['db-a', 'db-b']) !== hrwShard(key, ['db-a', 'db-b', 'db-c'])
+		);
+		const key = walkers[0]!;
+
+		const updated = await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['x', key]);
+		expect(updated.meta.changes).toBe(0);
+		expect(world.log.filter((sql) => PROBE.test(sql))).toHaveLength(2);
+
+		world.log.length = 0;
+		const deleted = await run(key, 'DELETE FROM users WHERE id = ?', [key]);
+		expect(deleted.meta.changes).toBe(0);
+		expect(world.log.filter((sql) => PROBE.test(sql))).toHaveLength(2);
+	});
+
+	it('sends a new key to the newest epoch owner', async () => {
+		const world = await grow();
+		const key = Array.from({ length: 400 }, (_, i) => `fresh-${i}`).find(
+			(candidate) => hrwShard(candidate, ['db-a', 'db-b']) !== hrwShard(candidate, ['db-a', 'db-b', 'db-c'])
+		)!;
+
+		await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, 'new']);
+
+		expect(await holdersOf(world, key)).toEqual([hrwShard(key, ['db-a', 'db-b', 'db-c'])]);
+	});
+
+	it('updates the existing row on an upsert of an old-epoch key and leaves one physical row', async () => {
+		const world = await grow();
+
+		for (const key of world.moved) {
+			await upsert(key, 'users', { id: key, name: 'upserted' }, 'id');
+			expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+			expect(await nameOf(world, key)).toBe('upserted');
+		}
+	});
+
+	it('does not create a second row for an INSERT OR REPLACE of an old-epoch key', async () => {
+		const world = await grow();
+		const key = world.moved[0]!;
+
+		await insertInto(key, 'users', { id: key, name: 'replaced' }, { orReplace: true });
+
+		expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+		expect(await nameOf(world, key)).toBe('replaced');
+	});
+
+	it('refuses a plain INSERT of an old-epoch key with the constraint error and keeps one row', async () => {
+		const world = await grow();
+		const key = world.moved[0]!;
+
+		await expect(run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, 'dup'])).rejects.toThrow(/UNIQUE|constraint/i);
+
+		expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+	});
+
+	it('resolves updateRow, patch, deleteRow, deleteById and query writes through the same walk', async () => {
+		const world = await grow();
+		const [a, b, c, d, e] = world.moved;
+
+		expect((await updateRow(a!, 'users', { name: 'u' }, { id: a! })).meta.changes).toBe(1);
+		expect((await patch(b!, 'users', b!, { name: 'p' })).meta.changes).toBe(1);
+		expect((await deleteRow(c!, 'users', { id: c! })).meta.changes).toBe(1);
+		expect((await deleteById(d!, 'users', d!)).meta.changes).toBe(1);
+		expect((await query('UPDATE users SET name = ? WHERE id = ?', ['q', e!])).meta.changes).toBe(1);
+
+		expect(await nameOf(world, a!)).toBe('u');
+		expect(await nameOf(world, b!)).toBe('p');
+		expect(await nameOf(world, e!)).toBe('q');
+		expect(await holdersOf(world, c!)).toEqual([]);
+		expect(await holdersOf(world, d!)).toEqual([]);
+	});
+
+	it('reads back an insertReturning of an old-epoch key from the shard that holds it', async () => {
+		const world = await grow();
+		const key = world.moved[0]!;
+
+		const row = await insertReturning<{ name: string }>(key, 'users', { id: key, name: 'again' }, { orReplace: true });
+
+		expect(row).toMatchObject({ name: 'again' });
+		expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+	});
+
+	it('keeps a write statement sent through all() off a shard that does not hold the row', async () => {
+		const world = await grow();
+		const key = world.moved[0]!;
+
+		const result = await all<{ id: string }>(key, 'INSERT OR REPLACE INTO users (id, name) VALUES (?, ?) RETURNING id', [key, 'via all']);
+
+		expect(result.results).toEqual([{ id: key }]);
+		expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+		expect(await nameOf(world, key)).toBe('via all');
+	});
+
+	it('memoizes the exception so the second write on the key does no walk', async () => {
+		const world = await grow();
+		const key = world.moved[0]!;
+
+		await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['one', key]);
+		expect(world.log.filter((sql) => PROBE.test(sql))).toHaveLength(2);
+
+		world.log.length = 0;
+		await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['two', key]);
+
+		expect(world.log).toEqual(['UPDATE users SET name = ? WHERE id = ?']);
+		expect(await nameOf(world, key)).toBe('two');
+	});
+
+	it('probes a key whose owner did not change once, and not at all when every epoch agrees', async () => {
+		const world = await grow();
+		const key = world.stayed[0]!;
+
+		await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['same', key]);
+
+		expect(world.log).toEqual(['UPDATE users SET name = ? WHERE id = ?']);
+	});
+
+	it('finds the row over the in-memory provider too', async () => {
+		const kv = createInMemoryKVProvider();
+		const shards = await makeShards(['db-a', 'db-b', 'db-c']);
+		const open = (names: string[]) => {
+			resetConfig();
+			resetPlacementState();
+			initialize({
+				kv,
+				shards: Object.fromEntries(names.map((name) => [name, shards[name]!])),
+				strategy: 'hash',
+				placement: 'computed',
+				disableAutoMigration: true,
+				hashShardMappings: false
+			});
+		};
+		open(['db-a', 'db-b', 'db-c']);
+		for (const name of Object.keys(shards)) {
+			await runShard(name, SCHEMA);
+		}
+
+		open(['db-a', 'db-b']);
+		const key = Array.from({ length: 200 }, (_, i) => `user-${i}`).find(
+			(candidate) => hrwShard(candidate, ['db-a', 'db-b']) !== hrwShard(candidate, ['db-a', 'db-b', 'db-c'])
+		)!;
+		await run(key, 'INSERT INTO users (id, name) VALUES (?, ?)', [key, 'Ada']);
+
+		open(['db-a', 'db-b', 'db-c']);
+		const result = await run(key, 'UPDATE users SET name = ? WHERE id = ?', ['Grace', key]);
+
+		expect(result.meta.changes).toBe(1);
+		expect(await first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key])).toMatchObject({ name: 'Grace' });
+		expect((await runShard<{ c: number }>('db-c', 'SELECT COUNT(*) AS c FROM users')).results[0]?.c).toBe(0);
+	});
+
+	it('groups a batch by the shard that holds each row', async () => {
+		const world = await grow();
+		const keys = [...world.moved.slice(0, 3), ...world.stayed.slice(0, 3)];
+
+		const groups = await batch(keys.map((key) => ({ key, sql: 'UPDATE users SET name = ? WHERE id = ?', bindings: ['batched', key] })));
+
+		expect(groups.every((group) => group.error === undefined)).toBe(true);
+		for (const key of keys) {
+			expect(await nameOf(world, key)).toBe('batched');
+			expect(await holdersOf(world, key)).toHaveLength(1);
+		}
+
+		const changed = groups.reduce((sum, group) => sum + group.results.reduce((n, result) => n + Number(result.meta.changes ?? 0), 0), 0);
+		expect(changed).toBe(keys.length);
+		for (const group of groups) {
+			for (const index of group.indices) {
+				expect(await holdersOf(world, keys[index]!)).toEqual([group.shard]);
+			}
+		}
+	});
+
+	it('refuses to guess when the table has no key column and names keyColumns', async () => {
+		const world = await grow();
+		for (const db of Object.values(world.base)) {
+			await db.prepare('CREATE TABLE tags (tag TEXT PRIMARY KEY, note TEXT)').run();
+		}
+		const key = world.moved[0]!;
+		await world.base[oldOwner(key)]!.prepare('INSERT INTO tags (tag, note) VALUES (?, ?)').bind(key, 'old').run();
+
+		await expect(run(key, 'UPDATE tags SET note = ? WHERE tag = ?', ['new', key])).rejects.toMatchObject({
+			code: 'WRITE_UNRESOLVED',
+			message: /keyColumns/
+		});
+
+		world.boot({ names: ['db-a', 'db-b', 'db-c'], keyColumns: { tags: 'tag' } });
+		const result = await run(key, 'UPDATE tags SET note = ? WHERE tag = ?', ['new', key]);
+		expect(result.meta.changes).toBe(1);
+		expect(await holdersOf(world, key, 'tags', 'tag')).toEqual([oldOwner(key)]);
+	});
+
+	it('keeps the journal fence and tombstone path when the builder resolves first', async () => {
+		const world = await grow({ journalShard: 'db-a' });
+		const key = world.moved[0]!;
+
+		expect((await updateRow(key, 'users', { name: 'journaled' }, { id: key })).meta.changes).toBe(1);
+		await upsert(key, 'users', { id: key, name: 'journaled again' }, 'id');
+
+		expect(await holdersOf(world, key)).toEqual([oldOwner(key)]);
+		expect(await nameOf(world, key)).toBe('journaled again');
+	});
+
+	describe('on a single epoch', () => {
+		async function statements(extra: Record<string, unknown>): Promise<string[]> {
+			const log: string[] = [];
+			const shards = Object.fromEntries(
+				['db-a', 'db-b'].map((name) => {
+					const raw = openNodeSqlite();
+					raw.exec(SCHEMA);
+					return [name, recorded(createNodeSqliteProvider(raw), log)];
+				})
+			);
+			initialize({
+				kv: createInMemoryKVProvider(),
+				shards,
+				strategy: 'hash',
+				disableAutoMigration: true,
+				hashShardMappings: false,
+				...extra
+			});
+			await first('warm', 'SELECT * FROM users WHERE id = ?', ['warm']);
+			log.length = 0;
+
+			await run('k1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['k1', 'a']);
+			await run('k1', 'UPDATE users SET name = ? WHERE id = ?', ['b', 'k1']);
+			await upsert('k1', 'users', { id: 'k1', name: 'c' }, 'id');
+			await updateRow('k1', 'users', { name: 'd' }, { id: 'k1' });
+			await deleteById('k1', 'users', 'k1');
+			await batch([{ key: 'k2', sql: 'INSERT INTO users (id, name) VALUES (?, ?)', bindings: ['k2', 'z'] }]);
+			return log;
+		}
+
+		it('issues exactly the write statements and nothing else under computed placement', async () => {
+			const log = await statements({ placement: 'computed' });
+
+			expect(log.filter((sql) => PROBE.test(sql))).toHaveLength(0);
+			expect(log).toHaveLength(5);
+		});
+
+		it('issues exactly the write statements and nothing else under kv placement', async () => {
+			const log = await statements({ placement: 'kv' });
+
+			expect(log.filter((sql) => PROBE.test(sql))).toHaveLength(0);
+			expect(log).toHaveLength(5);
+		});
+
+		it('costs no KV operation per write once the manifest is held', async () => {
+			const { kv, counts } = countingKV(createInMemoryKVProvider());
+			const shards = Object.fromEntries(
+				['db-a', 'db-b'].map((name) => {
+					const raw = openNodeSqlite();
+					raw.exec(SCHEMA);
+					return [name, createNodeSqliteProvider(raw)];
+				})
+			);
+			initialize({ kv, shards, strategy: 'hash', placement: 'computed', disableAutoMigration: true, hashShardMappings: false });
+			await run('k0', 'INSERT INTO users (id, name) VALUES (?, ?)', ['k0', 'a']);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			const settled = { get: counts.get, put: counts.put };
+
+			for (let i = 1; i <= 10; i++) {
+				await run(`k${i}`, 'INSERT INTO users (id, name) VALUES (?, ?)', [`k${i}`, 'a']);
+				await run(`k${i}`, 'UPDATE users SET name = ? WHERE id = ?', ['b', `k${i}`]);
+			}
+
+			expect({ get: counts.get, put: counts.put }).toEqual(settled);
+		});
 	});
 });
 

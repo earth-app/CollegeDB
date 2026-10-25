@@ -43,7 +43,7 @@ export type ColumnValues = Record<string, unknown>;
  * Options accepted by {@link buildInsert}.
  */
 export interface BuildInsertOptions {
-	/** Dialect of the target shard, used to quote identifiers @since 1.4.0 */
+	/** Dialect of the target shard, used to quote identifiers @since 1.3.0 */
 	dialect?: SQLDialect;
 	/** Emit `INSERT OR REPLACE` (SQLite) instead of a plain `INSERT` */
 	orReplace?: boolean;
@@ -57,7 +57,7 @@ export interface BuildInsertOptions {
  * Options accepted by {@link buildUpsert}.
  */
 export interface BuildUpsertOptions {
-	/** Dialect of the target shard, used to quote identifiers @since 1.4.0 */
+	/** Dialect of the target shard, used to quote identifiers @since 1.3.0 */
 	dialect?: SQLDialect;
 	/**
 	 * Columns to overwrite on conflict. Defaults to every inserted column that
@@ -130,7 +130,7 @@ export function quoteIdentifier(identifier: string, dialect?: SQLDialect): strin
  * @param identifier - Table or column name (may be `schema.name`)
  * @returns The validated identifier parts
  * @throws {CollegeDBError} If the identifier is empty or not a bare SQL identifier
- * @since 1.4.0
+ * @since 1.3.0
  */
 export function validateIdentifier(identifier: string): string[] {
 	const trimmed = identifier.trim();
@@ -313,10 +313,55 @@ export function buildDelete(table: string, where: ColumnValues, options: { diale
 }
 
 /**
- * Builds an "upsert" using the SQLite/PostgreSQL `ON CONFLICT ... DO UPDATE`
- * form. On conflict for `conflictColumns`, the listed `update` columns (or all
+ * Builds the conflict clause of an upsert, from the leading space to the end.
+ * @private
+ */
+function buildUpsertTail(values: ColumnValues, conflictColumns: string | string[], options: BuildUpsertOptions): string {
+	const conflicts = (Array.isArray(conflictColumns) ? conflictColumns : [conflictColumns]).filter((column) => column.trim().length > 0);
+	if (conflicts.length === 0) {
+		throw new CollegeDBError('At least one conflict column is required for upsert', 'EMPTY_CONFLICT');
+	}
+
+	const conflictSet = new Set(conflicts.map((column) => column.trim()));
+	const updateColumns = (options.update ?? definedEntries(values).map(([column]) => column)).filter((column) => !conflictSet.has(column));
+
+	// MySQL names no conflict target, but the columns are still validated and quoted
+	const conflictClause = conflicts.map((column) => quoteIdentifier(column, options.dialect)).join(', ');
+	const returning = buildReturningClause(options.returning, options.dialect);
+
+	if (options.dialect === 'mysql') {
+		// VALUES() is the one form MySQL and MariaDB both accept; the row alias is MySQL only
+		const assignments =
+			updateColumns.length === 0
+				? [`${quoteIdentifier(conflicts[0]!, options.dialect)} = ${quoteIdentifier(conflicts[0]!, options.dialect)}`]
+				: updateColumns.map(
+						(column) => `${quoteIdentifier(column, options.dialect)} = VALUES(${quoteIdentifier(column, options.dialect)})`
+					);
+		return ` ON DUPLICATE KEY UPDATE ${assignments.join(', ')}${returning}`;
+	}
+
+	if (updateColumns.length === 0) {
+		// Nothing to overwrite; degrade to DO NOTHING so the insert stays idempotent.
+		return ` ON CONFLICT (${conflictClause}) DO NOTHING${returning}`;
+	}
+
+	const assignments = updateColumns.map((column) => {
+		const quoted = quoteIdentifier(column, options.dialect);
+		return `${quoted} = excluded.${quoted}`;
+	});
+
+	return ` ON CONFLICT (${conflictClause}) DO UPDATE SET ${assignments.join(', ')}${returning}`;
+}
+
+/**
+ * Builds an "upsert". SQLite and PostgreSQL get `ON CONFLICT ... DO UPDATE`:
+ * on conflict for `conflictColumns`, the listed `update` columns (or all
  * non-conflict columns by default) are overwritten with the incoming values
- * via the `excluded` pseudo-row.
+ * via the `excluded` pseudo-row. MySQL and MariaDB get
+ * `ON DUPLICATE KEY UPDATE col = VALUES(col)`, which reacts to a conflict on any
+ * unique key of the table, so `conflictColumns` should name the primary key or
+ * the unique key you mean. MySQL and MariaDB report 2 affected rows when the
+ * update changed the row, 1 for an insert, and 0 when nothing changed.
  *
  * @param table - Target table name
  * @param values - Column to value map for the row to insert
@@ -337,34 +382,400 @@ export function buildUpsert(
 	conflictColumns: string | string[],
 	options: BuildUpsertOptions = {}
 ): BuiltQuery {
-	const conflicts = (Array.isArray(conflictColumns) ? conflictColumns : [conflictColumns]).filter((column) => column.trim().length > 0);
-	if (conflicts.length === 0) {
-		throw new CollegeDBError('At least one conflict column is required for upsert', 'EMPTY_CONFLICT');
-	}
-
+	const tail = buildUpsertTail(values, conflictColumns, options);
 	const insert = buildInsert(table, values, { dialect: options.dialect });
-	const conflictSet = new Set(conflicts.map((column) => column.trim()));
 
-	const updateColumns = (options.update ?? definedEntries(values).map(([column]) => column)).filter((column) => !conflictSet.has(column));
+	return { sql: `${insert.sql}${tail}`, bindings: insert.bindings };
+}
 
-	const conflictClause = conflicts.map((column) => quoteIdentifier(column, options.dialect)).join(', ');
-	const returning = buildReturningClause(options.returning, options.dialect);
+/**
+ * Dialects the migration journal protocol has been proven on.
+ *
+ * SQLite includes D1 and a binding with no declared dialect. MySQL covers
+ * MariaDB, which shares the dialect value and passed the same race. Each has a
+ * concurrency test with a control arm behind it; a journal move on any other
+ * dialect is refused. Postgres and MySQL writes are only safe when router
+ * builder writes run through `runGuardedWrite`, which takes the key lock.
+ * @since 1.4.0
+ */
+export const PROVEN_JOURNAL_DIALECTS: readonly SQLDialect[] = ['sqlite', 'postgres', 'mysql'];
 
-	if (updateColumns.length === 0) {
-		// Nothing to overwrite; degrade to DO NOTHING so the insert stays idempotent.
-		return {
-			sql: `${insert.sql} ON CONFLICT (${conflictClause}) DO NOTHING${returning}`,
-			bindings: insert.bindings
-		};
+/**
+ * Whether a shard's dialect is covered by {@link PROVEN_JOURNAL_DIALECTS}.
+ * An unset dialect is read as SQLite, matching how identifiers are quoted.
+ * @since 1.4.0
+ */
+export function isProvenJournalDialect(dialect?: SQLDialect): boolean {
+	return PROVEN_JOURNAL_DIALECTS.includes(dialect ?? 'sqlite');
+}
+
+/** Name of the shard-local tombstone and archive table. @since 1.4.0 */
+export const RETIRED_TABLE = 'collegedb_retired';
+
+/** Name of the shard-local topology fence table. @since 1.4.0 */
+export const TOPOLOGY_TABLE = 'collegedb_topology';
+
+/**
+ * Null-safe equality of a quoted column against one bound value: SQLite `IS`,
+ * Postgres `IS NOT DISTINCT FROM`, MySQL `<=>`.
+ * @since 1.4.0
+ */
+export function nullSafeEquals(quotedColumn: string, dialect?: SQLDialect): string {
+	if (dialect === 'postgres') {
+		return `${quotedColumn} IS NOT DISTINCT FROM ?`;
 	}
+	return dialect === 'mysql' ? `${quotedColumn} <=> ?` : `${quotedColumn} IS ?`;
+}
 
-	const assignments = updateColumns.map((column) => {
-		const quoted = quoteIdentifier(column, options.dialect);
-		return `${quoted} = excluded.${quoted}`;
-	});
+/**
+ * Builds an insert that ignores a duplicate key instead of failing.
+ * @since 1.4.0
+ */
+export function buildInsertIgnore(table: string, values: ColumnValues, dialect?: SQLDialect): BuiltQuery {
+	const entries = definedEntries(values);
+	const columns = entries.map(([column]) => quoteIdentifier(column, dialect)).join(', ');
+	const placeholders = entries.map(() => '?').join(', ');
+	const target = `INTO ${quoteIdentifier(table, dialect)} (${columns}) VALUES (${placeholders})`;
+	const bindings = entries.map(([, value]) => value);
+
+	if (dialect === 'postgres') {
+		return { sql: `INSERT ${target} ON CONFLICT DO NOTHING`, bindings };
+	}
+	return { sql: `${dialect === 'mysql' ? 'INSERT IGNORE' : 'INSERT OR IGNORE'} ${target}`, bindings };
+}
+
+/**
+ * Identifies the tombstone a guarded write must not run past.
+ * @since 1.4.0
+ */
+export interface TombstoneGuard {
+	/** Journal scope */
+	scope: string;
+	/** Table the write targets, as the journal recorded it */
+	table: string;
+	/** Routing key of the record */
+	key: string;
+	/** Writer's topology generation; the fence compares it with `min_generation` */
+	generation?: number;
+}
+
+/** Name of the lock-stripe table MySQL and MariaDB writers take row locks on. @since 1.4.0 */
+export const LOCK_STRIPES_TABLE = 'collegedb_lock_stripes';
+
+/** Number of key stripes in {@link LOCK_STRIPES_TABLE}. @since 1.4.0 */
+export const LOCK_STRIPES = 256;
+
+/** Row of {@link LOCK_STRIPES_TABLE} that the fence lock uses, beside the key stripes. @since 1.4.0 */
+export const FENCE_STRIPE = LOCK_STRIPES;
+
+/** Advisory lock id of the fence on Postgres. @private */
+const FENCE_LOCK_ID = '4172601337920511817';
+
+/**
+ * 64-bit FNV-1a over scope, table and key.
+ * @private
+ */
+function keyLockHash(guard: TombstoneGuard): bigint {
+	let hash = 0xcbf29ce484222325n;
+	for (const byte of new TextEncoder().encode(`${guard.scope}\0${guard.table}\0${guard.key}`)) {
+		hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100000001b3n);
+	}
+	return hash;
+}
+
+/**
+ * Builds the statements that serialize one key's cutover and writes. They are
+ * empty on a dialect that needs none.
+ *
+ * Statement snapshots alone leave a window on Postgres and MySQL: a guarded
+ * insert can read "no tombstone" before the cutover commits and insert after
+ * the row is deleted. Both sides run these statements first, inside their own
+ * transaction, so the second one waits for the first to commit and then reads
+ * the committed state. Postgres takes `pg_advisory_xact_lock` on a hash of the
+ * key, after pinning the transaction to READ COMMITTED: under REPEATABLE READ
+ * the snapshot is taken at the lock statement, before the wait, and the
+ * concurrency test shows ghost rows and lost acknowledged writes there. MySQL
+ * and MariaDB lock one of {@link LOCK_STRIPES} rows with `SELECT ... FOR
+ * UPDATE`; the row lock lasts until commit, where a named lock would have to be
+ * released by hand after it. SQLite and D1 serialize writers and need nothing.
+ *
+ * @param guard - Scope, table and key of the record
+ * @param dialect - Dialect of the shard the transaction runs on
+ * @returns The statements to run first in the transaction, in order
+ * @since 1.4.0
+ */
+export function buildWriteLock(guard: TombstoneGuard, dialect?: SQLDialect): BuiltQuery[] {
+	if (dialect === 'postgres') {
+		return [
+			{ sql: 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', bindings: [] },
+			{ sql: 'SELECT pg_advisory_xact_lock(CAST(? AS bigint))', bindings: [BigInt.asIntN(64, keyLockHash(guard)).toString()] }
+		];
+	}
+	if (dialect === 'mysql') {
+		return [
+			{
+				sql: `SELECT stripe FROM ${LOCK_STRIPES_TABLE} WHERE stripe = ? FOR UPDATE`,
+				bindings: [Number(keyLockHash(guard) % BigInt(LOCK_STRIPES))]
+			}
+		];
+	}
+	return [];
+}
+
+/**
+ * Builds the lock that orders a fence raise against in-flight writers on
+ * Postgres, MySQL and MariaDB.
+ *
+ * A guarded insert checks the fence in its own statement, so a writer that read
+ * the old fence can still commit after the raise and the census that follows it,
+ * and the census then misses its row. Writers take this lock in `shared` mode
+ * inside their transaction, and the raise takes it `exclusive` inside its own.
+ * The raise waits for writers already in flight and holds back the ones that
+ * come after, so a writer either commits before the raise or reads the new fence.
+ * Postgres uses an advisory lock; MySQL and MariaDB lock {@link FENCE_STRIPE}
+ * with `LOCK IN SHARE MODE` or `FOR UPDATE`, the one form both engines accept.
+ * SQLite and D1 serialize writers and need nothing.
+ *
+ * @param mode - `shared` for a writer, `exclusive` for the raise
+ * @param dialect - Dialect of the shard the transaction runs on
+ * @returns The statements to run in the transaction after any isolation statement
+ * @since 1.4.0
+ */
+export function buildFenceLock(mode: 'shared' | 'exclusive', dialect?: SQLDialect): BuiltQuery[] {
+	if (dialect === 'postgres') {
+		return [{ sql: `SELECT pg_advisory_xact_lock${mode === 'shared' ? '_shared' : ''}(CAST(? AS bigint))`, bindings: [FENCE_LOCK_ID] }];
+	}
+	if (dialect === 'mysql') {
+		return [
+			{
+				sql: `SELECT stripe FROM ${LOCK_STRIPES_TABLE} WHERE stripe = ? ${mode === 'shared' ? 'LOCK IN SHARE MODE' : 'FOR UPDATE'}`,
+				bindings: [FENCE_STRIPE]
+			}
+		];
+	}
+	return [];
+}
+
+/**
+ * The shared tail of a guarded insert: a `WHERE` that fails when this shard
+ * holds a tombstone for the key or when the topology fence is above the
+ * writer's generation.
+ * @private
+ */
+function buildTombstoneGuard(guard: TombstoneGuard, dialect?: SQLDialect): BuiltQuery {
+	const retired = quoteIdentifier(RETIRED_TABLE, dialect);
+	const topology = quoteIdentifier(TOPOLOGY_TABLE, dialect);
+	const cols = (name: string) => quoteIdentifier(name, dialect);
 
 	return {
-		sql: `${insert.sql} ON CONFLICT (${conflictClause}) DO UPDATE SET ${assignments.join(', ')}${returning}`,
-		bindings: insert.bindings
+		sql:
+			`NOT EXISTS (SELECT 1 FROM ${retired} WHERE ${cols('scope')} = ? AND ${cols('table_name')} = ? AND ${cols('primary_key')} = ?) ` +
+			`AND (SELECT COALESCE(MAX(${cols('min_generation')}), 0) FROM ${topology}) <= ?`,
+		bindings: [guard.scope, guard.table, guard.key, guard.generation ?? 0]
+	};
+}
+
+/**
+ * Builds an `INSERT ... SELECT ... WHERE NOT EXISTS (tombstone)` so the tombstone
+ * check and the write are one statement and cannot race a cutover.
+ *
+ * Zero rows inserted means a tombstone, a raised fence, or (with `orIgnore`) a
+ * genuine conflict. MySQL needs `FROM DUAL` for a `SELECT` with a `WHERE`.
+ *
+ * @param table - Target table
+ * @param values - Column to value map for the new row
+ * @param guard - The tombstone and fence the write must clear
+ * @param options - Insert modifiers
+ * @returns The parameterized SQL and its bindings
+ * @since 1.4.0
+ */
+export function buildGuardedInsert(
+	table: string,
+	values: ColumnValues,
+	guard: TombstoneGuard,
+	options: BuildInsertOptions = {}
+): BuiltQuery {
+	const entries = definedEntries(values);
+	if (entries.length === 0) {
+		throw new CollegeDBError('At least one column value is required for INSERT', 'EMPTY_INSERT');
+	}
+
+	const columns = entries.map(([column]) => quoteIdentifier(column, options.dialect));
+	const placeholders = entries.map(() => '?').join(', ');
+	const prefix = options.orReplace ? 'INSERT OR REPLACE' : options.orIgnore ? 'INSERT OR IGNORE' : 'INSERT';
+	const fence = buildTombstoneGuard(guard, options.dialect);
+	const dual = options.dialect === 'mysql' ? ' FROM DUAL' : '';
+
+	return {
+		sql:
+			`${prefix} INTO ${quoteIdentifier(table, options.dialect)} (${columns.join(', ')}) ` +
+			`SELECT ${placeholders}${dual} WHERE ${fence.sql}${buildReturningClause(options.returning, options.dialect)}`,
+		bindings: [...entries.map(([, value]) => value), ...fence.bindings]
+	};
+}
+
+/**
+ * Builds the guarded form of {@link buildUpsert}. The select ends in a `WHERE`,
+ * which SQLite requires before `ON CONFLICT` so the parser does not read `ON`
+ * as a join constraint.
+ *
+ * @param table - Target table
+ * @param values - Column to value map for the row
+ * @param conflictColumns - Column(s) forming the conflict target
+ * @param guard - The tombstone and fence the write must clear
+ * @param options - Upsert modifiers
+ * @returns The parameterized SQL and its bindings
+ * @since 1.4.0
+ */
+export function buildGuardedUpsert(
+	table: string,
+	values: ColumnValues,
+	conflictColumns: string | string[],
+	guard: TombstoneGuard,
+	options: BuildUpsertOptions = {}
+): BuiltQuery {
+	const tail = buildUpsertTail(values, conflictColumns, options);
+	const insert = buildGuardedInsert(table, values, guard, { dialect: options.dialect });
+
+	return { sql: `${insert.sql}${tail}`, bindings: insert.bindings };
+}
+
+/**
+ * The statements that make a shard able to hold tombstones and archives.
+ * @since 1.4.0
+ */
+export function buildShardSidecarSchema(dialect?: SQLDialect): string[] {
+	const key = dialect === 'mysql' ? 'VARCHAR(190)' : 'TEXT';
+	const long = dialect === 'mysql' ? 'LONGTEXT' : 'TEXT';
+	const int = dialect === 'sqlite' || dialect === undefined ? 'INTEGER' : 'BIGINT';
+
+	const statements = [
+		`CREATE TABLE IF NOT EXISTS ${RETIRED_TABLE} (scope ${key} NOT NULL, table_name ${key} NOT NULL, primary_key ${key} NOT NULL, ` +
+			`pk_column ${key} NOT NULL, op_id ${key} NOT NULL, generation ${int} NOT NULL, moved_to ${key} NOT NULL, payload ${long}, ` +
+			`archived_at ${int} NOT NULL, purged_at ${int}, PRIMARY KEY (scope, table_name, primary_key))`,
+		`CREATE TABLE IF NOT EXISTS ${TOPOLOGY_TABLE} (min_generation ${int} NOT NULL)`
+	];
+
+	if (dialect === 'mysql') {
+		const stripes = Array.from({ length: LOCK_STRIPES + 1 }, (_, stripe) => `(${stripe})`).join(', ');
+		statements.push(
+			`CREATE TABLE IF NOT EXISTS ${LOCK_STRIPES_TABLE} (stripe INT NOT NULL, PRIMARY KEY (stripe))`,
+			`INSERT IGNORE INTO ${LOCK_STRIPES_TABLE} (stripe) VALUES ${stripes}`
+		);
+	}
+
+	return statements;
+}
+
+/**
+ * The statements for the journal shard: the active claim table, the append-only
+ * history, the durable placement exception set and the verification record.
+ * @since 1.4.0
+ */
+export function buildJournalSchema(dialect?: SQLDialect): string[] {
+	const key = dialect === 'mysql' ? 'VARCHAR(190)' : 'TEXT';
+	const long = dialect === 'mysql' ? 'LONGTEXT' : 'TEXT';
+	const int = dialect === 'sqlite' || dialect === undefined ? 'INTEGER' : 'BIGINT';
+
+	return [
+		`CREATE TABLE IF NOT EXISTS collegedb_migration_active (scope ${key} NOT NULL, table_name ${key} NOT NULL, ` +
+			`primary_key ${key} NOT NULL, op_id ${key} NOT NULL, claimed_at ${int} NOT NULL, PRIMARY KEY (scope, table_name, primary_key))`,
+		`CREATE TABLE IF NOT EXISTS collegedb_migration_history (op_id ${key} NOT NULL, state ${key} NOT NULL, attempt ${int} NOT NULL, ` +
+			`scope ${key} NOT NULL, table_name ${key} NOT NULL, primary_key ${key} NOT NULL, source ${key} NOT NULL, ` +
+			`destination ${key} NOT NULL, generation ${int} NOT NULL, placement_epoch ${int}, digest ${key}, detail ${long}, ` +
+			`at ${int} NOT NULL, PRIMARY KEY (op_id, state, attempt))`,
+		`CREATE TABLE IF NOT EXISTS collegedb_placement_exceptions (scope ${key} NOT NULL, hashed_key ${key} NOT NULL, ` +
+			`added_at ${int} NOT NULL, PRIMARY KEY (scope, hashed_key))`,
+		`CREATE TABLE IF NOT EXISTS collegedb_migration_verification (scope ${key} NOT NULL, completed_at ${int} NOT NULL, ` +
+			`clean ${int} NOT NULL, PRIMARY KEY (scope))`
+	];
+}
+
+/**
+ * Inputs for {@link buildCutoverStatements}.
+ * @since 1.4.0
+ */
+export interface CutoverSpec {
+	/** Table holding the record */
+	table: string;
+	/** Primary-key column */
+	pkColumn: string;
+	/** Every column of the snapshot with the value to compare, in any order */
+	columns: Array<[string, unknown]>;
+	/** When set, only this column (plus the key) is compared */
+	versionColumn?: string;
+	/** Journal scope */
+	scope: string;
+	/** Routing key */
+	key: string;
+	/** Operation id the archive row carries */
+	opId: string;
+	/** Generation the archive row carries */
+	generation: number;
+	/** Binding the key moves to */
+	movedTo: string;
+	/** Archive payload, exactly the text that was hashed for the digest */
+	payload: string;
+	/** Archive timestamp in milliseconds */
+	archivedAt: number;
+	/** Dialect of the source shard */
+	dialect?: SQLDialect;
+}
+
+/**
+ * Builds the two cutover statements: an archive insert and a delete, both
+ * conditional on one snapshot-equality predicate. Run together in one
+ * transaction, a changed row makes both match nothing, so a miss writes no
+ * archive row and no tombstone.
+ *
+ * @param spec - What to move and what the row must still look like
+ * @returns The archive insert and the delete
+ * @since 1.4.0
+ */
+export function buildCutoverStatements(spec: CutoverSpec): { archive: BuiltQuery; delete: BuiltQuery } {
+	const { dialect } = spec;
+	const pk = spec.columns.find(([name]) => name === spec.pkColumn);
+	if (!pk) {
+		throw new CollegeDBError(`Snapshot has no primary key column ${spec.pkColumn}`, 'MIGRATION_PK_MISSING');
+	}
+
+	const compared = spec.versionColumn
+		? spec.columns.filter(([name]) => name === spec.versionColumn)
+		: spec.columns.filter(([name]) => name !== spec.pkColumn);
+	if (spec.versionColumn && compared.length === 0) {
+		throw new CollegeDBError(`Snapshot has no version column ${spec.versionColumn}`, 'MIGRATION_VERSION_COLUMN_MISSING');
+	}
+
+	const predicate = [
+		`${quoteIdentifier(spec.pkColumn, dialect)} = ?`,
+		...compared.map(([name]) => nullSafeEquals(quoteIdentifier(name, dialect), dialect))
+	];
+	const predicateBindings = [pk[1], ...compared.map(([, value]) => value)];
+	const table = quoteIdentifier(spec.table, dialect);
+	const archiveColumns = ['scope', 'table_name', 'primary_key', 'pk_column', 'op_id', 'generation', 'moved_to', 'payload', 'archived_at'];
+	const dual = dialect === 'mysql' ? ' FROM DUAL' : '';
+
+	return {
+		archive: {
+			sql:
+				`INSERT INTO ${quoteIdentifier(RETIRED_TABLE, dialect)} (${archiveColumns.map((c) => quoteIdentifier(c, dialect)).join(', ')}) ` +
+				`SELECT ${archiveColumns.map(() => '?').join(', ')}${dual} WHERE EXISTS (SELECT 1 FROM ${table} WHERE ${predicate.join(' AND ')})`,
+			bindings: [
+				spec.scope,
+				spec.table,
+				spec.key,
+				spec.pkColumn,
+				spec.opId,
+				spec.generation,
+				spec.movedTo,
+				spec.payload,
+				spec.archivedAt,
+				...predicateBindings
+			]
+		},
+		delete: {
+			sql: `DELETE FROM ${table} WHERE ${predicate.join(' AND ')}`,
+			bindings: predicateBindings
+		}
 	};
 }

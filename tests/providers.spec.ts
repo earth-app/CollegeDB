@@ -15,8 +15,10 @@ import {
 	isKVStorage,
 	isSQLDatabase,
 	toProvider,
+	type SQLBatchOptions,
 	type WorkersKVNamespaceLike
 } from '../src/providers';
+import { createNodeSqliteClient, openNodeSqlite } from './helpers/concurrent-sqlite';
 
 class MockRedisClient {
 	private readonly store = new Map<string, string>();
@@ -1430,5 +1432,760 @@ describe('Drizzle batches', () => {
 		const provider = createDrizzleSQLProvider(inner.client, drizzleSql, 'mysql');
 		expect(await provider.runBatch!([])).toEqual([]);
 		expect(transactions).toBe(0);
+	});
+});
+
+describe('atomicBatch capability', () => {
+	function recorder() {
+		const statements: string[] = [];
+		return {
+			statements,
+			query: async (sql: string, _bindings?: any[]) => {
+				statements.push(sql);
+				if (sql === 'BOOM') {
+					throw new Error('statement failed');
+				}
+				return { rows: [] as any[], rowCount: 0 };
+			}
+		};
+	}
+
+	/** The text of a drizzle `sql` chunk built from raw strings */
+	const textOf = (query: any): string => (query.queryChunks ?? []).flatMap((chunk: any) => chunk?.value ?? []).join('');
+
+	it('is declared by every adapter whose runBatch holds a transaction on one connection', () => {
+		const pgPool = { totalCount: 0, idleCount: 0, connect: async () => ({ query: async () => ({ rows: [] }), release() {} }) };
+		const mysqlPool = { getConnection: async () => ({ execute: async () => [[], []], release() {} }) };
+		const sqlite = { prepare: () => ({ run: () => ({ changes: 0 }), all: () => [], get: () => null }) };
+
+		const declared = [
+			createPostgreSQLProvider(pgPool as any),
+			createPostgreSQLProvider({ query: async () => ({ rows: [] }) }, { singleConnection: true }),
+			createMySQLProvider(mysqlPool as any),
+			createMySQLProvider({ execute: async () => [[], []] }, { singleConnection: true }),
+			createSQLiteProvider(sqlite as any, { singleConnection: true })
+		];
+
+		for (const provider of declared) {
+			expect(provider.runBatch).toBeDefined();
+			expect(provider.atomicBatch).toBe(true);
+		}
+	});
+
+	it('is left unset where there is no transaction to roll back', () => {
+		const providers = [
+			createPostgreSQLProvider({ query: async () => ({ rows: [] }) }),
+			createMySQLProvider({ execute: async () => [[], []] }),
+			createSQLiteProvider({ prepare: () => ({ run: () => ({ changes: 0 }) }) } as any)
+		];
+
+		for (const provider of providers) {
+			expect(provider.runBatch).toBeUndefined();
+			expect(provider.atomicBatch).toBeUndefined();
+		}
+	});
+
+	it('is declared through toProvider for a D1-style native batch and not for a plain binding', () => {
+		const withBatch = toProvider({ prepare: () => ({}) as any, batch: async () => [] })!;
+		const plain = toProvider({ prepare: () => ({}) as any })!;
+
+		expect(withBatch.runBatch).toBeDefined();
+		expect(withBatch.atomicBatch).toBe(true);
+		expect(plain.runBatch).toBeUndefined();
+		expect(plain.atomicBatch).toBeUndefined();
+	});
+
+	it('is declared for a drizzle transaction and not for a native-batch drizzle driver', () => {
+		const run = async () => ({ rowsAffected: 0 });
+		const transaction = async (callback: (tx: unknown) => Promise<unknown>) => await callback({ run });
+
+		const transactional = createDrizzleSQLProvider({ run, transaction } as any, drizzleSql, 'postgres');
+		const nativeBatch = createDrizzleSQLProvider({ run, transaction, batch: async () => [] } as any, drizzleSql, 'sqlite');
+
+		expect(transactional.atomicBatch).toBe(true);
+		expect(nativeBatch.runBatch).toBeUndefined();
+		expect(nativeBatch.atomicBatch).toBeUndefined();
+	});
+
+	describe('Drizzle over a synchronous driver', () => {
+		/** Mimics drizzle's bun:sqlite and better-sqlite3 sessions: begin, run the callback, commit, and no wait for a promise */
+		function syncDrizzle() {
+			const log: string[] = [];
+			const client: any = {
+				run(query: any) {
+					const text = textOf(query);
+					log.push(text);
+					if (text === 'BOOM') {
+						throw new Error('statement failed');
+					}
+					return { changes: 1, lastInsertRowid: 1 };
+				},
+				all() {
+					return [];
+				},
+				transaction(callback: (tx: any) => unknown) {
+					log.push('begin');
+					try {
+						const result = callback(client);
+						log.push('commit');
+						return result;
+					} catch (error) {
+						log.push('rollback');
+						throw error;
+					}
+				}
+			};
+			return { client, log };
+		}
+
+		it('runs every statement inside the transaction, so the commit comes last', async () => {
+			const { client, log } = syncDrizzle();
+			const provider = createDrizzleSQLProvider(client, drizzleSql, 'sqlite');
+
+			const results = await provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }]);
+
+			expect(log).toEqual(['begin', 'INSERT 1', 'INSERT 2', 'commit']);
+			expect(results).toHaveLength(2);
+			expect(results[0]!.meta.changes).toBe(1);
+		});
+
+		it('rolls the whole group back when a later statement fails', async () => {
+			const { client, log } = syncDrizzle();
+			const provider = createDrizzleSQLProvider(client, drizzleSql, 'sqlite');
+
+			await expect(provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }, { sql: 'BOOM' }])).rejects.toThrow('statement failed');
+
+			expect(log).toEqual(['begin', 'INSERT 1', 'INSERT 2', 'BOOM', 'rollback']);
+			expect(provider.atomicBatch).toBe(true);
+		});
+
+		it('lets no other statement into the open transaction', async () => {
+			const { client, log } = syncDrizzle();
+			const provider = createDrizzleSQLProvider(client, drizzleSql, 'sqlite');
+
+			const batch = provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }]);
+			const other = provider.prepare('SELECT 9').run();
+			await Promise.all([batch, other]);
+
+			expect(log.indexOf('SELECT 9')).toBeGreaterThan(log.indexOf('commit'));
+		});
+
+		it('still awaits statements on an asynchronous driver', async () => {
+			const log: string[] = [];
+			const client: any = {
+				async run(query: any) {
+					log.push(textOf(query));
+					await new Promise((resolve) => setTimeout(resolve, 1));
+					return { rowsAffected: 1 };
+				},
+				async transaction(callback: (tx: any) => Promise<unknown>) {
+					log.push('begin');
+					try {
+						const result = await callback(client);
+						log.push('commit');
+						return result;
+					} catch (error) {
+						log.push('rollback');
+						throw error;
+					}
+				}
+			};
+
+			const provider = createDrizzleSQLProvider(client, drizzleSql, 'postgres');
+			await provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }]);
+
+			expect(log).toEqual(['begin', 'INSERT 1', 'INSERT 2', 'commit']);
+		});
+	});
+
+	describe('Hyperdrive providers', () => {
+		it('runs a Postgres batch on the one client of the request and declares it atomic', async () => {
+			const lifecycle: string[] = [];
+			let created = 0;
+
+			const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => {
+				created++;
+				return {
+					async connect() {
+						lifecycle.push('connect');
+					},
+					async query(sql: string) {
+						lifecycle.push(sql);
+						return { rows: [], rowCount: 0 };
+					},
+					async end() {
+						lifecycle.push('end');
+					}
+				};
+			});
+
+			expect(provider.atomicBatch).toBe(true);
+			await provider.prepare('SELECT 1').run();
+			await provider.runBatch!([{ sql: 'INSERT INTO t VALUES (?)', bindings: [1] }]);
+
+			expect(created).toBe(1);
+			expect(lifecycle).toEqual(['connect', 'SELECT 1', 'BEGIN', 'INSERT INTO t VALUES ($1)', 'COMMIT']);
+		});
+
+		it('rolls a Postgres batch back on failure and frees the client for the next statement', async () => {
+			const rec = recorder();
+			const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({ query: rec.query }));
+
+			await expect(provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'BOOM' }])).rejects.toThrow('statement failed');
+			expect(rec.statements).toEqual(['BEGIN', 'INSERT 1', 'BOOM', 'ROLLBACK']);
+
+			await provider.prepare('SELECT 2').run();
+			expect(rec.statements.at(-1)).toBe('SELECT 2');
+		});
+
+		it('makes a plain statement wait for a batch in flight on the same client', async () => {
+			const log: string[] = [];
+			const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({
+				async query(sql: string) {
+					log.push(sql);
+					await new Promise((resolve) => setTimeout(resolve, 2));
+					return { rows: [], rowCount: 0 };
+				}
+			}));
+
+			const batch = provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }]);
+			const plain = provider.prepare('SELECT 9').run();
+			await Promise.all([batch, plain]);
+
+			expect(log).toEqual(['BEGIN', 'INSERT 1', 'INSERT 2', 'COMMIT', 'SELECT 9']);
+		});
+
+		it('serializes two batches on the same client', async () => {
+			const log: string[] = [];
+			const provider = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({
+				async query(sql: string) {
+					log.push(sql);
+					await new Promise((resolve) => setTimeout(resolve, 1));
+					return { rows: [], rowCount: 0 };
+				}
+			}));
+
+			await Promise.all([provider.runBatch!([{ sql: 'A1' }, { sql: 'A2' }]), provider.runBatch!([{ sql: 'B1' }, { sql: 'B2' }])]);
+
+			expect(log).toEqual(['BEGIN', 'A1', 'A2', 'COMMIT', 'BEGIN', 'B1', 'B2', 'COMMIT']);
+		});
+
+		it('sends MySQL transaction control through query on the one connection and declares it atomic', async () => {
+			const executed: string[] = [];
+			const queried: string[] = [];
+			let created = 0;
+
+			const provider = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => {
+				created++;
+				return {
+					execute: async (sql: string) => {
+						if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql)) {
+							throw new Error('This command is not supported in the prepared statement protocol yet');
+						}
+						executed.push(sql);
+						return [{ affectedRows: 1 }, []];
+					},
+					query: async (sql: string) => {
+						queried.push(sql);
+						return [{ affectedRows: 0 }, []];
+					},
+					end: async () => {}
+				};
+			});
+
+			expect(provider.atomicBatch).toBe(true);
+			const results = await provider.runBatch!([{ sql: 'INSERT 1' }, { sql: 'INSERT 2' }]);
+
+			expect(results).toHaveLength(2);
+			expect(created).toBe(1);
+			expect(queried).toEqual(['BEGIN', 'COMMIT']);
+			expect(executed).toEqual(['INSERT 1', 'INSERT 2']);
+		});
+
+		it('gives each request scope its own gate', async () => {
+			const log: string[] = [];
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => (release = resolve));
+			const scopes = [{ id: 1 }, { id: 2 }];
+			let current = scopes[0]!;
+
+			const provider = createHyperdrivePostgresProvider(
+				{ connectionString: 'postgres://example' },
+				() => {
+					const label = `client-${log.length}`;
+					return {
+						async query(sql: string) {
+							log.push(`${label}:${sql}`);
+							if (sql === 'HOLD') {
+								await held;
+							}
+							return { rows: [], rowCount: 0 };
+						}
+					};
+				},
+				{ scope: () => current }
+			);
+
+			const slow = provider.runBatch!([{ sql: 'HOLD' }]);
+			await new Promise((resolve) => setTimeout(resolve, 2));
+			current = scopes[1]!;
+			await provider.prepare('SELECT 2').run();
+			expect(log.some((line) => line.endsWith(':SELECT 2'))).toBe(true);
+
+			release();
+			await slow;
+		});
+	});
+});
+
+describe('read consistency capabilities', () => {
+	const singleNode = { primary: true, session: false, eventual: true };
+
+	it('reports primary and eventual but no session on the single-node adapters', () => {
+		const postgres = createPostgreSQLProvider({ query: async () => ({ rows: [] }) });
+		const mysql = createMySQLProvider({ execute: async () => [[], []] });
+		const sqlite = createSQLiteProvider({ prepare: () => ({ all: () => [], get: () => null, run: () => ({ changes: 0 }) }) });
+		const drizzle = createDrizzleSQLProvider({ all: async () => ({ rows: [] }) } as any, drizzleSql, 'sqlite');
+
+		for (const provider of [postgres, mysql, sqlite, drizzle]) {
+			expect(provider.consistency).toEqual(singleNode);
+			expect(provider.withSession).toBeUndefined();
+		}
+	});
+
+	it('reports the same on the Hyperdrive wrappers', () => {
+		const postgres = createHyperdrivePostgresProvider({ connectionString: 'postgres://example' }, () => ({
+			query: async () => ({ rows: [] })
+		}));
+		const mysql = createHyperdriveMySQLProvider({ connectionString: 'mysql://example' }, () => ({ execute: async () => [[], []] }));
+
+		expect(postgres.consistency).toEqual(singleNode);
+		expect(mysql.consistency).toEqual(singleNode);
+	});
+
+	it('keeps withSession and its bookmark when a D1 binding goes through toProvider', () => {
+		const constraints: Array<string | undefined> = [];
+		const binding = {
+			prepare: () => ({}) as any,
+			batch: async () => [],
+			withSession(constraint?: string) {
+				constraints.push(constraint);
+				return { prepare: () => ({}) as any, getBookmark: () => 'bm-1' };
+			}
+		};
+
+		const provider = toProvider(binding)!;
+		const session = provider.withSession!('first-primary');
+
+		expect(constraints).toEqual(['first-primary']);
+		expect(session.getBookmark()).toBe('bm-1');
+		expect(provider.runBatch).toBeDefined();
+	});
+
+	it('adds no withSession to a binding that has none', () => {
+		const provider = toProvider({ prepare: () => ({}) as any, batch: async () => [] })!;
+
+		expect(provider.withSession).toBeUndefined();
+		expect(provider.consistency).toBeUndefined();
+	});
+});
+
+describe('Single-connection batch gate', () => {
+	const INSERT_ONE = 'INSERT INTO users (id) VALUES (1)';
+	const INSERT_TWO = 'INSERT INTO users (id) VALUES (2)';
+	const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+	const within = <T>(promise: Promise<T>, ms = 250) =>
+		Promise.race([promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timed out behind the gate')), ms))]);
+
+	/** Fake clients that log each statement as it is dispatched and can hold or fail one. */
+	function rig() {
+		const log: string[] = [];
+		const holds = new Map<string, Promise<void>>();
+		const failures = new Map<string, Error>();
+		const exec = async (sql: string) => {
+			log.push(sql);
+			await holds.get(sql);
+			const failure = failures.get(sql);
+			if (failure) {
+				failures.delete(sql);
+				throw failure;
+			}
+		};
+		return {
+			log,
+			exec,
+			hold(sql: string): () => void {
+				let release!: () => void;
+				holds.set(
+					sql,
+					new Promise<void>((resolve) => {
+						release = resolve;
+					})
+				);
+				return release;
+			},
+			failOnce(sql: string, message: string) {
+				failures.set(sql, new Error(message));
+			}
+		};
+	}
+
+	type Kind = 'postgres' | 'mysql' | 'sqlite';
+
+	function build(kind: Kind, options: SQLBatchOptions<any> = { singleConnection: true }) {
+		const fake = rig();
+		const { exec } = fake;
+		const client =
+			kind === 'postgres'
+				? {
+						query: async (sql: string) => {
+							await exec(sql);
+							return { rows: [] as any[], rowCount: 0 };
+						}
+					}
+				: kind === 'mysql'
+					? {
+							execute: async (sql: string) => {
+								await exec(sql);
+								return [[], []];
+							},
+							query: async (sql: string) => {
+								await exec(sql);
+								return [[], []];
+							}
+						}
+					: {
+							prepare: (sql: string) => ({
+								run: async () => {
+									await exec(sql);
+									return { changes: 0 };
+								},
+								all: async () => {
+									await exec(sql);
+									return [];
+								},
+								get: async () => {
+									await exec(sql);
+									return null;
+								}
+							})
+						};
+		const provider =
+			kind === 'postgres'
+				? createPostgreSQLProvider(client as any, options)
+				: kind === 'mysql'
+					? createMySQLProvider(client as any, options)
+					: createSQLiteProvider(client as any, options);
+		return { ...fake, client, provider };
+	}
+
+	describe.each<Kind>(['postgres', 'mysql', 'sqlite'])('%s', (kind) => {
+		it('holds a plain statement until the batch commits', async () => {
+			const { provider, log, hold } = build(kind);
+			const release = hold(INSERT_ONE);
+
+			const batch = provider.runBatch!([{ sql: INSERT_ONE }, { sql: INSERT_TWO }]);
+			await flush();
+			const plain = provider.prepare('SELECT 1').all();
+			await flush();
+
+			expect(log).toEqual(['BEGIN', INSERT_ONE]);
+
+			release();
+			await Promise.all([batch, plain]);
+			expect(log).toEqual(['BEGIN', INSERT_ONE, INSERT_TWO, 'COMMIT', 'SELECT 1']);
+		});
+
+		it('holds every plain statement shape (run, all, first)', async () => {
+			const { provider, log, hold } = build(kind);
+			const release = hold(INSERT_ONE);
+
+			const batch = provider.runBatch!([{ sql: INSERT_ONE }]);
+			await flush();
+			const waiting = [provider.prepare('SELECT 1').run(), provider.prepare('SELECT 2').all(), provider.prepare('SELECT 3').first()];
+			await flush();
+
+			expect(log).toEqual(['BEGIN', INSERT_ONE]);
+
+			release();
+			await Promise.all([batch, ...waiting]);
+			expect(log.indexOf('COMMIT')).toBe(2);
+			expect(log.slice(3).sort()).toEqual(['SELECT 1', 'SELECT 2', 'SELECT 3']);
+		});
+
+		it('runs two concurrent batches one after the other', async () => {
+			const { provider, log, hold } = build(kind);
+			const release = hold(INSERT_ONE);
+
+			const first = provider.runBatch!([{ sql: INSERT_ONE }]);
+			const second = provider.runBatch!([{ sql: INSERT_TWO }]);
+			await flush();
+
+			expect(log).toEqual(['BEGIN', INSERT_ONE]);
+
+			release();
+			await Promise.all([first, second]);
+			expect(log).toEqual(['BEGIN', INSERT_ONE, 'COMMIT', 'BEGIN', INSERT_TWO, 'COMMIT']);
+		});
+
+		it('orders a plain statement issued between two batches after the first only', async () => {
+			const { provider, log, hold } = build(kind);
+			const release = hold(INSERT_ONE);
+
+			const first = provider.runBatch!([{ sql: INSERT_ONE }]);
+			const plain = provider.prepare('SELECT 1').all();
+			const second = provider.runBatch!([{ sql: INSERT_TWO }]);
+			await flush();
+			release();
+			await Promise.all([first, plain, second]);
+
+			expect(log.indexOf('SELECT 1')).toBeGreaterThan(log.indexOf('COMMIT'));
+			expect(log.filter((entry) => entry === 'BEGIN')).toHaveLength(2);
+			expect(log.indexOf('SELECT 1')).not.toBeGreaterThan(log.lastIndexOf('BEGIN'));
+		});
+
+		it('rolls a failing batch back, then lets the waiting statement run', async () => {
+			const { provider, log, hold, failOnce } = build(kind);
+			const release = hold(INSERT_ONE);
+			failOnce(INSERT_TWO, 'statement failed');
+
+			const batch = provider.runBatch!([{ sql: INSERT_ONE }, { sql: INSERT_TWO }]);
+			const rejected = expect(batch).rejects.toThrow('statement failed');
+			await flush();
+			const plain = provider.prepare('SELECT 1').all();
+			await flush();
+			expect(log).toEqual(['BEGIN', INSERT_ONE]);
+
+			release();
+			await rejected;
+			await plain;
+			expect(log).toEqual(['BEGIN', INSERT_ONE, INSERT_TWO, 'ROLLBACK', 'SELECT 1']);
+		});
+
+		it('releases the gate when the connection throws before BEGIN', async () => {
+			const { provider, log, failOnce } = build(kind);
+			failOnce('BEGIN', 'connection refused');
+
+			await expect(provider.runBatch!([{ sql: INSERT_ONE }])).rejects.toThrow('connection refused');
+			await within(provider.prepare('SELECT 1').all());
+			await within(provider.runBatch!([{ sql: INSERT_TWO }]));
+
+			expect(log).toEqual(['BEGIN', 'SELECT 1', 'BEGIN', INSERT_TWO, 'COMMIT']);
+		});
+
+		it('releases the gate when a caller lease throws', async () => {
+			const { provider, log } = build(kind, {
+				singleConnection: true,
+				lease: async () => {
+					throw new Error('no connection');
+				}
+			});
+
+			await expect(provider.runBatch!([{ sql: INSERT_ONE }])).rejects.toThrow('no connection');
+			await within(provider.prepare('SELECT 1').all());
+			expect(log).toEqual(['SELECT 1']);
+		});
+
+		it('gates a caller lease when the handle is declared single, and leaves the lease callers alone', async () => {
+			const fake = build(kind);
+			let released = 0;
+			const gated = build(kind, {
+				singleConnection: true,
+				lease: async () => ({ client: fake.client as any, release: () => void released++ })
+			});
+			const release = fake.hold(INSERT_ONE);
+
+			const batch = gated.provider.runBatch!([{ sql: INSERT_ONE }, { sql: INSERT_TWO }]);
+			await flush();
+			const plain = gated.provider.prepare('SELECT 1').all();
+			await flush();
+
+			expect(fake.log).toEqual(['BEGIN', INSERT_ONE]);
+			expect(gated.log).toEqual([]);
+
+			release();
+			await Promise.all([batch, plain]);
+			expect(fake.log).toEqual(['BEGIN', INSERT_ONE, INSERT_TWO, 'COMMIT']);
+			expect(gated.log).toEqual(['SELECT 1']);
+			expect(released).toBe(1);
+		});
+
+		it('dispatches a plain statement in the same tick when no batch is open', async () => {
+			const { provider, log } = build(kind);
+
+			const plain = provider.prepare('SELECT 1').all();
+			expect(log).toEqual(['SELECT 1']);
+			await plain;
+
+			await provider.runBatch!([{ sql: INSERT_ONE }]);
+			const after = provider.prepare('SELECT 2').first();
+			expect(log.at(-1)).toBe('SELECT 2');
+			await after;
+			expect(log).toEqual(['SELECT 1', 'BEGIN', INSERT_ONE, 'COMMIT', 'SELECT 2']);
+		});
+	});
+
+	describe('real node:sqlite handle', () => {
+		const PRE_BATCH = 'CREATE TABLE t (id INTEGER PRIMARY KEY)';
+
+		/** One node:sqlite connection whose `run` of one statement waits for the test. */
+		function heldSqlite(holdSql: string) {
+			const db = openNodeSqlite();
+			db.exec(PRE_BATCH);
+			const inner = createNodeSqliteClient(db);
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const client = {
+				prepare(sql: string) {
+					const statement = inner.prepare!(sql);
+					return {
+						...statement,
+						run: async (...bindings: any[]) => {
+							if (sql === holdSql) {
+								await held;
+							}
+							return statement.run!(...bindings);
+						}
+					};
+				}
+			};
+			return { provider: createSQLiteProvider(client, { singleConnection: true }), release };
+		}
+
+		it('shows a statement queued behind a batch the rows the batch committed', async () => {
+			const { provider, release } = heldSqlite('INSERT INTO t (id) VALUES (2)');
+
+			const batch = provider.runBatch!([{ sql: 'INSERT INTO t (id) VALUES (1)' }, { sql: 'INSERT INTO t (id) VALUES (2)' }]);
+			await flush();
+			let settled = false;
+			const read = provider
+				.prepare('SELECT id FROM t ORDER BY id')
+				.all()
+				.finally(() => {
+					settled = true;
+				});
+			await flush();
+			expect(settled).toBe(false);
+
+			release();
+			await batch;
+			expect((await read).results).toEqual([{ id: 1 }, { id: 2 }]);
+		});
+
+		it('shows a statement queued behind a failed batch the pre-batch state', async () => {
+			const { provider, release } = heldSqlite('INSERT INTO t (id) SELECT 1');
+
+			const batch = provider.runBatch!([{ sql: 'INSERT INTO t (id) VALUES (1)' }, { sql: 'INSERT INTO t (id) SELECT 1' }]);
+			const rejected = expect(batch).rejects.toThrow();
+			await flush();
+			const read = provider.prepare('SELECT id FROM t ORDER BY id').all();
+			await flush();
+
+			release();
+			await rejected;
+			expect((await read).results).toEqual([]);
+		});
+
+		it('keeps the connection usable after a rolled-back batch', async () => {
+			const { provider, release } = heldSqlite('INSERT INTO t (id) SELECT 1');
+			release();
+
+			await expect(
+				provider.runBatch!([{ sql: 'INSERT INTO t (id) VALUES (1)' }, { sql: 'INSERT INTO t (id) SELECT 1' }])
+			).rejects.toThrow();
+			await provider.runBatch!([{ sql: 'INSERT INTO t (id) VALUES (7)' }]);
+
+			expect((await provider.prepare('SELECT id FROM t').all()).results).toEqual([{ id: 7 }]);
+		});
+	});
+
+	describe('pooled adapters', () => {
+		it('sends a plain statement straight to the pool while a pg batch holds its own connection', async () => {
+			const fake = rig();
+			const seenBy: unknown[] = [];
+			const pool = {
+				totalCount: 1,
+				idleCount: 1,
+				query(this: unknown, sql: string) {
+					seenBy.push(this);
+					return fake.exec(sql).then(() => ({ rows: [] as any[], rowCount: 0 }));
+				},
+				async connect() {
+					return { query: (sql: string) => fake.exec(sql).then(() => ({ rows: [] as any[], rowCount: 0 })), release: () => {} };
+				}
+			};
+
+			for (const options of [undefined, { singleConnection: true }] as const) {
+				fake.log.length = 0;
+				seenBy.length = 0;
+				const release = fake.hold(INSERT_ONE);
+				const provider = createPostgreSQLProvider(pool as any, options);
+
+				const batch = provider.runBatch!([{ sql: INSERT_ONE }]);
+				await flush();
+				const plain = provider.prepare('SELECT 1').all();
+
+				// dispatched synchronously on the pool itself, with no wrapper in between
+				expect(fake.log).toEqual(['BEGIN', INSERT_ONE, 'SELECT 1']);
+				expect(seenBy).toEqual([pool]);
+
+				release();
+				await Promise.all([batch, plain]);
+				expect(fake.log).toEqual(['BEGIN', INSERT_ONE, 'SELECT 1', 'COMMIT']);
+			}
+		});
+
+		it('sends a plain statement straight to the pool while a mysql2 batch holds its own connection', async () => {
+			const fake = rig();
+			const seenBy: unknown[] = [];
+			const pool = {
+				execute(this: unknown, sql: string) {
+					seenBy.push(this);
+					return fake.exec(sql).then(() => [[], []]);
+				},
+				async getConnection() {
+					return {
+						execute: (sql: string) => fake.exec(sql).then(() => [[], []]),
+						query: (sql: string) => fake.exec(sql).then(() => [[], []]),
+						release: () => {}
+					};
+				}
+			};
+
+			for (const options of [undefined, { singleConnection: true }] as const) {
+				fake.log.length = 0;
+				seenBy.length = 0;
+				const release = fake.hold(INSERT_ONE);
+				const provider = createMySQLProvider(pool as any, options);
+
+				const batch = provider.runBatch!([{ sql: INSERT_ONE }]);
+				await flush();
+				const plain = provider.prepare('SELECT 1').all();
+
+				expect(fake.log).toEqual(['BEGIN', INSERT_ONE, 'SELECT 1']);
+				expect(seenBy).toEqual([pool]);
+
+				release();
+				await Promise.all([batch, plain]);
+				expect(fake.log).toEqual(['BEGIN', INSERT_ONE, 'SELECT 1', 'COMMIT']);
+			}
+		});
+
+		it('does not gate a lease-only adapter, which is how the Hyperdrive providers order their own batches', async () => {
+			const fake = rig();
+			const client = { query: (sql: string) => fake.exec(sql).then(() => ({ rows: [] as any[], rowCount: 0 })) };
+			const provider = createPostgreSQLProvider(client as any, { lease: async () => ({ client, release: () => {} }) });
+			const release = fake.hold(INSERT_ONE);
+
+			const batch = provider.runBatch!([{ sql: INSERT_ONE }]);
+			await flush();
+			const plain = provider.prepare('SELECT 1').all();
+
+			expect(fake.log).toEqual(['BEGIN', INSERT_ONE, 'SELECT 1']);
+			release();
+			await Promise.all([batch, plain]);
+		});
 	});
 });

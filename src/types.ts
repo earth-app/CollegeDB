@@ -84,7 +84,7 @@ export interface KVStorage {
 	 * Optional. Backends with a native multi-get (Redis/Valkey `MGET`) implement
 	 * it; CollegeDB falls back to concurrent single reads when it is absent, so
 	 * callers never need to check for it.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	getMany?<T = unknown>(keys: string[], type: 'json'): Promise<(T | null)[]>;
 	getMany?(keys: string[], type?: 'text'): Promise<(string | null)[]>;
@@ -93,14 +93,14 @@ export interface KVStorage {
 	 *
 	 * Optional, with the same fallback contract as {@link KVStorage.getMany}.
 	 * A multi-key shard mapping otherwise costs one round trip per lookup key.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	putMany?(entries: Array<{ key: string; value: string }>): Promise<void>;
 	/**
 	 * Deletes several keys in one round trip.
 	 *
 	 * Optional, with the same fallback contract as {@link KVStorage.getMany}.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	deleteMany?(keys: string[]): Promise<void>;
 }
@@ -115,6 +115,20 @@ export interface QueryResultMeta {
 	changes?: number;
 	/** Last inserted row id (when available) */
 	last_row_id?: number | string;
+	/**
+	 * Latest session bookmark of the shard that served a read made with a
+	 * {@link ReadConsistency}. Absent when the read ran without a session or the
+	 * session has no bookmark yet.
+	 * @since 1.4.0
+	 */
+	bookmark?: string;
+	/**
+	 * Bookmarks of every database a merged read touched, keyed by database id
+	 * (`shardState[binding].id`). Pass it back as `bookmarks` to resume. Left off
+	 * when a shard has no verified id.
+	 * @since 1.4.0
+	 */
+	bookmarks?: Record<string, string>;
 	/** Additional provider-specific metadata */
 	[key: string]: unknown;
 }
@@ -154,13 +168,104 @@ export interface PreparedStatement {
  * MySQL and MariaDB reject double-quoted identifiers unless `ANSI_QUOTES` is in
  * their `sql_mode`, so a statement built with ANSI quoting fails outright there.
  * Adapters report their dialect so the builders can pick the right character.
- * @since 1.4.0
+ * @since 1.3.0
  */
 export type SQLDialect = 'sqlite' | 'postgres' | 'mysql';
 
 /**
- * A statement plus its bindings, as accepted by {@link SQLDatabase.runBatch}.
+ * Read guarantee a caller asks for, per call.
+ *
+ * - `primary`: the first query of a D1 session goes to the primary and the
+ *   session continues in sequence. This is not promised to be primary-only for
+ *   the whole operation unless the adapter says so.
+ * - `session`: resume from `bookmarks`, keyed by database id; with none, the first
+ *   query goes to any instance (`first-unconstrained`). Needs a provider with
+ *   sessions, otherwise the call throws `CONSISTENCY_UNSUPPORTED`.
+ * - `eventual`: unconstrained. Every provider accepts it.
+ *
+ * Writes ignore it. Leaving it off keeps the call exactly as it was.
  * @since 1.4.0
+ */
+export type ReadConsistency = { mode: 'primary' } | { mode: 'session'; bookmarks?: Record<string, string> } | { mode: 'eventual' };
+
+/**
+ * Trailing option for read helpers.
+ * @since 1.4.0
+ */
+export interface ReadOptions {
+	/** Read guarantee for this call */
+	consistency?: ReadConsistency;
+}
+
+/**
+ * What a provider can honor for {@link ReadConsistency}. A stronger guarantee
+ * satisfies a weaker request.
+ * @since 1.4.0
+ */
+export interface ConsistencyCapabilities {
+	primary: boolean;
+	session: boolean;
+	eventual: boolean;
+}
+
+/**
+ * Query handle of a read session, shaped like D1's `D1DatabaseSession`.
+ * @since 1.4.0
+ */
+export interface SQLSession {
+	/** Creates a prepared statement that runs inside the session */
+	prepare(sql: string): PreparedStatement;
+	/** Latest bookmark across the session's queries, or `null` before the first */
+	getBookmark(): string | null;
+}
+
+/**
+ * Known facts about one shard binding.
+ * @since 1.4.0
+ */
+export interface ShardState {
+	/**
+	 * Stable physical database id (for D1, the database UUID). Session bookmarks
+	 * are keyed by it, so a topology change cannot apply one database's bookmark
+	 * to another.
+	 */
+	id?: string;
+	/**
+	 * Whether the shard accepts new keys. `false` keeps it out of new allocations; its
+	 * existing keys stay readable and writable.
+	 * @default true
+	 */
+	writable?: boolean;
+	/**
+	 * Where the shard is in being emptied. Only `active` takes new keys. `draining` and
+	 * `retired` differ in intent: `retired` says its data should already be moved, and
+	 * `pruneEpochs` is what proves it. Both stay readable and stay in older epochs, so
+	 * existing keys keep resolving.
+	 * @default 'active'
+	 */
+	drain?: 'active' | 'draining' | 'retired';
+	/** Labels the `eligible` predicate can read, such as a jurisdiction or a schema version */
+	tags?: Record<string, string>;
+}
+
+/**
+ * What {@link CollegeDBConfig.eligible} is told about the shard it judges.
+ * @since 1.4.0
+ */
+export interface EligibilityContext {
+	/** The primary key being allocated; unset for a publication and for an insert with a generated key */
+	key?: string;
+	/** `allocate` for a new key, `publish` when a computed placement snapshot is built */
+	operation: 'allocate' | 'publish';
+	/** The shard's `tags`, or an empty object */
+	tags: Record<string, string>;
+	/** The shard's `shardState` entry, or an empty object */
+	state: ShardState;
+}
+
+/**
+ * A statement plus its bindings, as accepted by {@link SQLDatabase.runBatch}.
+ * @since 1.3.0
  */
 export interface BatchStatement {
 	/** SQL text using `?` placeholders */
@@ -182,7 +287,7 @@ export interface SQLDatabase {
 	 * Optional. The adapter factories set it; a raw binding passed straight to
 	 * {@link initialize} leaves it unset, which is read as ANSI double quoting
 	 * and is correct for D1 and SQLite.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	dialect?: SQLDialect;
 	/**
@@ -201,9 +306,37 @@ export interface SQLDatabase {
 	 * Statements execute in order and share one transaction per shard. There is
 	 * no cross-shard atomicity: a routed batch spanning three shards is three
 	 * independent transactions.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	runBatch?<T = Record<string, unknown>>(statements: BatchStatement[]): Promise<QueryResult<T>[]>;
+	/**
+	 * Whether {@link SQLDatabase.runBatch} rolls the whole group back when one
+	 * statement fails.
+	 *
+	 * Optional, and `true` only for an adapter whose rollback has been shown to
+	 * work. The journal cutover and the key lock refuse a shard that leaves it
+	 * unset with `MIGRATION_NO_ATOMIC_BATCH`, because a batch that leaves its early
+	 * statements behind would leave a tombstone beside a live row.
+	 * @since 1.4.0
+	 */
+	atomicBatch?: boolean;
+	/**
+	 * Which {@link ReadConsistency} modes this shard can honor.
+	 *
+	 * Optional. The Postgres, MySQL, MariaDB, SQLite and Drizzle adapters report
+	 * `primary` and `eventual` and not `session`. A shard that leaves it unset is
+	 * read as supporting `session` only when it has {@link SQLDatabase.withSession}.
+	 * @since 1.4.0
+	 */
+	consistency?: ConsistencyCapabilities;
+	/**
+	 * Starts a read session. A raw D1 binding already has this method, and that
+	 * is how CollegeDB detects it.
+	 *
+	 * The argument is `first-primary`, `first-unconstrained` or a bookmark string.
+	 * @since 1.4.0
+	 */
+	withSession?(constraintOrBookmark?: string): SQLSession;
 }
 
 /**
@@ -277,6 +410,14 @@ export interface CollegeDBConfig {
 	kv: KVStorage;
 	/** Shard coordinator Durable Object */
 	coordinator?: DurableObjectNamespace;
+	/**
+	 * Name passed to `idFromName` when the router reaches the coordinator. Deployments that
+	 * split their keys into groups can give each group its own scope and coordinator object.
+	 * A scope change starts from an empty allocation ledger.
+	 * @default 'default'
+	 * @since 1.4.0
+	 */
+	coordinatorScope?: string;
 	/** Available SQL shard providers */
 	shards: Record<string, SQLDatabase>;
 	/** Default shard allocation strategy (can be single strategy or mixed strategy object) */
@@ -310,6 +451,9 @@ export interface CollegeDBConfig {
 	 *
 	 * When omitted, size-based filtering is disabled to avoid extra sizing queries.
 	 * This significantly reduces routing latency for write-heavy workloads.
+	 *
+	 * A shard whose size cannot be read is not excluded: the limit applies only where it
+	 * can be measured. With `debug` set, the first failure per shard is logged.
 	 * @since 1.0.8
 	 */
 	maxDatabaseSize?: number;
@@ -354,7 +498,7 @@ export interface CollegeDBConfig {
 	 * has not seen before, and to `kv` when existing mappings are detected, so
 	 * an upgrade never starts computing placements for keys another algorithm
 	 * placed. Call `rebalance()` to migrate such a deployment.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	placement?: 'computed' | 'kv';
 	/**
@@ -364,7 +508,7 @@ export interface CollegeDBConfig {
 	 * so looking up a key that has no row costs no KV write and leaves no
 	 * mapping behind. Writes always record their mapping.
 	 * @default false
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	allocateOnRead?: boolean;
 	/**
@@ -375,13 +519,17 @@ export interface CollegeDBConfig {
 	 * data this version wrote and doubles the KV cost of every true miss. Enable
 	 * it only while migrating mappings written before 1.0.3.
 	 * @default false
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	legacyMultiKeyLookup?: boolean;
 	/**
 	 * Primary-key column per table, used by the query planner to recover the
 	 * routing key from a statement. Tables absent from the map use `id`.
-	 * @since 1.4.0
+	 *
+	 * Under computed placement, a write to a key whose owner changed in an earlier topology
+	 * change also probes this column to find the shard that holds the row, so a table with
+	 * another key column must be listed here.
+	 * @since 1.3.0
 	 */
 	keyColumns?: Record<string, string>;
 	/**
@@ -394,14 +542,14 @@ export interface CollegeDBConfig {
 	 * `throw` is the default because a mis-routed write lands a row where no
 	 * reader will look, while a thrown error is visible immediately.
 	 * @default 'throw'
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	onUnroutable?: 'throw' | 'fanout';
 	/**
 	 * Per-phase timing observer. When set, CollegeDB reports the cost of hashing,
 	 * each KV round trip, shard selection, coordinator calls, and SQL execution.
 	 * Unset, the instrumentation allocates nothing.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	onPhase?: PhaseObserver;
 	/**
@@ -409,9 +557,59 @@ export interface CollegeDBConfig {
 	 * request. Pass `ctx.waitUntil` from a Worker: without it, the background
 	 * known-shard sync and auto-migration started by {@link initialize} are
 	 * cancelled when the request that triggered them ends.
-	 * @since 1.4.0
+	 * @since 1.3.0
 	 */
 	waitUntil?: (promise: Promise<unknown>) => void;
+	/**
+	 * Shard binding that holds the migration journal.
+	 *
+	 * `reassignShard`, `rebalance` and `recoverMigrations` need it once there is
+	 * more than one shard, and throw `JOURNAL_NOT_CONFIGURED` without it. A
+	 * single-shard config falls back to its only shard. When set, router-issued
+	 * inserts and upserts also check the shard-local tombstone, so a stale caller
+	 * cannot recreate a row on a shard the key has left.
+	 * @since 1.4.0
+	 */
+	journalShard?: string;
+	/**
+	 * Partition of the journal, for deployments that share one journal database.
+	 * @default 'default'
+	 * @since 1.4.0
+	 */
+	journalScope?: string;
+	/**
+	 * Per-call time limit for KV reads and writes. A call that runs longer rejects with
+	 * `KV_TIMEOUT`; it never resolves as "not found". The underlying call is not cancelled.
+	 * @default no timeout
+	 * @since 1.4.0
+	 */
+	kvTimeoutMs?: number;
+	/**
+	 * Known facts per shard binding. `id` is the physical database id that session
+	 * bookmarks are keyed by; a read that supplies bookmarks for a binding with no
+	 * `id` throws `BOOKMARK_IDENTITY_UNVERIFIED`.
+	 * @since 1.4.0
+	 */
+	shardState?: Record<string, ShardState>;
+	/**
+	 * Decides whether a shard may take new keys, after `shardState` and `maxDatabaseSize`
+	 * have had their say. Return `false` to keep a shard out; a throw or rejection fails
+	 * the operation with `ELIGIBILITY_FAILED` and never counts as eligible.
+	 *
+	 * With a kv-mapped strategy it runs for each new key (`operation: 'allocate'`),
+	 * because the chosen shard is stored as a mapping. With computed placement it runs
+	 * when a snapshot is published (`operation: 'publish'`), at a cold start and in
+	 * `publishEligibility()`, and the result becomes a topology epoch. It never affects
+	 * a read or an existing key. When no shard is eligible, allocation throws
+	 * `NO_ELIGIBLE_SHARD`. Under computed placement a process that finds an existing
+	 * manifest and no eligible shard publishes nothing, keeps serving reads from the
+	 * epochs it has and refuses every write with `NO_ELIGIBLE_SHARD`.
+	 *
+	 * Re-initializing does not compare this function, so a changed predicate takes
+	 * effect through `publishEligibility()` or the next cold start.
+	 * @since 1.4.0
+	 */
+	eligible?: (shard: string, context: EligibilityContext) => boolean | Promise<boolean>;
 }
 
 /**

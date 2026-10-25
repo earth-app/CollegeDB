@@ -17,7 +17,7 @@ import {
 	run,
 	runShard
 } from '../src/index';
-import type { CollegeDBConfig } from '../src/types';
+import type { CollegeDBConfig, SQLDatabase } from '../src/types';
 
 describe('InMemory Providers - Basic Operations', () => {
 	beforeEach(() => {
@@ -791,5 +791,14 @@ describe('InMemory Providers - Insert via Router and Aggregates', () => {
 
 		const result = await allShard<{ total: number }>('db-a', 'SELECT SUM(score) AS total FROM u');
 		expect(result.results[0]?.total).toBe(30);
+	});
+});
+
+describe('in-memory read consistency', () => {
+	it('reports primary and eventual but no session', () => {
+		const db = createInMemorySQLProvider();
+
+		expect(db.consistency).toEqual({ primary: true, session: false, eventual: true });
+		expect((db as SQLDatabase).withSession).toBeUndefined();
 	});
 });
