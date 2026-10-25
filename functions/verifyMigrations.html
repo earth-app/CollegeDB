@@ -17,9 +17,14 @@
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Checks the journal against the shards. Observational unless <code>repair</code> is set.</p>
 <p>Reports unfinished moves, live rows left on a shard the key moved off, and
-tombstones the journal does not know. With <code>repair: true</code> it resumes unfinished
-moves and removes a ghost row only when it equals the archived copy. The pass
-is recorded; <a href="purgeRetired.html" class="tsd-kind-function">purgeRetired</a> waits for a clean one.</p>
+tombstones the journal does not know. It also reports <code>strandedCopies</code>, live
+destination rows of an aborted move that equal a row the move journaled, and
+<code>staleCutovers</code>, tombstones whose move the journal ended as aborted. Both come
+from a recovery executor that stalled past its lease, and both count against
+<code>clean</code>. With <code>repair: true</code> it resumes unfinished moves, removes a ghost row
+only when it equals the archived copy, removes a stranded copy under the same
+proof, and restores the archived row of a stale cutover when nothing else owns
+the key. The pass is recorded; <a href="purgeRetired.html" class="tsd-kind-function">purgeRetired</a> waits for a clean one.</p>
 </div>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
@@ -36,11 +41,14 @@ is recorded; <a href="purgeRetired.html" class="tsd-kind-function">purgeRetired<
 <div class="tsd-tag-throws">
 <h4 class="tsd-anchor-link" id="throws-1">Throws<a href="#throws-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>With <code>repair</code>: <code>RECOVERY_IN_PROGRESS</code> when another recovery holds the lease; <code>RECOVERY_FENCED</code> when this one lost it mid-run</p>
 </div>
+<div class="tsd-tag-throws">
+<h4 class="tsd-anchor-link" id="throws-2">Throws<a href="#throws-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>With <code>repair</code>: <code>MIGRATION_NO_ATOMIC_BATCH</code> when a stale cutover is restored on a shard that does not declare <code>atomicBatch</code></p>
+</div>
 <div class="tsd-tag-since">
 <h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/router.ts#L3258">src/router.ts:3258</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/router.ts#L3319">src/router.ts:3319</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

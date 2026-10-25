@@ -13,7 +13,7 @@
 <section class="tsd-panel">
 <ul class="tsd-signatures">
 <li class="">
-<div class="tsd-signature tsd-anchor-link" id="insert"><span class="tsd-kind-call-signature">insert</span><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#insertt">T</a> <span class="tsd-signature-symbol">=</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">unknown</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">sql</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">bindings</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">any</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">options</span><span class="tsd-signature-symbol">?:</span> <a href="../interfaces/IdColumnOptions.html" class="tsd-signature-type tsd-kind-interface">IdColumnOptions</a><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/InsertResult.html" class="tsd-signature-type tsd-kind-interface">InsertResult</a><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#insertt">T</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><a href="#insert" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
+<div class="tsd-signature tsd-anchor-link" id="insert"><span class="tsd-kind-call-signature">insert</span><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#insertt">T</a> <span class="tsd-signature-symbol">=</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">unknown</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">sql</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">bindings</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">any</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">options</span><span class="tsd-signature-symbol">?:</span> <a href="../interfaces/InsertOptions.html" class="tsd-signature-type tsd-kind-interface">InsertOptions</a><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/InsertResult.html" class="tsd-signature-type tsd-kind-interface">InsertResult</a><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#insertt">T</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><a href="#insert" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
 <div class="tsd-comment tsd-typography"><p>Executes an insert on an automatically selected shard and returns the generated primary key.</p>
 <p>This is the default helper for generated-key tables. CollegeDB picks a shard
@@ -27,6 +27,14 @@ first mapping and stranding its row. For a generated-key table that spans
 shards, allocate the id with <a href="nextId.html" class="tsd-kind-function">nextId</a> and pass it explicitly; to keep
 using the database's own sequence, confine the table to one shard with
 <a href="insertShard.html" class="tsd-kind-function">insertShard</a>.</p>
+<p><strong>The refused row.</strong> The INSERT has already run when the collision shows up.
+CollegeDB takes only a raw SQL string here and does not parse it, so it does
+not know which table to clean. Pass <code>options.table</code> and it deletes the row it
+just wrote (matched on <code>idColumn</code>, default <code>id</code>) before it throws. Without
+<code>table</code> the row stays on the shard and removing it is the caller's job; the
+error message names the shard and id. If the delete itself fails, the error
+still has the code <code>GENERATED_KEY_COLLISION</code>, names the shard and id of the
+leftover row, and carries the delete failure as <code>cause</code>.</p>
 </div>
 <section class="tsd-panel">
 <h4>Type Parameters</h4>
@@ -43,12 +51,17 @@ using the database's own sequence, confine the table to one shard with
 <li><span><span class="tsd-kind-parameter">bindings</span>: <span class="tsd-signature-type">any</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol"> = []</span></span>
 <div class="tsd-comment tsd-typography"><p>Parameter values to bind to the statement</p>
 </div></li>
-<li><span><span class="tsd-kind-parameter">options</span>: <a href="../interfaces/IdColumnOptions.html" class="tsd-signature-type tsd-kind-interface">IdColumnOptions</a><span class="tsd-signature-symbol"> = {}</span></span></li></ul></div>
+<li><span><span class="tsd-kind-parameter">options</span>: <a href="../interfaces/InsertOptions.html" class="tsd-signature-type tsd-kind-interface">InsertOptions</a><span class="tsd-signature-symbol"> = {}</span></span>
+<div class="tsd-comment tsd-typography"><p><code>idColumn</code> names the generated key column, <code>table</code> enables cleanup of a refused row</p>
+</div></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/InsertResult.html" class="tsd-signature-type tsd-kind-interface">InsertResult</a><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#insertt">T</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4><p>Promise resolving to the write result plus the generated id</p>
 
 <div class="tsd-comment tsd-typography">
 <div class="tsd-tag-throws">
 <h4 class="tsd-anchor-link" id="throws">Throws<a href="#throws" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If the insert succeeds but no generated id can be determined</p>
+</div>
+<div class="tsd-tag-throws">
+<h4 class="tsd-anchor-link" id="throws-1">Throws<a href="#throws-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p><code>GENERATED_KEY_COLLISION</code> when another shard already owns the generated id</p>
 </div>
 <div class="tsd-tag-since">
 <h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.1.4</p>
@@ -59,7 +72,7 @@ using the database's own sequence, confine the table to one shard with
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/router.ts#L2665">src/router.ts:2665</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/router.ts#L2713">src/router.ts:2713</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

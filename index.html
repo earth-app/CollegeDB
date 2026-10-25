@@ -574,12 +574,25 @@ recovery that loses its lease stops with <code>RECOVERY_FENCED</code> and makes 
 does not take the lease; <code>verifyMigrations({ repair: true })</code> does. The full contract, the window the
 fence does not cover, and a Workers <code>scheduled()</code> example are in <code>docs/migration-protocol.md</code> under
 Recovery lease.</p>
+<p>A recovery that stalls between its lease check and a shard write can still run that one write after
+another recovery takes over. Its journal writes are fenced, so it never returns a report and throws
+<code>RECOVERY_FENCED</code>. The stale write can leave a stranded copy on the destination, or archive a source
+row after the new holder aborted the move. <code>verifyMigrations()</code> reports both, and <code>repair</code> fixes them
+where the journal proves the state. One case stays undetected: a stale destination insert that lands
+after the new holder committed and an acknowledged delete removed the key. It needs an executor
+stalled longer than the lease, a complete move by the new holder in that time, and a delete of the
+key in the same interval.</p>
 <p>Crash recovery is not a backup or a restore. Archived source rows are kept for seven days by default
 (<code>retire: { afterMs }</code> changes this), and <code>purgeRetired()</code> clears their payloads once the retention
 deadline has passed and a clean verification pass has run after the move. Tombstones remain, so stale
 writers stay refused. <code>verifyMigrations()</code> reports unfinished moves, ghost rows and tombstones without
-a journal record. <code>verifyMigrations({ repair: true })</code> removes a ghost only when it matches the
-archived payload.</p>
+a journal record. It also reports two leftovers of a recovery executor that stalled past its lease: <code>strandedCopies</code>,
+a live row on the destination of an aborted move that equals a row the move journaled, and
+<code>staleCutovers</code>, a tombstone whose move the journal ended as aborted. Both count against <code>clean</code>.
+<code>verifyMigrations({ repair: true })</code> removes a ghost only when it matches the archived payload,
+removes a stranded copy by the same proof, and restores the archived row of a stale cutover when the
+journal shows that nothing else owns the key. A stale cutover that cannot be restored is reported
+with <code>restorable: false</code> and left as it is.</p>
 <h3 id="single-row-copy" class="tsd-anchor-link">Single-Row Copy<a href="#single-row-copy" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <p><code>migrateRecord(source, target, primaryKey, tableName, options)</code> copies one row to another shard and
 then deletes the source row. It writes no journal, so use <code>reassignShard</code> when a crash between the
@@ -601,8 +614,13 @@ bypass it.</li>
 <code>AUTOINCREMENT</code> or <code>SERIAL</code> sequence, so <code>db-a</code> and <code>db-b</code> both hand out 1, then 2, then 3. Spread
 a generated-key table across shards and the same id eventually arrives twice; the second mapping
 would overwrite the first and leave that row on a shard nothing routes to.</p>
-<p>CollegeDB throws <code>GENERATED_KEY_COLLISION</code> when it sees that instead:</p>
-<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">insertShard</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-a&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Ada&#39;</span><span class="hl-1">]); </span><span class="hl-3">// id 1 on db-a</span><br/><br/><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-b&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Grace&#39;</span><span class="hl-1">]); </span><span class="hl-3">// also id 1</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">	</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-7">CollegeDBError</span><span class="hl-1"> &amp;&amp; </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">code</span><span class="hl-1"> === </span><span class="hl-2">&#39;GENERATED_KEY_COLLISION&#39;</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-3">// The row was written to db-b, but id 1 already routes to db-a. Reconcile</span><br/><span class="hl-1">		</span><span class="hl-3">// it with a cluster-unique id rather than leaving it unreachable.</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">}</span>
+<p>CollegeDB throws <code>GENERATED_KEY_COLLISION</code> when it sees that instead. The INSERT has already run by
+then, so the refused row sits on the shard with no mapping. CollegeDB takes a raw SQL string and
+does not parse it, so it removes that row only when you pass <code>{ table }</code>; it then deletes the row it
+just wrote, matched on <code>idColumn</code> (default <code>id</code>), before it throws. Without <code>table</code> the row stays
+and you delete it; the error message names its shard and id. If the delete fails or removes no row,
+the error keeps the same code, names the leftover row, and carries the delete failure as <code>cause</code>.</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">insertShard</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-a&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Ada&#39;</span><span class="hl-1">]); </span><span class="hl-3">// id 1 on db-a</span><br/><br/><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-b&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Grace&#39;</span><span class="hl-1">], { </span><span class="hl-5">table:</span><span class="hl-1"> </span><span class="hl-2">&#39;auto_users&#39;</span><span class="hl-1"> }); </span><span class="hl-3">// also id 1</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">	</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-7">CollegeDBError</span><span class="hl-1"> &amp;&amp; </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">code</span><span class="hl-1"> === </span><span class="hl-2">&#39;GENERATED_KEY_COLLISION&#39;</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-3">// the row on db-b is gone; retry with a cluster-unique id from nextId()</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">}</span>
 </code><button type="button">Copy</button></pre>
 
 <h3 id="three-ways-to-key-a-generated-id-table" class="tsd-anchor-link">Three Ways to Key a Generated-Id Table<a href="#three-ways-to-key-a-generated-id-table" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
@@ -1530,7 +1548,7 @@ ANALYZE;
 </tr>
 <tr>
 <td><code>GENERATED_KEY_COLLISION</code></td>
-<td>A generated id is already mapped to a different shard</td>
+<td>A generated id is already mapped to another shard; <code>{ table }</code> removes the refused row</td>
 </tr>
 <tr>
 <td><code>UNROUTABLE_QUERY</code></td>

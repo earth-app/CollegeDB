@@ -19,7 +19,7 @@
 </div></div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">EligibilityContext</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#key">key</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#operation">operation</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">&quot;allocate&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;publish&quot;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#state">state</a><span class="tsd-signature-symbol">:</span> <a href="ShardState.html" class="tsd-signature-type tsd-kind-interface">ShardState</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#tags">tags</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L262">src/types.ts:262</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L262">src/types.ts:262</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -41,28 +41,28 @@
 <div class="tsd-comment tsd-typography"><p>The primary key being allocated; unset for a publication and for an insert with a generated key</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L264">src/types.ts:264</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L264">src/types.ts:264</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="operation"><span>operation</span><a href="#operation" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">operation</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">&quot;allocate&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;publish&quot;</span></div>
 <div class="tsd-comment tsd-typography"><p><code>allocate</code> for a new key, <code>publish</code> when a computed placement snapshot is built</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L266">src/types.ts:266</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L266">src/types.ts:266</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="state"><span>state</span><a href="#state" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">state</span><span class="tsd-signature-symbol">:</span> <a href="ShardState.html" class="tsd-signature-type tsd-kind-interface">ShardState</a></div>
 <div class="tsd-comment tsd-typography"><p>The shard's <code>shardState</code> entry, or an empty object</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L270">src/types.ts:270</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L270">src/types.ts:270</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="tags"><span>tags</span><a href="#tags" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">tags</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span></div>
 <div class="tsd-comment tsd-typography"><p>The shard's <code>tags</code>, or an empty object</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L268">src/types.ts:268</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L268">src/types.ts:268</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

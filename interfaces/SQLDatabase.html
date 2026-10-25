@@ -14,7 +14,7 @@
 <div class="tsd-comment tsd-typography"><p>Provider-agnostic SQL database contract.</p>
 </div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">SQLDatabase</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#atomicbatch">atomicBatch</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#consistency">consistency</a><span class="tsd-signature-symbol">?:</span> <a href="ConsistencyCapabilities.html" class="tsd-signature-type tsd-kind-interface">ConsistencyCapabilities</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#dialect">dialect</a><span class="tsd-signature-symbol">?:</span> <a href="../types/SQLDialect.html" class="tsd-signature-type tsd-kind-type-alias">SQLDialect</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-call-signature" href="#prepare-1">prepare</a><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">sql</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="PreparedStatement.html" class="tsd-signature-type tsd-kind-interface">PreparedStatement</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-call-signature" href="#runbatch-1">runBatch</a><span class="tsd-signature-symbol">?</span><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="#runbatcht">T</a> <span class="tsd-signature-symbol">=</span> <span class="tsd-signature-type">Record</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">unknown</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">(</span><br/>        <span class="tsd-kind-parameter">statements</span><span class="tsd-signature-symbol">:</span> <a href="BatchStatement.html" class="tsd-signature-type tsd-kind-interface">BatchStatement</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="QueryResult.html" class="tsd-signature-type tsd-kind-interface">QueryResult</a><span class="tsd-signature-symbol">&lt;</span><a class="tsd-signature-type tsd-kind-type-parameter" href="HyperdriveProvider.html#runbatcht">T</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-call-signature" href="#withsession-1">withSession</a><span class="tsd-signature-symbol">?</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">constraintOrBookmark</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="SQLSession.html" class="tsd-signature-type tsd-kind-interface">SQLSession</a><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div>
-<section class="tsd-panel tsd-hierarchy" data-refl="2096">
+<section class="tsd-panel tsd-hierarchy" data-refl="2113">
 <h4>Hierarchy (<a href="../hierarchy.html#SQLDatabase">View Summary</a>)</h4>
 <ul class="tsd-hierarchy">
 <li class="tsd-hierarchy-item"><span class="tsd-hierarchy-target">SQLDatabase</span>
@@ -25,7 +25,7 @@
 <ul class="tsd-hierarchy">
 <li><a href="../classes/InMemorySQLDatabase.html" class="tsd-signature-type tsd-kind-class">InMemorySQLDatabase</a></li></ul></section><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L287">src/types.ts:287</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L287">src/types.ts:287</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -61,7 +61,7 @@ statements behind would leave a tombstone beside a live row.</p>
 <h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L329">src/types.ts:329</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L329">src/types.ts:329</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="consistency"><code class="tsd-tag">Optional</code><span>consistency</span><a href="#consistency" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">consistency</span><span class="tsd-signature-symbol">?:</span> <a href="ConsistencyCapabilities.html" class="tsd-signature-type tsd-kind-interface">ConsistencyCapabilities</a></div>
@@ -75,7 +75,7 @@ read as supporting <code>session</code> only when it has <a href="#withsession" 
 <h4 class="tsd-anchor-link" id="since-1">Since<a href="#since-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L338">src/types.ts:338</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L338">src/types.ts:338</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="dialect"><code class="tsd-tag">Optional</code><span>dialect</span><a href="#dialect" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">dialect</span><span class="tsd-signature-symbol">?:</span> <a href="../types/SQLDialect.html" class="tsd-signature-type tsd-kind-type-alias">SQLDialect</a></div>
@@ -90,7 +90,7 @@ and is correct for D1 and SQLite.</p>
 <h4 class="tsd-anchor-link" id="since-2">Since<a href="#since-2" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.3.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L299">src/types.ts:299</a></li></ul></aside></section></section></details>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L299">src/types.ts:299</a></li></ul></aside></section></section></details>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Methods"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="methods-1">Methods<a href="#methods-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
@@ -108,7 +108,7 @@ and is correct for D1 and SQLite.</p>
 <li><span><span class="tsd-kind-parameter">sql</span>: <span class="tsd-signature-type">string</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <a href="PreparedStatement.html" class="tsd-signature-type tsd-kind-interface">PreparedStatement</a></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L289">src/types.ts:289</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L289">src/types.ts:289</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="runbatch"><code class="tsd-tag">Optional</code><span>run<wbr/>Batch</span><a href="#runbatch" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -142,7 +142,7 @@ independent transactions.</p>
 <h4 class="tsd-anchor-link" id="since-3">Since<a href="#since-3" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.3.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L318">src/types.ts:318</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L318">src/types.ts:318</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="withsession"><code class="tsd-tag">Optional</code><span>with<wbr/>Session</span><a href="#withsession" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -163,7 +163,7 @@ is how CollegeDB detects it.</p>
 <h4 class="tsd-anchor-link" id="since-4">Since<a href="#since-4" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/types.ts#L346">src/types.ts:346</a></li></ul></aside></div></li></ul></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/types.ts#L346">src/types.ts:346</a></li></ul></aside></div></li></ul></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
