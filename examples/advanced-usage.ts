@@ -90,6 +90,7 @@ export default {
 				'db-west': env['db-west'],
 				'db-central': env['db-central'] // Third shard for demonstration
 			},
+			journalShard: 'db-east', // migration journal; needs a real SQL shard
 			strategy: 'hash' // Consistent hashing for better distribution
 		};
 
