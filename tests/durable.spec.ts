@@ -910,6 +910,17 @@ describe('reconcileAllocations', () => {
 
 	const other = (shard: string) => (shard === 'a' ? 'b' : 'a');
 
+	const verify = { verifyRecords: { tables: [{ table: 'users' }] } };
+
+	async function createUsers(shard: string) {
+		await shards[shard]!.prepare('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY)').run();
+	}
+
+	async function insertUser(shard: string, key: string) {
+		await createUsers(shard);
+		await shards[shard]!.prepare('INSERT INTO users (id) VALUES (?)').bind(key).run();
+	}
+
 	beforeEach(async () => {
 		state = new MockDurableObjectState();
 		coordinator = new ShardCoordinator(state as any);
@@ -964,7 +975,11 @@ describe('reconcileAllocations', () => {
 
 		expect(report).toEqual({
 			examined: 5,
-			agreed: 2,
+			routingAgreed: 2,
+			recordVerified: 0,
+			recordMissing: [],
+			recordMissingCount: 0,
+			recordUnchecked: 5,
 			missingMapping: ['k3', 'k5'],
 			missingMappingCount: 2,
 			disagreeing: [{ key: 'k2', ledgerShard: 'a', recordShard: 'b' }],
@@ -990,7 +1005,10 @@ describe('reconcileAllocations', () => {
 		await setup();
 		const put = vi.spyOn(kv, 'put');
 
-		const report = await reconcileAllocations({ limit: 2, repair: true });
+		await insertUser('b', 'k3');
+		await insertUser('c', 'k5');
+
+		const report = await reconcileAllocations({ limit: 2, repair: true, ...verify });
 
 		expect(report.repaired).toBe(2);
 		expect(put).toHaveBeenCalledTimes(2);
@@ -1009,7 +1027,7 @@ describe('reconcileAllocations', () => {
 
 		const report = await reconcileAllocations({ limit: 1000, pruneVerified: true });
 
-		expect(report).toMatchObject({ examined: 132, agreed: 130, pruned: 130, missingMappingCount: 1, disagreeingCount: 1 });
+		expect(report).toMatchObject({ examined: 132, routingAgreed: 130, pruned: 130, missingMappingCount: 1, disagreeingCount: 1 });
 		const batches = callsTo('/allocations/prune').map((call) => JSON.parse(call.body!).primaryKeys.length);
 		expect(batches).toEqual([128, 2]);
 		expect([...ledgerShards().keys()].sort()).toEqual(['x', 'y']);
@@ -1029,7 +1047,7 @@ describe('reconcileAllocations', () => {
 
 		expect(report).toMatchObject({
 			examined: 2,
-			agreed: 1,
+			routingAgreed: 1,
 			missingMapping: [],
 			disagreeing: [{ key: 'p2', ledgerShard: other(owner('p2')), recordShard: owner('p2') }],
 			pruned: 0
@@ -1041,6 +1059,131 @@ describe('reconcileAllocations', () => {
 		initialize({ kv, shards, disableAutoMigration: true });
 
 		await expect(reconcileAllocations()).rejects.toMatchObject({ code: 'COORDINATOR_NOT_CONFIGURED' });
+	});
+
+	it('reports the routing and record fields and marks every row unchecked without verifyRecords', async () => {
+		ledger([['k1', 'a']]);
+		await mapper.setShardMapping('k1', 'a');
+		await setup();
+
+		expect(await reconcileAllocations()).toEqual({
+			examined: 1,
+			routingAgreed: 1,
+			recordVerified: 0,
+			recordMissing: [],
+			recordMissingCount: 0,
+			recordUnchecked: 1,
+			missingMapping: [],
+			missingMappingCount: 0,
+			disagreeing: [],
+			disagreeingCount: 0,
+			repaired: 0,
+			pruned: 0
+		});
+	});
+
+	it('default run issues no shard queries and prunes only routing-agreed mapped rows', async () => {
+		ledger([
+			['k1', 'a'],
+			['k2', 'a']
+		]);
+		await mapper.setShardMapping('k1', 'a');
+		await setup();
+		const queries = Object.values(shards).map((db) => vi.spyOn(db, 'prepare'));
+
+		const report = await reconcileAllocations({ pruneVerified: true });
+
+		expect(queries.flatMap((spy) => spy.mock.calls)).toHaveLength(0);
+		expect(report).toMatchObject({ routingAgreed: 1, recordUnchecked: 2, pruned: 1 });
+		expect([...ledgerShards().keys()]).toEqual(['k2']);
+	});
+
+	it('repair without verifyRecords throws RECONCILE_VERIFY_REQUIRED before any work', async () => {
+		ledger([['k1', 'a']]);
+		await setup();
+		calls = [];
+
+		await expect(reconcileAllocations({ repair: true })).rejects.toMatchObject({ code: 'RECONCILE_VERIFY_REQUIRED' });
+		expect(calls).toHaveLength(0);
+		expect(await mapper.getShardMapping('k1')).toBeNull();
+	});
+
+	it('verifyRecords: routing agreed without a row is recordMissing and is not pruned', async () => {
+		ledger([['k1', 'a']]);
+		await mapper.setShardMapping('k1', 'a');
+		await createUsers('a');
+		await setup();
+
+		const report = await reconcileAllocations({ pruneVerified: true, ...verify });
+
+		expect(report).toMatchObject({ routingAgreed: 1, recordVerified: 0, recordMissing: ['k1'], recordMissingCount: 1, pruned: 0 });
+		expect(callsTo('/allocations/prune')).toHaveLength(0);
+		expect([...ledgerShards().keys()]).toEqual(['k1']);
+	});
+
+	it('verifyRecords: routing agreed with a row is pruned under pruneVerified', async () => {
+		ledger([['k1', 'a']]);
+		await mapper.setShardMapping('k1', 'a');
+		await insertUser('a', 'k1');
+		await setup();
+
+		const report = await reconcileAllocations({ pruneVerified: true, ...verify });
+
+		expect(report).toMatchObject({ routingAgreed: 1, recordVerified: 1, recordMissingCount: 0, recordUnchecked: 0, pruned: 1 });
+		expect(ledgerShards().size).toBe(0);
+	});
+
+	it('verifyRecords: a disagreeing row is probed on its routed shard and never pruned', async () => {
+		ledger([['k1', 'a']]);
+		await mapper.setShardMapping('k1', 'b');
+		await insertUser('b', 'k1');
+		await setup();
+
+		const report = await reconcileAllocations({ pruneVerified: true, ...verify });
+
+		expect(report).toMatchObject({ disagreeingCount: 1, recordVerified: 1, pruned: 0 });
+		expect([...ledgerShards().keys()]).toEqual(['k1']);
+	});
+
+	it('verifyRecords: repair writes the mapping when the row is on the ledger shard', async () => {
+		ledger([['k1', 'a']]);
+		await insertUser('a', 'k1');
+		await setup();
+
+		const report = await reconcileAllocations({ repair: true, ...verify });
+
+		expect(report).toMatchObject({ repaired: 1, recordVerified: 1, missingMappingCount: 1 });
+		expect(await mapper.getShardMapping('k1')).toMatchObject({ shard: 'a' });
+	});
+
+	it('verifyRecords: repair writes nothing when no row exists and lists the key as missing', async () => {
+		ledger([['k1', 'a']]);
+		await createUsers('a');
+		await setup();
+
+		const report = await reconcileAllocations({ repair: true, ...verify });
+
+		expect(report).toMatchObject({ repaired: 0, recordMissing: ['k1'], recordMissingCount: 1, missingMapping: ['k1'] });
+		expect(await mapper.getShardMapping('k1')).toBeNull();
+	});
+
+	it('verifyRecords: a probe that throws is recordUnchecked and never repairs or prunes', async () => {
+		ledger([
+			['k1', 'a'],
+			['k2', 'a']
+		]);
+		await mapper.setShardMapping('k1', 'a');
+		await setup();
+
+		vi.spyOn(shards.a!, 'prepare').mockImplementation(() => {
+			throw new Error('no such table: users');
+		});
+
+		const report = await reconcileAllocations({ repair: true, pruneVerified: true, ...verify });
+
+		expect(report).toMatchObject({ recordUnchecked: 2, recordMissingCount: 0, recordVerified: 0, repaired: 0, pruned: 0 });
+		expect(await mapper.getShardMapping('k2')).toBeNull();
+		expect(ledgerShards().size).toBe(2);
 	});
 
 	it('caps report key lists at 1000 entries and keeps exact counts', async () => {
