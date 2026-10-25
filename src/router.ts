@@ -84,6 +84,7 @@ import {
 import { planQuery, unroutableError } from './planner';
 import { createWorkersKVProvider, isKVStorage, toProvider, type DrizzleSqlTagLike } from './providers';
 import {
+	RETIRED_TABLE,
 	buildDelete,
 	buildGuardedInsert,
 	buildGuardedUpsert,
@@ -2029,7 +2030,12 @@ function requireJournal(config: CollegeDBConfig): { binding: string; db: SQLData
 /**
  * Follows a tombstone from a shard that no longer holds the key to the shard it
  * moved to, so a read in the cutover window still finds the row. Returns
- * `undefined` when there is nothing to follow or the lookup cannot be made.
+ * `undefined` when the key has no tombstone here.
+ *
+ * A failed lookup, a move chain longer than {@link MAX_TOMBSTONE_HOPS}, a cycle
+ * and a move to an unknown shard all throw, unless `bestEffort` is set. Then
+ * they return `undefined`, which reads as not found.
+ *
  * @private
  */
 async function followTombstone<T>(
@@ -2037,15 +2043,17 @@ async function followTombstone<T>(
 	binding: string,
 	key: string,
 	execute: (database: SQLDatabase) => Promise<T>,
-	isEmpty: (value: T) => boolean
+	isEmpty: (value: T) => boolean,
+	bestEffort: boolean
 ): Promise<T | undefined> {
 	const journal = explicitJournal(config);
 	if (!journal) {
 		return undefined;
 	}
 
+	const visited = [binding];
 	let current = binding;
-	for (let hop = 0; hop < MAX_TOMBSTONE_HOPS; hop++) {
+	for (let hop = 0; ; hop++) {
 		const database = config.shards[current];
 		if (!database || !isProvenJournalDialect(database.dialect)) {
 			return undefined;
@@ -2053,29 +2061,100 @@ async function followTombstone<T>(
 
 		let moved: string | undefined;
 		try {
-			await ensureShardTables(database);
-			moved = (await findTombstone(database, journal.scope, key))?.movedTo;
-		} catch {
+			moved = await tombstoneTarget(database, journal.scope, key);
+		} catch (error) {
+			if (bestEffort) {
+				return undefined;
+			}
+			throw lookupUnavailable(key, current, error);
+		}
+
+		if (moved === undefined) {
 			return undefined;
 		}
 
-		const next = moved === undefined ? undefined : config.shards[moved];
-		if (!next || moved === undefined) {
-			return undefined;
+		if (!config.shards[moved]) {
+			if (bestEffort) {
+				return undefined;
+			}
+			throw new CollegeDBError(
+				`Tombstone for ${key} on ${current} points to ${moved}, which is not a configured shard. ` +
+					'Check the shard configuration; retrying will not help.',
+				'MIGRATION_LOOKUP_UNAVAILABLE'
+			);
 		}
 
-		const result = await execute(next);
+		if (visited.includes(moved) || hop === MAX_TOMBSTONE_HOPS) {
+			if (bestEffort) {
+				return undefined;
+			}
+			const path = visited.join(' -> ');
+			const reason = visited.includes(moved) ? `loops back to ${moved}` : `is longer than ${MAX_TOMBSTONE_HOPS} hops (next ${moved})`;
+			throw new CollegeDBError(`Move chain for ${key} ${reason}: ${path}. Retrying will not help.`, 'MIGRATION_CHAIN_EXCEEDED');
+		}
+
+		visited.push(moved);
+		const result = await execute(config.shards[moved]!);
 		if (!isEmpty(result)) {
 			return result;
 		}
 		current = moved;
 	}
-
-	return undefined;
 }
 
 /** Longest chain of tombstones a read follows. @private */
 const MAX_TOMBSTONE_HOPS = 4;
+
+/**
+ * Where a shard's tombstone for a key points, or `undefined` when it holds none.
+ *
+ * Only a missing sidecar table counts as no tombstone, because no move can have
+ * written one there. The read does not create the table, so a read-only shard
+ * still answers. Every other failure propagates.
+ *
+ * @private
+ */
+async function tombstoneTarget(database: SQLDatabase, scope: string, key: string): Promise<string | undefined> {
+	try {
+		return (await findTombstone(database, scope, key))?.movedTo;
+	} catch (error) {
+		if (isMissingSidecarTable(error)) {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+/**
+ * Whether a lookup failed because the shard has no sidecar table. The table name
+ * must appear in the message, so an unrelated missing object does not match.
+ * @private
+ */
+function isMissingSidecarTable(error: unknown): boolean {
+	const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+	if (code === '42P01' || code === 'ER_NO_SUCH_TABLE') {
+		return true;
+	}
+
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes(RETIRED_TABLE) && /no such table|does not exist|doesn't exist/i.test(message);
+}
+
+/**
+ * The error for a tombstone lookup that failed for a reason other than a missing
+ * table. The read may be retried, or called with `bestEffort` to read it as not
+ * found.
+ * @private
+ */
+function lookupUnavailable(key: string, binding: string, cause: unknown): CollegeDBError {
+	const reason = cause instanceof Error ? cause.message : String(cause);
+	const error = new CollegeDBError(
+		`Could not check whether ${key} moved off ${binding}, because the tombstone lookup failed (${reason}). ` +
+			'Retry the read, or pass bestEffort to treat it as not found.',
+		'MIGRATION_LOOKUP_UNAVAILABLE'
+	);
+	return Object.assign(error, { cause });
+}
 
 /**
  * What a read runs on: the shard, or a read session opened on it.
@@ -2200,7 +2279,11 @@ function sharing(s: RouterState, options: ReadOptions | undefined): ReadOptions 
 		return options ?? {};
 	}
 
-	return { consistency: options.consistency, sessions: readSessions(getConfig(s), options.consistency) } as ReadOptions;
+	return {
+		consistency: options.consistency,
+		bestEffort: options.bestEffort,
+		sessions: readSessions(getConfig(s), options.consistency)
+	} as ReadOptions;
 }
 
 /**
@@ -2238,7 +2321,8 @@ async function readAcrossCandidates<T>(
 	key: string,
 	sql: string,
 	execute: (database: SQLDatabase) => Promise<T>,
-	isEmpty: (value: T) => boolean
+	isEmpty: (value: T) => boolean,
+	options: ReadOptions | undefined
 ): Promise<T> {
 	const config = getConfig(s);
 	const operationType = getOperationType(sql);
@@ -2258,7 +2342,7 @@ async function readAcrossCandidates<T>(
 		const result = await execute(database);
 		// no journal means no tombstones, so the async walk is skipped
 		return isEmpty(result) && config.journalShard !== undefined
-			? ((await followTombstone(config, binding, key, execute, isEmpty)) ?? result)
+			? ((await followTombstone(config, binding, key, execute, isEmpty, options?.bestEffort === true)) ?? result)
 			: result;
 	}
 
@@ -2293,7 +2377,7 @@ async function readAcrossCandidates<T>(
 	if (firstResult !== undefined) {
 		return config.journalShard === undefined
 			? firstResult
-			: ((await followTombstone(config, candidates[0] ?? '', key, execute, isEmpty)) ?? firstResult);
+			: ((await followTombstone(config, candidates[0] ?? '', key, execute, isEmpty, options?.bestEffort === true)) ?? firstResult);
 	}
 
 	const fallback = config.shards[candidates[0] ?? ''];
@@ -2657,6 +2741,8 @@ async function insertShardIn<T = Record<string, unknown>>(
  * @param bindings - Parameter values to bind to the SQL statement
  * @returns Promise that resolves to the result of the update operation
  * @throws {Error} If update fails or routing fails
+ * @throws {CollegeDBError} `MIGRATION_LOOKUP_UNAVAILABLE` when a tombstone lookup fails or names an unknown shard;
+ * `MIGRATION_CHAIN_EXCEEDED` on a move cycle or a chain past four hops. Both return not found with `bestEffort`.
  *
  * @example
  * ```typescript
@@ -2710,7 +2796,8 @@ async function allIn<T = Record<string, unknown>>(
 					.bind(...bindings)
 					.all<T>()
 			),
-		(value) => value.success && value.results.length === 0
+		(value) => value.success && value.results.length === 0,
+		options
 	);
 
 	if (!result.success) {
@@ -2733,6 +2820,8 @@ async function allIn<T = Record<string, unknown>>(
  * @param bindings - Parameter values to bind to the SQL statement
  * @returns Promise that resolves to the first matching record, or null if not found
  * @throws {Error} If query fails or routing fails
+ * @throws {CollegeDBError} `MIGRATION_LOOKUP_UNAVAILABLE` when a tombstone lookup fails or names an unknown shard;
+ * `MIGRATION_CHAIN_EXCEEDED` on a move cycle or a chain past four hops. Both return not found with `bestEffort`.
  *
  * @example
  * ```typescript
@@ -2781,7 +2870,8 @@ async function firstIn<T = Record<string, unknown>>(
 				.prepare(sql)
 				.bind(...bindings)
 				.first<T>(),
-		(value) => value === null
+		(value) => value === null,
+		options
 	);
 }
 
@@ -3123,11 +3213,14 @@ async function republishExceptions(s: RouterState, config: CollegeDBConfig): Pro
  * the move already did from the shards and the journal, and finishes it or aborts
  * it, per the rules in `docs/migration-protocol.md`. A move that cannot be
  * resolved is reported in `failed` and left for an operator. Run it on a timer, or
- * after a deploy that may have interrupted a move. Run one recovery at a time.
+ * after a deploy that may have interrupted a move. One recovery runs per journal
+ * scope at a time, on any number of isolates: it takes a lease in the journal, and a
+ * second call while the lease is live throws `RECOVERY_IN_PROGRESS`, which a timer
+ * can treat as success.
  *
  * @param options - `olderThanMs` leaves alone moves that changed more recently than that
  * @returns What happened to each active claim
- * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`; `JOURNAL_UNAVAILABLE` when the journal cannot be read
+ * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`; `RECOVERY_IN_PROGRESS` when another recovery holds the lease; `RECOVERY_FENCED` when this one lost the lease mid-run; `JOURNAL_UNAVAILABLE` when the journal cannot be read
  * @since 1.4.0
  * @example
  * ```typescript
@@ -3159,6 +3252,7 @@ async function recoverMigrationsIn(s: RouterState, options: { olderThanMs?: numb
  * @param options - `repair` to act on what it finds
  * @returns The findings
  * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
+ * @throws {CollegeDBError} With `repair`: `RECOVERY_IN_PROGRESS` when another recovery holds the lease; `RECOVERY_FENCED` when this one lost it mid-run
  * @since 1.4.0
  */
 export function verifyMigrations(options: { repair?: boolean } = {}): Promise<VerifyReport> {

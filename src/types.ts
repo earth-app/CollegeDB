@@ -195,6 +195,13 @@ export type ReadConsistency = { mode: 'primary' } | { mode: 'session'; bookmarks
 export interface ReadOptions {
 	/** Read guarantee for this call */
 	consistency?: ReadConsistency;
+	/**
+	 * Treat a failed move lookup as not found. Without it, a tombstone lookup that
+	 * fails, a move chain longer than the read follows, or a move to an unknown
+	 * shard throws instead of returning an empty result.
+	 * @since 1.4.0
+	 */
+	bestEffort?: boolean;
 }
 
 /**

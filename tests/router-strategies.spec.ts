@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cached, invalidate } from '../src/cache';
+import { CollegeDBError } from '../src/errors';
 import { KVShardMapper } from '../src/kvmap';
 import {
 	addPlacementException,
@@ -13,6 +14,7 @@ import {
 	withCurrentTopology
 } from '../src/placement';
 import { createInMemoryKVProvider, createInMemorySQLProvider } from '../src/providers-memory';
+import { buildShardSidecarSchema, RETIRED_TABLE } from '../src/query';
 import {
 	all,
 	allAllShardsGlobal,
@@ -44,6 +46,7 @@ import {
 	upsert
 } from '../src/router';
 import type { BatchStatement, KVStorage, QueryResult, SQLDatabase } from '../src/types';
+import { restoreClock, setClock, settle } from './helpers/clock';
 import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
 
 const SCHEMA = 'CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)';
@@ -1084,21 +1087,19 @@ describe('Computed placement', () => {
 	});
 
 	it('shares one manifest read among the operations that find the cache expired', async () => {
-		vi.useFakeTimers({ toFake: ['Date'] });
-
 		try {
 			const { counts } = await setupComputed();
 			await run('user-1', 'INSERT INTO users (id, name) VALUES (?, ?)', ['user-1', 'Ada']);
-			await new Promise((resolve) => setTimeout(resolve, 0));
+			await settle();
 
-			vi.setSystemTime(Date.now() + 11_000);
+			setClock(Date.now() + 11_000);
 			const before = counts.get;
 			await Promise.all(Array.from({ length: 20 }, (_, i) => first(`user-${i}`, 'SELECT * FROM users WHERE id = ?', [`user-${i}`])));
 
 			// one getMany for the manifest and exception set, not one per operation
 			expect(counts.get - before).toBe(1);
 		} finally {
-			vi.useRealTimers();
+			restoreClock();
 		}
 	});
 
@@ -1156,12 +1157,8 @@ describe('Computed placement', () => {
 		const read1 = () => first<{ name: string }>('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
 		const expectUnverified = (work: Promise<unknown>) => expect(work).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
 
-		beforeEach(() => {
-			vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-		});
-
 		afterEach(() => {
-			vi.useRealTimers();
+			restoreClock();
 		});
 
 		it('keeps serving cached keys, reads and writes, while the cached state is inside its TTL', async () => {
@@ -1175,7 +1172,7 @@ describe('Computed placement', () => {
 
 		it('serves reads from the stale manifest and exception set once the TTL has passed', async () => {
 			const { mode } = await setupFlaky();
-			await vi.advanceTimersByTimeAsync(11_000);
+			setClock(Date.now() + 11_000);
 			mode.state = 'down';
 
 			expect(await read1()).toMatchObject({ name: 'Ada' });
@@ -1183,7 +1180,7 @@ describe('Computed placement', () => {
 
 		it('refuses a write on stale placement state and accepts it again once KV is back', async () => {
 			const { mode, shards } = await setupFlaky();
-			await vi.advanceTimersByTimeAsync(11_000);
+			setClock(Date.now() + 11_000);
 			mode.state = 'down';
 
 			await expectUnverified(insert2());
@@ -1198,7 +1195,7 @@ describe('Computed placement', () => {
 
 		it('fails reads and writes on a cold isolate instead of computing against an assumed manifest', async () => {
 			const { mode, config, shards } = await setupFlaky();
-			await vi.advanceTimersByTimeAsync(0);
+			await settle();
 			mode.state = 'down';
 
 			resetConfig();
@@ -1215,52 +1212,44 @@ describe('Computed placement', () => {
 		});
 
 		it('reports a hung KV as PLACEMENT_UNVERIFIED and never as a missing key', async () => {
-			const { mode, config } = await setupFlaky({ kvTimeoutMs: 100 });
-			await vi.advanceTimersByTimeAsync(0);
+			const { mode, config } = await setupFlaky({ kvTimeoutMs: 30 });
+			await settle();
 			mode.state = 'hung';
 
 			resetConfig();
 			initialize(config);
-			const cold = expectUnverified(read1());
-			await vi.advanceTimersByTimeAsync(300);
-			await cold;
+			await expectUnverified(read1());
 
 			mode.state = 'up';
 			expect(await read1()).toMatchObject({ name: 'Ada' });
-			await vi.advanceTimersByTimeAsync(11_000);
+			setClock(Date.now() + 11_000);
 			mode.state = 'hung';
-			const stale = expectUnverified(insert2());
-			await vi.advanceTimersByTimeAsync(300);
-			await stale;
+			await expectUnverified(insert2());
 		});
 
 		it('lets stale reads skip a refresh for a second after one failed, so a hung KV is waited on once', async () => {
-			const { mode } = await setupFlaky({ kvTimeoutMs: 100 });
-			await vi.advanceTimersByTimeAsync(11_000);
+			const { mode } = await setupFlaky({ kvTimeoutMs: 30 });
+			setClock(Date.now() + 11_000);
 			mode.state = 'hung';
 
 			const callsBefore = mode.calls ?? 0;
-			const firstRead = read1();
-			await vi.advanceTimersByTimeAsync(150);
-			expect(await firstRead).toMatchObject({ name: 'Ada' });
+			expect(await read1()).toMatchObject({ name: 'Ada' });
 			const callsAfterFirst = mode.calls ?? 0;
 			expect(callsAfterFirst).toBeGreaterThan(callsBefore);
 
-			// no timer advances here, so a read that tried KV again would never settle
+			// the clock is frozen, so a read that tried KV again would show up in the call count
 			expect(await read1()).toMatchObject({ name: 'Ada' });
 			expect(await read1()).toMatchObject({ name: 'Ada' });
 			expect(mode.calls).toBe(callsAfterFirst);
 
-			await vi.advanceTimersByTimeAsync(1_100);
-			const retried = read1();
-			await vi.advanceTimersByTimeAsync(150);
-			expect(await retried).toMatchObject({ name: 'Ada' });
+			setClock(Date.now() + 1_100);
+			expect(await read1()).toMatchObject({ name: 'Ada' });
 			expect(mode.calls).toBeGreaterThan(callsAfterFirst);
 		});
 
 		it('does not back writes off: each one tries KV, so a write sees the recovery at once', async () => {
 			const { mode } = await setupFlaky();
-			await vi.advanceTimersByTimeAsync(11_000);
+			setClock(Date.now() + 11_000);
 			mode.state = 'down';
 
 			await expectUnverified(insert2());
@@ -1308,12 +1297,8 @@ describe('Computed placement', () => {
 			}
 		}
 
-		beforeEach(() => {
-			vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-		});
-
 		afterEach(() => {
-			vi.useRealTimers();
+			restoreClock();
 		});
 
 		it('lands a write from the older epoch on an owner the newer client still finds', async () => {
@@ -1376,7 +1361,7 @@ describe('Computed placement', () => {
 			});
 
 			expect(await read()).toBeFalsy();
-			await vi.advanceTimersByTimeAsync(11_000);
+			setClock(Date.now() + 11_000);
 			expect(await read()).toMatchObject({ name: 'Ada' });
 		});
 
@@ -1410,7 +1395,7 @@ describe('Computed placement', () => {
 
 			// A finds the key through the walk and memoizes it as an exception
 			expect(await first<{ name: string }>(key, 'SELECT * FROM users WHERE id = ?', [key])).toMatchObject({ name: 'Ada' });
-			await vi.advanceTimersByTimeAsync(0);
+			await settle();
 
 			const stored = await asOtherClient(() => loadPlacementManifest(kv, undefined, { fresh: true }));
 			expect(stored!.epochs.map((epoch) => epoch.n)).toEqual([3, 2, 1]);
@@ -1716,7 +1701,7 @@ describe('Writes after a topology change', () => {
 
 		await expect(run(key, 'UPDATE tags SET note = ? WHERE tag = ?', ['new', key])).rejects.toMatchObject({
 			code: 'WRITE_UNRESOLVED',
-			message: /keyColumns/
+			message: expect.stringMatching(/keyColumns/)
 		});
 
 		world.boot({ names: ['db-a', 'db-b', 'db-c'], keyColumns: { tags: 'tag' } });
@@ -1800,6 +1785,197 @@ describe('Writes after a topology change', () => {
 			}
 
 			expect({ get: counts.get, put: counts.put }).toEqual(settled);
+		});
+	});
+});
+
+describe('Tombstone reads', () => {
+	const KEY = 'k1';
+	const SELECT = 'SELECT * FROM users WHERE id = ?';
+
+	type Handle = ReturnType<typeof openNodeSqlite>;
+
+	afterEach(() => {
+		resetConfig();
+		resetPlacementState();
+	});
+
+	/**
+	 * SQLite shards whose tombstone lookups throw the error named in `failing`. With
+	 * `refuseCreate`, the sidecar table cannot be created, as on a read-only shard.
+	 */
+	function openShards(
+		names: string[],
+		failing: Record<string, Error>,
+		refuseCreate: boolean
+	): { raw: Record<string, Handle>; shards: Record<string, SQLDatabase> } {
+		const raw: Record<string, Handle> = {};
+		const shards: Record<string, SQLDatabase> = {};
+		for (const name of names) {
+			const handle = openNodeSqlite();
+			handle.exec(SCHEMA);
+			const provider = createNodeSqliteProvider(handle);
+			raw[name] = handle;
+			shards[name] = {
+				...provider,
+				prepare: (sql: string) => {
+					if (sql.includes(RETIRED_TABLE) && failing[name]) throw failing[name];
+					if (refuseCreate && sql.includes(RETIRED_TABLE) && /^CREATE TABLE/.test(sql)) {
+						throw new Error('attempt to write a readonly database');
+					}
+					return provider.prepare(sql);
+				}
+			} as SQLDatabase;
+		}
+		return { raw, shards };
+	}
+
+	/** Routes KEY to `route` and boots the router with the journal on db-a. */
+	async function setup(
+		names: string[],
+		route: string,
+		failing: Record<string, Error> = {},
+		refuseCreate = false
+	): Promise<Record<string, Handle>> {
+		const kv = createInMemoryKVProvider();
+		const { raw, shards } = openShards(names, failing, refuseCreate);
+		const mapper = new KVShardMapper(kv, { hashShardMappings: false });
+		await mapper.setShardMapping(KEY, route);
+		expect((await mapper.getShardMapping(KEY))?.shard).toBe(route);
+		initialize({
+			kv,
+			shards,
+			strategy: 'hash',
+			disableAutoMigration: true,
+			hashShardMappings: false,
+			mappingCacheTtlMs: 0,
+			journalShard: 'db-a'
+		});
+		return raw;
+	}
+
+	/** Records on `handle` that KEY moved to `to`, creating the sidecar table as a move does. */
+	function tombstone(handle: Handle, to: string): void {
+		for (const sql of buildShardSidecarSchema()) handle.exec(sql);
+		handle
+			.prepare(
+				`INSERT INTO ${RETIRED_TABLE} (scope, table_name, primary_key, pk_column, op_id, generation, moved_to, payload, archived_at, purged_at) ` +
+					`VALUES ('default', 'users', ?, 'id', ?, 1, ?, NULL, 0, NULL)`
+			)
+			.run(KEY, `op-${to}`, to);
+	}
+
+	/** Tombstones each shard in `path` to the one after it. */
+	function chain(raw: Record<string, Handle>, path: string[]): void {
+		for (let i = 0; i < path.length - 1; i++) tombstone(raw[path[i]!]!, path[i + 1]!);
+	}
+
+	function row(handle: Handle, name: string): void {
+		handle.prepare('INSERT INTO users (id, name) VALUES (?, ?)').run(KEY, name);
+	}
+
+	it('follows one tombstone to the row on the destination', async () => {
+		const raw = await setup(['db-a', 'db-b'], 'db-a');
+		chain(raw, ['db-a', 'db-b']);
+		row(raw['db-b']!, 'moved');
+
+		expect(await first<{ name: string }>(KEY, SELECT, [KEY])).toMatchObject({ name: 'moved' });
+	});
+
+	it('follows two tombstones to the row on the last shard', async () => {
+		const raw = await setup(['db-a', 'db-b', 'db-c'], 'db-a');
+		chain(raw, ['db-a', 'db-b', 'db-c']);
+		row(raw['db-c']!, 'moved');
+
+		expect(await first<{ name: string }>(KEY, SELECT, [KEY])).toMatchObject({ name: 'moved' });
+	});
+
+	it('follows a four-hop chain to the row', async () => {
+		const path = ['db-a', 'db-b', 'db-c', 'db-d', 'db-e'];
+		const raw = await setup(path, 'db-a');
+		chain(raw, path);
+		row(raw['db-e']!, 'moved');
+
+		expect(await first<{ name: string }>(KEY, SELECT, [KEY])).toMatchObject({ name: 'moved' });
+	});
+
+	it('throws MIGRATION_CHAIN_EXCEEDED for a five-hop chain instead of reporting absence', async () => {
+		const path = ['db-a', 'db-b', 'db-c', 'db-d', 'db-e', 'db-f'];
+		const raw = await setup(path, 'db-a');
+		chain(raw, path);
+		row(raw['db-f']!, 'unreached');
+
+		await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({
+			code: 'MIGRATION_CHAIN_EXCEEDED',
+			message: expect.stringMatching(/k1.*db-a -> db-b -> db-c -> db-d -> db-e/)
+		});
+	});
+
+	it('throws MIGRATION_CHAIN_EXCEEDED when a tombstone points back at a visited shard', async () => {
+		const raw = await setup(['db-a', 'db-b'], 'db-a');
+		chain(raw, ['db-a', 'db-b']);
+		tombstone(raw['db-b']!, 'db-a');
+
+		await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({
+			code: 'MIGRATION_CHAIN_EXCEEDED',
+			message: expect.stringMatching(/k1.*db-a -> db-b/)
+		});
+	});
+
+	it('throws MIGRATION_LOOKUP_UNAVAILABLE when the tombstone lookup fails, instead of reporting absence', async () => {
+		const failure = new Error('read timed out');
+		const raw = await setup(['db-a', 'db-b'], 'db-a', { 'db-a': failure });
+		chain(raw, ['db-a', 'db-b']);
+		row(raw['db-b']!, 'moved');
+
+		const error = await first(KEY, SELECT, [KEY]).catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(CollegeDBError);
+		expect(error).toMatchObject({ code: 'MIGRATION_LOOKUP_UNAVAILABLE', message: expect.stringMatching(/k1.*db-a/) });
+		expect((error as { cause?: unknown }).cause).toBe(failure);
+
+		await expect(all(KEY, SELECT, [KEY])).rejects.toMatchObject({ code: 'MIGRATION_LOOKUP_UNAVAILABLE' });
+	});
+
+	it('returns the empty answer when bestEffort is set and the lookup fails', async () => {
+		const raw = await setup(['db-a', 'db-b'], 'db-a', { 'db-a': new Error('read timed out') });
+		chain(raw, ['db-a', 'db-b']);
+		row(raw['db-b']!, 'moved');
+
+		await expect(first(KEY, SELECT, [KEY], { bestEffort: true })).resolves.toBeNull();
+		expect((await all(KEY, SELECT, [KEY], { bestEffort: true })).results).toEqual([]);
+	});
+
+	it('keeps bestEffort when a consistency request is also set', async () => {
+		const raw = await setup(['db-a', 'db-b'], 'db-a', { 'db-a': new Error('read timed out') });
+		chain(raw, ['db-a', 'db-b']);
+		row(raw['db-b']!, 'moved');
+
+		await expect(first(KEY, SELECT, [KEY], { bestEffort: true, consistency: { mode: 'primary' } })).resolves.toBeNull();
+	});
+
+	it('reads a shard that refuses the sidecar table as holding no tombstone, and does not create one', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const raw = await setup(['db-a', 'db-b'], 'db-a', {}, true);
+			// let the background journal schema attempt fail before reading
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(await first(KEY, SELECT, [KEY])).toBeNull();
+			expect(raw['db-a']!.prepare('SELECT name FROM sqlite_master WHERE name = ?').get(RETIRED_TABLE)).toBeUndefined();
+		} finally {
+			warn.mockRestore();
+			error.mockRestore();
+		}
+	});
+
+	it('throws MIGRATION_LOOKUP_UNAVAILABLE for a tombstone that names a shard outside the config', async () => {
+		const raw = await setup(['db-a', 'db-b'], 'db-a');
+		tombstone(raw['db-a']!, 'db-z');
+
+		await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({
+			code: 'MIGRATION_LOOKUP_UNAVAILABLE',
+			message: expect.stringMatching(/db-z/)
 		});
 	});
 });
