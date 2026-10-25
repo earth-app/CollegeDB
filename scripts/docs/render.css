@@ -1,0 +1,14 @@
+.tsd-typography table {
+	display: block;
+	width: fit-content;
+	max-width: 100%;
+	overflow-x: auto;
+}
+
+.tsd-typography :not(pre) > code {
+	overflow-wrap: anywhere;
+}
+
+.tsd-typography pre {
+	overflow-x: auto;
+}
