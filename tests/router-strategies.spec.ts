@@ -323,6 +323,106 @@ describe('Generated id extraction', () => {
 		);
 	});
 
+	describe('a refused insert and the row it wrote', () => {
+		const AUTO_SCHEMA = 'CREATE TABLE auto_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)';
+
+		// db-a owns ids 1 and 2; db-b holds an unmapped id 1 so its next sequence value is 2, which collides
+		async function collidingCluster() {
+			const kv = createInMemoryKVProvider();
+			const shards = await makeShards(['db-a', 'db-b']);
+
+			initialize({ kv, shards, strategy: 'hash', disableAutoMigration: true, hashShardMappings: false });
+			for (const name of Object.keys(shards)) {
+				await runShard(name, AUTO_SCHEMA);
+			}
+
+			await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Ada']);
+			await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Grace']);
+			await runShard('db-b', 'INSERT INTO auto_users (id, name) VALUES (?, ?)', [1, 'Bystander']);
+		}
+
+		const namesOn = async (shard: string) =>
+			(await runShard<{ id: number; name: string }>(shard, 'SELECT id, name FROM auto_users ORDER BY id')).results.map(
+				(row) => `${row.id}:${row.name}`
+			);
+
+		it('removes the row it wrote when the table is named', async () => {
+			await collidingCluster();
+
+			await expect(
+				insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus'], { table: 'auto_users' })
+			).rejects.toMatchObject({ code: 'GENERATED_KEY_COLLISION', message: expect.stringContaining('removed') });
+
+			expect(await namesOn('db-b')).toEqual(['1:Bystander']);
+			expect(await countShard('db-b', 'auto_users')).toBe(1);
+		});
+
+		it('leaves the owner shard row and other rows on the refused shard alone', async () => {
+			await collidingCluster();
+
+			await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus'], { table: 'auto_users' }).catch(() => undefined);
+
+			expect(await namesOn('db-a')).toEqual(['1:Ada', '2:Grace']);
+			expect(await namesOn('db-b')).toEqual(['1:Bystander']);
+			expect((await first('2', 'SELECT name FROM auto_users WHERE id = ?', [2])) as { name: string } | null).toEqual({ name: 'Grace' });
+		});
+
+		it('removes the row of a RETURNING insert as well', async () => {
+			await collidingCluster();
+
+			await expect(
+				insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?) RETURNING id', ['Linus'], { table: 'auto_users' })
+			).rejects.toMatchObject({ code: 'GENERATED_KEY_COLLISION' });
+
+			expect(await namesOn('db-b')).toEqual(['1:Bystander']);
+		});
+
+		it('names the shard and id of the row it leaves behind when no table is given', async () => {
+			await collidingCluster();
+
+			const error = await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus']).catch((e) => e);
+
+			expect(error).toBeInstanceOf(CollegeDBError);
+			expect(error.code).toBe('GENERATED_KEY_COLLISION');
+			expect(error.message).toMatch(/already mapped to shard db-a/);
+			expect(error.message).toMatch(/still on shard db-b with id 2/);
+			expect(await namesOn('db-b')).toEqual(['1:Bystander', '2:Linus']);
+		});
+
+		it('attaches the delete failure as the cause and names the orphan when removal fails', async () => {
+			await collidingCluster();
+
+			const error = await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus'], { table: 'missing_table' }).catch(
+				(e) => e
+			);
+
+			expect(error).toBeInstanceOf(CollegeDBError);
+			expect(error.code).toBe('GENERATED_KEY_COLLISION');
+			expect(error.message).toMatch(/still on shard db-b with id 2/);
+			expect(error.cause).toBeInstanceOf(Error);
+			expect(await namesOn('db-b')).toEqual(['1:Bystander', '2:Linus']);
+		});
+
+		it('rejects an unsafe table name before anything is written', async () => {
+			await collidingCluster();
+
+			await expect(
+				insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus'], { table: 'auto_users; DROP TABLE auto_users' })
+			).rejects.toThrow();
+
+			expect(await namesOn('db-b')).toEqual(['1:Bystander']);
+		});
+
+		it('leaves a successful insert and its mapping alone when a table is named', async () => {
+			await collidingCluster();
+
+			const created = await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Linus'], { table: 'auto_users' });
+
+			expect(created.generatedId).toBe(3);
+			expect(await namesOn('db-a')).toEqual(['1:Ada', '2:Grace', '3:Linus']);
+		});
+	});
+
 	it('does not read the mapping to rule out a collision on a single shard', async () => {
 		const { kv, counts } = countingKV(createInMemoryKVProvider());
 		const shards = await makeShards(['db-a']);
@@ -1976,6 +2076,61 @@ describe('Tombstone reads', () => {
 		await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({
 			code: 'MIGRATION_LOOKUP_UNAVAILABLE',
 			message: expect.stringMatching(/db-z/)
+		});
+	});
+
+	describe('driver errors wrapped by Drizzle', () => {
+		/** Drizzle's wrapper: the query and its parameters on the message, the driver error on cause. */
+		function wrapped(driver: unknown, params = `default, ${KEY}`): Error {
+			return Object.assign(new Error(`Failed query: SELECT * FROM ${RETIRED_TABLE} WHERE scope = $1 params: ${params}`), {
+				cause: driver
+			});
+		}
+
+		const MISSING_TABLE = [
+			['Postgres', Object.assign(new Error(`relation "${RETIRED_TABLE}" does not exist`), { code: '42P01' })],
+			['MySQL', Object.assign(new Error(`Table 'app.${RETIRED_TABLE}' doesn't exist`), { code: 'ER_NO_SUCH_TABLE', errno: 1146 })],
+			['MariaDB', Object.assign(new Error(`Table 'app.${RETIRED_TABLE}' doesn't exist`), { code: 'ER_NO_SUCH_TABLE', errno: 1146 })]
+		] as const;
+
+		it.each(MISSING_TABLE)('reads a missing %s sidecar table on the cause as holding no tombstone', async (_dialect, driver) => {
+			await setup(['db-a', 'db-b'], 'db-a', { 'db-a': wrapped(driver) });
+
+			expect(await first(KEY, SELECT, [KEY])).toBeNull();
+		});
+
+		it('reads a missing table three links down the cause chain as holding no tombstone', async () => {
+			const middle = Object.assign(new Error('driver call failed'), { cause: MISSING_TABLE[0][1] });
+			await setup(['db-a', 'db-b'], 'db-a', { 'db-a': wrapped(middle) });
+
+			expect(await first(KEY, SELECT, [KEY])).toBeNull();
+		});
+
+		it.each([
+			['permission denied', Object.assign(new Error(`permission denied for table ${RETIRED_TABLE}`), { code: '42501' })],
+			['connection refused', Object.assign(new Error('connect ECONNREFUSED 10.0.0.5:5432'), { code: 'ECONNREFUSED' })]
+		])('throws MIGRATION_LOOKUP_UNAVAILABLE for a wrapped %s, instead of reporting absence', async (_reason, driver) => {
+			const outer = wrapped(driver);
+			await setup(['db-a', 'db-b'], 'db-a', { 'db-a': outer });
+
+			const error = await first(KEY, SELECT, [KEY]).catch((caught: unknown) => caught);
+			expect(error).toMatchObject({ code: 'MIGRATION_LOOKUP_UNAVAILABLE' });
+			expect((error as { cause?: unknown }).cause).toBe(outer);
+		});
+
+		it('does not read a permission failure as a missing table because a key holds the phrase', async () => {
+			const driver = Object.assign(new Error(`permission denied for table ${RETIRED_TABLE}`), { code: '42501' });
+			await setup(['db-a', 'db-b'], 'db-a', { 'db-a': wrapped(driver, `default, a key that does not exist`) });
+
+			await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({ code: 'MIGRATION_LOOKUP_UNAVAILABLE' });
+		});
+
+		it('stops at a cause cycle and reads the failure as unavailable', async () => {
+			const loop = new Error('connection reset');
+			Object.assign(loop, { cause: loop });
+			await setup(['db-a', 'db-b'], 'db-a', { 'db-a': wrapped(loop) });
+
+			await expect(first(KEY, SELECT, [KEY])).rejects.toMatchObject({ code: 'MIGRATION_LOOKUP_UNAVAILABLE' });
 		});
 	});
 });

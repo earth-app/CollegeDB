@@ -50,6 +50,7 @@ import {
 	createSchemaAcrossShards,
 	ensureJournalSchema,
 	ensureShardTables,
+	errorChain,
 	findTombstone,
 	getMigrationStatus as getJournalStatus,
 	moveRecord,
@@ -2125,19 +2126,29 @@ async function tombstoneTarget(database: SQLDatabase, scope: string, key: string
 	}
 }
 
+/** MySQL and MariaDB error number for a missing table. @private */
+const MYSQL_NO_SUCH_TABLE = 1146;
+
 /**
- * Whether a lookup failed because the shard has no sidecar table. The table name
- * must appear in the message, so an unrelated missing object does not match.
+ * Whether a lookup failed because the shard has no sidecar table. A missing-table
+ * code counts on any link of the cause chain, because Drizzle wraps the driver
+ * error. A message counts only on a link with no cause: a wrapper's message
+ * echoes the query and its parameters, and a key can hold the phrase. The table
+ * name must appear in the message, so an unrelated missing object does not match.
  * @private
  */
 function isMissingSidecarTable(error: unknown): boolean {
-	const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
-	if (code === '42P01' || code === 'ER_NO_SUCH_TABLE') {
-		return true;
-	}
-
-	const message = error instanceof Error ? error.message : String(error);
-	return message.includes(RETIRED_TABLE) && /no such table|does not exist|doesn't exist/i.test(message);
+	return errorChain(error).some((link) => {
+		const { code, errno, cause } = link as { code?: unknown; errno?: unknown; cause?: unknown };
+		if (code === '42P01' || code === 'ER_NO_SUCH_TABLE' || errno === MYSQL_NO_SUCH_TABLE) {
+			return true;
+		}
+		if (cause) {
+			return false;
+		}
+		const message = link instanceof Error ? link.message : String(link);
+		return message.includes(RETIRED_TABLE) && /no such table|does not exist|doesn't exist/i.test(message);
+	});
 }
 
 /**
@@ -2580,11 +2591,19 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
-	options: IdColumnOptions = {}
+	options: InsertOptions = {}
 ): Promise<InsertResult<T>> {
 	const config = getConfig(s);
 	if (!config.shards[shardBinding]) {
 		throw new CollegeDBError(`Shard ${shardBinding} not found`, 'SHARD_NOT_FOUND');
+	}
+
+	// validated before the INSERT so a bad name cannot leave a row behind
+	const dialect = dialectOf(s, shardBinding);
+	const idColumn = options.idColumn ?? 'id';
+	if (options.table) {
+		quoteIdentifier(options.table, dialect);
+		quoteIdentifier(idColumn, dialect);
 	}
 
 	const returning = /\breturning\b/i.test(sql);
@@ -2605,21 +2624,39 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 
 	// Each shard mints its own sequence, so two shards both hand out 1, then 2,
 	// and so on. Storing the second mapping would overwrite the first and leave
-	// the earlier row on a shard nothing routes to. Refusing here turns silent
-	// unreachability into an error at the point the collision happens.
+	// the earlier row on a shard nothing routes to. The INSERT has already run by
+	// the time the id is known, so a refusal also has to remove that row, or it
+	// stays on the shard with no mapping. That needs the table, hence options.table.
 	//
 	// One shard has no second sequence to collide with, so the lookup is skipped
 	// there rather than spending a KV read per insert to rule out a collision
 	// that cannot occur.
 	const existing = Object.keys(config.shards).length > 1 ? await mapper.getShardMapping(idKey) : null;
 	if (existing && existing.shard !== shardBinding) {
-		throw new CollegeDBError(
+		const reason =
 			`Generated id ${idKey} is already mapped to shard ${existing.shard}, but this insert ran on ${shardBinding}. ` +
-				'Per-shard AUTOINCREMENT and SERIAL sequences repeat across shards, so a database-generated id is not unique ' +
-				'cluster-wide. Use nextId() to allocate a cluster-unique id and pass it explicitly, or confine the table to one ' +
-				'shard with insertShard().',
-			'GENERATED_KEY_COLLISION'
-		);
+			'Per-shard AUTOINCREMENT and SERIAL sequences repeat across shards, so a database-generated id is not unique ' +
+			'cluster-wide. Use nextId() to allocate a cluster-unique id and pass it explicitly, or confine the table to one ' +
+			'shard with insertShard().';
+		const orphan = `The row is still on shard ${shardBinding} with id ${idKey}`;
+
+		if (!options.table) {
+			throw new CollegeDBError(`${reason} ${orphan}; delete it, or pass { table } so the insert removes it.`, 'GENERATED_KEY_COLLISION');
+		}
+
+		try {
+			const removal = buildDelete(options.table, { [idColumn]: generatedId }, { dialect });
+			const deleted = await runShardIn(s, shardBinding, removal.sql, removal.bindings);
+			if (deleted.meta.changes === 0) {
+				throw new Error(`DELETE on ${options.table} matched no row where ${idColumn} = ${idKey}`);
+			}
+		} catch (cause) {
+			const failure = new CollegeDBError(`${reason} ${orphan}, and removing it from ${options.table} failed.`, 'GENERATED_KEY_COLLISION');
+			failure.cause = cause;
+			throw failure;
+		}
+
+		throw new CollegeDBError(`${reason} The row this insert wrote on ${shardBinding} was removed.`, 'GENERATED_KEY_COLLISION');
 	}
 
 	await mapper.setShardMapping(idKey, shardBinding);
@@ -2646,11 +2683,22 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
  * using the database's own sequence, confine the table to one shard with
  * {@link insertShard}.
  *
+ * **The refused row.** The INSERT has already run when the collision shows up.
+ * CollegeDB takes only a raw SQL string here and does not parse it, so it does
+ * not know which table to clean. Pass `options.table` and it deletes the row it
+ * just wrote (matched on `idColumn`, default `id`) before it throws. Without
+ * `table` the row stays on the shard and removing it is the caller's job; the
+ * error message names the shard and id. If the delete itself fails, the error
+ * still has the code `GENERATED_KEY_COLLISION`, names the shard and id of the
+ * leftover row, and carries the delete failure as `cause`.
+ *
  * @template T - Type of returned rows when the insert uses `RETURNING`
  * @param sql - The INSERT statement to execute
  * @param bindings - Parameter values to bind to the statement
+ * @param options - `idColumn` names the generated key column, `table` enables cleanup of a refused row
  * @returns Promise resolving to the write result plus the generated id
  * @throws {CollegeDBError} If the insert succeeds but no generated id can be determined
+ * @throws {CollegeDBError} `GENERATED_KEY_COLLISION` when another shard already owns the generated id
  * @since 1.1.4
  * @example
  * ```typescript
@@ -2665,7 +2713,7 @@ async function executeInsertOnShard<T = Record<string, unknown>>(
 export function insert<T = Record<string, unknown>>(
 	sql: string,
 	bindings: any[] = [],
-	options: IdColumnOptions = {}
+	options: InsertOptions = {}
 ): Promise<InsertResult<T>> {
 	return insertIn<T>(currentState(), sql, bindings, options);
 }
@@ -2674,7 +2722,7 @@ async function insertIn<T = Record<string, unknown>>(
 	s: RouterState,
 	sql: string,
 	bindings: any[] = [],
-	options: IdColumnOptions = {}
+	options: InsertOptions = {}
 ): Promise<InsertResult<T>> {
 	const shardBinding = await allocateInsertShard(s);
 	return await executeInsertOnShard<T>(s, shardBinding, sql, bindings, options);
@@ -2687,12 +2735,19 @@ async function insertIn<T = Record<string, unknown>>(
  * The helper still captures the generated id and stores the mapping so routed
  * reads can find the new row later.
  *
+ * Throws `GENERATED_KEY_COLLISION` when another shard already owns the
+ * generated id. Cleanup of the row the refused INSERT wrote works as in
+ * {@link insert}: pass `options.table` to have it deleted, otherwise it is the
+ * caller's to remove.
+ *
  * @template T - Type of returned rows when the insert uses `RETURNING`
  * @param shardBinding - The shard binding to execute the insert on
  * @param sql - The INSERT statement to execute
  * @param bindings - Parameter values to bind to the statement
+ * @param options - `idColumn` names the generated key column, `table` enables cleanup of a refused row
  * @returns Promise resolving to the write result plus the generated id
  * @throws {CollegeDBError} If the insert succeeds but no generated id can be determined
+ * @throws {CollegeDBError} `GENERATED_KEY_COLLISION` when another shard already owns the generated id
  * @since 1.1.4
  * @example
  * ```typescript
@@ -2715,7 +2770,7 @@ export function insertShard<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
-	options: IdColumnOptions = {}
+	options: InsertOptions = {}
 ): Promise<InsertResult<T>> {
 	return insertShardIn<T>(currentState(), shardBinding, sql, bindings, options);
 }
@@ -2725,7 +2780,7 @@ async function insertShardIn<T = Record<string, unknown>>(
 	shardBinding: string,
 	sql: string,
 	bindings: any[] = [],
-	options: IdColumnOptions = {}
+	options: InsertOptions = {}
 ): Promise<InsertResult<T>> {
 	return await executeInsertOnShard<T>(s, shardBinding, sql, bindings, options);
 }
@@ -3245,14 +3300,20 @@ async function recoverMigrationsIn(s: RouterState, options: { olderThanMs?: numb
  * Checks the journal against the shards. Observational unless `repair` is set.
  *
  * Reports unfinished moves, live rows left on a shard the key moved off, and
- * tombstones the journal does not know. With `repair: true` it resumes unfinished
- * moves and removes a ghost row only when it equals the archived copy. The pass
- * is recorded; {@link purgeRetired} waits for a clean one.
+ * tombstones the journal does not know. It also reports `strandedCopies`, live
+ * destination rows of an aborted move that equal a row the move journaled, and
+ * `staleCutovers`, tombstones whose move the journal ended as aborted. Both come
+ * from a recovery executor that stalled past its lease, and both count against
+ * `clean`. With `repair: true` it resumes unfinished moves, removes a ghost row
+ * only when it equals the archived copy, removes a stranded copy under the same
+ * proof, and restores the archived row of a stale cutover when nothing else owns
+ * the key. The pass is recorded; {@link purgeRetired} waits for a clean one.
  *
  * @param options - `repair` to act on what it finds
  * @returns The findings
  * @throws {CollegeDBError} `JOURNAL_NOT_CONFIGURED` with several shards and no `journalShard`
  * @throws {CollegeDBError} With `repair`: `RECOVERY_IN_PROGRESS` when another recovery holds the lease; `RECOVERY_FENCED` when this one lost it mid-run
+ * @throws {CollegeDBError} With `repair`: `MIGRATION_NO_ATOMIC_BATCH` when a stale cutover is restored on a shard that does not declare `atomicBatch`
  * @since 1.4.0
  */
 export function verifyMigrations(options: { repair?: boolean } = {}): Promise<VerifyReport> {
@@ -5964,6 +6025,21 @@ export interface IdColumnOptions extends CrudReturningOptions {
 }
 
 /**
+ * Options for {@link insert} and {@link insertShard}.
+ * @since 1.4.0
+ */
+export interface InsertOptions extends IdColumnOptions {
+	/**
+	 * Table the INSERT writes to. When set and the generated id collides with a
+	 * mapping on another shard, the call deletes the row it just wrote (matched on
+	 * `idColumn`, default `id`) before it throws. It is validated before the
+	 * INSERT runs. Without it, the refused row stays on the shard and the error
+	 * names its shard and id.
+	 */
+	table?: string;
+}
+
+/**
  * Inserts a row built from a plain object, routed to `key`'s shard.
  *
  * @template T - Type of returned rows when `RETURNING` is used
@@ -6539,7 +6615,7 @@ export function createClient(config: CollegeDBConfig) {
 		},
 
 		/** Same as {@link insert}, on this client. */
-		insert<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options: IdColumnOptions = {}): Promise<InsertResult<T>> {
+		insert<T = Record<string, unknown>>(sql: string, bindings: any[] = [], options: InsertOptions = {}): Promise<InsertResult<T>> {
 			return insertIn<T>(s, sql, bindings, options);
 		},
 
@@ -6548,7 +6624,7 @@ export function createClient(config: CollegeDBConfig) {
 			shardBinding: string,
 			sql: string,
 			bindings: any[] = [],
-			options: IdColumnOptions = {}
+			options: InsertOptions = {}
 		): Promise<InsertResult<T>> {
 			return insertShardIn<T>(s, shardBinding, sql, bindings, options);
 		},

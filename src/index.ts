@@ -98,6 +98,7 @@ export type {
 	IdColumnOptions,
 	IndexColumnDefinition,
 	InitializeFromEnvOptions,
+	InsertOptions,
 	InsertResult,
 	LookupOptions,
 	NextIdOptions,
