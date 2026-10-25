@@ -501,10 +501,7 @@ export interface CollegeDBConfig {
 	 * functions of the key, and `location` depends on the requesting region
 	 * rather than the key, so all three force `kv`.
 	 *
-	 * Defaults to `computed` for the `hash` strategy on a deployment CollegeDB
-	 * has not seen before, and to `kv` when existing mappings are detected, so
-	 * an upgrade never starts computing placements for keys another algorithm
-	 * placed. Call `rebalance()` to migrate such a deployment.
+	 * Defaults to `kv`. Set `computed` to opt in.
 	 * @since 1.3.0
 	 */
 	placement?: 'computed' | 'kv';

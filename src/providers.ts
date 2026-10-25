@@ -1388,16 +1388,7 @@ function withNativeBatch(provider: SQLDatabase, rawBinding: unknown = provider):
 	};
 }
 
-/**
- * Default `cacheTtl` for Workers KV reads, in seconds.
- *
- * Cloudflare's guidance is to raise this above the 60 second default, and shard
- * mappings are close to write-once: a key keeps its shard until something calls
- * `reassignShard`. CollegeDB already tolerates a stale mapping for
- * `mappingCacheTtlMs` in process, so a longer edge TTL does not widen the
- * window in kind, only in duration.
- * @private
- */
+// edge cache ttl for workers kv reads when cacheTtl is unset, in seconds
 const DEFAULT_WORKERS_KV_CACHE_TTL = 3600;
 
 /**
