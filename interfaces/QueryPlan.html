@@ -19,7 +19,7 @@
 </div></div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">QueryPlan</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#keycolumn">keyColumn</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#keys">keys</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#kind">kind</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">&quot;delete&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;insert&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;update&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;select&quot;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#readonly">readOnly</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#table">table</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L30">src/planner.ts:30</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L30">src/planner.ts:30</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -42,7 +42,7 @@
 <div class="tsd-comment tsd-typography"><p>Key column that was matched</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L36">src/planner.ts:36</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L36">src/planner.ts:36</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="keys"><span>keys</span><a href="#keys" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">keys</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span></div>
@@ -50,28 +50,28 @@
 out across shards: an <code>IN (...)</code> predicate or a multi-row <code>VALUES</code>.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L41">src/planner.ts:41</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L41">src/planner.ts:41</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="kind"><span>kind</span><a href="#kind" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">kind</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">&quot;delete&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;insert&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;update&quot;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;select&quot;</span></div>
 <div class="tsd-comment tsd-typography"><p>Statement kind that was recognized</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L32">src/planner.ts:32</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L32">src/planner.ts:32</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="readonly"><span>read<wbr/>Only</span><a href="#readonly" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">readOnly</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span></div>
 <div class="tsd-comment tsd-typography"><p><code>true</code> when the statement reads and can be answered by a single shard per key</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L43">src/planner.ts:43</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L43">src/planner.ts:43</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="table"><span>table</span><a href="#table" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">table</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span></div>
 <div class="tsd-comment tsd-typography"><p>Table the statement targets</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4feb1b0413431354b9852df80df2011de0e130ba/src/planner.ts#L34">src/planner.ts:34</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/planner.ts#L34">src/planner.ts:34</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
