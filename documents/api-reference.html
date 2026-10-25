@@ -1,0 +1,1310 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>api-reference | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">api-reference</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="api-reference" class="tsd-anchor-link">API Reference<a href="#api-reference" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page lists the functions CollegeDB exports from <code>src/index.ts</code>, grouped by purpose, and every error code the library throws. Use it when you need a signature or want to know what a code means. Configuration fields and types are in <a href="configuration.html">Configuration</a>. Setup, examples and the first call are in <a href="getting-started.html">Getting started</a>.</p>
+<p>Optional parameters are marked with <code>?</code>. Parameters with a default show it as <code>= value</code>. Generic type parameters are omitted from the tables.</p>
+<h2 id="client-and-setup" class="tsd-anchor-link">Client and Setup<a href="#client-and-setup" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>collegedb(config, callback)</code></td>
+<td><code>CollegeDBConfig, () =&gt; T</code></td>
+<td>Runs a callback with the configuration active. Without <code>AsyncLocalStorage</code>, overlapping callbacks with different configurations throw <code>CONCURRENT_CONFIG</code>.</td>
+</tr>
+<tr>
+<td><code>initialize(config)</code></td>
+<td><code>CollegeDBConfig</code></td>
+<td>Sets the global configuration and starts background work (known-shard sync and auto-migration) unless <code>disableAutoMigration</code> is set.</td>
+</tr>
+<tr>
+<td><code>initializeAsync(config)</code></td>
+<td><code>CollegeDBConfig</code></td>
+<td>Asynchronous form of <code>initialize</code>.</td>
+</tr>
+<tr>
+<td><code>initializeFromEnv(env, options?)</code></td>
+<td><code>Record&lt;string, unknown&gt;, InitializeFromEnvOptions</code></td>
+<td>Builds the configuration from a Workers <code>env</code>. Detects <code>env.KV</code> and the shard bindings by prefix. Returns the shard binding names.</td>
+</tr>
+<tr>
+<td><code>createClient(config)</code></td>
+<td><code>CollegeDBConfig</code></td>
+<td>Returns a client with its own state and the same operations as the module-level functions.</td>
+</tr>
+<tr>
+<td><code>getActiveConfig()</code></td>
+<td>none</td>
+<td>Returns the active configuration, or <code>null</code> before initialization.</td>
+</tr>
+<tr>
+<td><code>isInitialized()</code></td>
+<td>none</td>
+<td>Reports whether the current context is initialized.</td>
+</tr>
+<tr>
+<td><code>resetConfig()</code></td>
+<td>none</td>
+<td>Clears the global configuration. For tests.</td>
+</tr>
+<tr>
+<td><code>createSchema(db, schema)</code></td>
+<td><code>SQLDatabase, string</code></td>
+<td>Runs schema SQL on one shard.</td>
+</tr>
+<tr>
+<td><code>ensureSchema(schema, options?)</code></td>
+<td><code>string or string[], EnsureSchemaOptions</code></td>
+<td>Creates the schema on every configured shard. Safe to call again.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="reads-and-writes" class="tsd-anchor-link">Reads and Writes<a href="#reads-and-writes" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Each function here resolves the shard from a primary key or from the statement itself. See <a href="reads-and-writes.html">Reads and writes</a> for consistency modes and the planner rules.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>prepare(key, sql)</code></td>
+<td><code>string, string</code></td>
+<td>Prepares a statement on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>run(key, sql, bindings = [])</code></td>
+<td><code>string, string, any[]</code></td>
+<td>Executes one statement on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>first(key, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ReadOptions</code></td>
+<td>Returns the first row from the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>all(key, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ReadOptions</code></td>
+<td>Returns every row from the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>firstResilient(key, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ReadOptions</code></td>
+<td>Reads the first row by key. On a miss, falls back to a scan of every shard.</td>
+</tr>
+<tr>
+<td><code>query(sql, bindings = [])</code></td>
+<td><code>string, any[]</code></td>
+<td>Executes a statement and takes the routing key from the statement. Throws <code>UNROUTABLE_QUERY</code> when the key cannot be proven, unless <code>onUnroutable</code> is <code>fanout</code>.</td>
+</tr>
+<tr>
+<td><code>queryFirst(sql, bindings = [], options?)</code></td>
+<td><code>string, any[], ReadOptions</code></td>
+<td>Like <code>query</code>, returns the first matching row or <code>null</code>.</td>
+</tr>
+<tr>
+<td><code>queryAll(sql, bindings = [], options?)</code></td>
+<td><code>string, any[], ReadOptions</code></td>
+<td>Like <code>query</code>, returns every matching row.</td>
+</tr>
+<tr>
+<td><code>insert(sql, bindings = [], options?)</code></td>
+<td><code>string, any[], InsertOptions</code></td>
+<td>Inserts on an automatically chosen shard and returns the generated primary key.</td>
+</tr>
+<tr>
+<td><code>insertShard(shard, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], InsertOptions</code></td>
+<td>Same as <code>insert</code>, on the named shard.</td>
+</tr>
+<tr>
+<td><code>insertInto(key, table, values, options?)</code></td>
+<td><code>string, string, ColumnValues, BuildInsertOptions</code></td>
+<td>Inserts a row built from an object, on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>insertReturning(key, table, values, options?)</code></td>
+<td><code>string, string, ColumnValues, BuildInsertOptions</code></td>
+<td>Inserts a row, reads it back and returns it.</td>
+</tr>
+<tr>
+<td><code>updateRow(key, table, values, where, options?)</code></td>
+<td><code>string, string, ColumnValues, ColumnValues, CrudReturningOptions</code></td>
+<td>Updates the rows matching a WHERE map.</td>
+</tr>
+<tr>
+<td><code>patch(key, table, id, values, options?)</code></td>
+<td><code>string, string, string or number, ColumnValues, IdColumnOptions</code></td>
+<td>Updates one row by id. Wraps <code>updateRow</code>.</td>
+</tr>
+<tr>
+<td><code>deleteRow(key, table, where)</code></td>
+<td><code>string, string, ColumnValues</code></td>
+<td>Deletes the rows matching a WHERE map.</td>
+</tr>
+<tr>
+<td><code>deleteById(key, table, id, options?)</code></td>
+<td><code>string, string, string or number, IdColumnOptions</code></td>
+<td>Deletes one row by id. Wraps <code>deleteRow</code>.</td>
+</tr>
+<tr>
+<td><code>upsert(key, table, values, conflictColumns, options?)</code></td>
+<td><code>string, string, ColumnValues, string or string[], BuildUpsertOptions</code></td>
+<td>Inserts a row, or updates the conflicting columns when the key already exists.</td>
+</tr>
+<tr>
+<td><code>batch(entries)</code></td>
+<td><code>BatchEntry[]</code></td>
+<td>Resolves each entry to a shard and returns the results in submission order.</td>
+</tr>
+<tr>
+<td><code>nextId(table, options?)</code></td>
+<td><code>string, NextIdOptions</code></td>
+<td>Returns the next monotonic integer id for a table. See <a href="generated-ids.html">Generated ids</a>.</td>
+</tr>
+<tr>
+<td><code>count(key, table, options?)</code></td>
+<td><code>string, string, ReadOptions</code></td>
+<td>Counts rows on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>explain(key, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ExplainOptions</code></td>
+<td>Runs an explain on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>paginate(sql, bindings = [], options?)</code></td>
+<td><code>string, any[], PaginateOptions</code></td>
+<td>Runs a query across all shards. Returns one page and the total match count.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="shard-targeted-and-all-shard-queries" class="tsd-anchor-link">Shard-Targeted and All-Shard Queries<a href="#shard-targeted-and-all-shard-queries" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>These functions skip key routing. Use them for administration or for reads that span shards. See <a href="query-guidance.html">Query guidance</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>runShard(shard, sql, bindings = [])</code></td>
+<td><code>string, string, any[]</code></td>
+<td>Runs a statement on a named shard.</td>
+</tr>
+<tr>
+<td><code>allShard(shard, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ReadOptions</code></td>
+<td>Returns every row from a named shard.</td>
+</tr>
+<tr>
+<td><code>firstShard(shard, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], ReadOptions</code></td>
+<td>Returns the first row from a named shard.</td>
+</tr>
+<tr>
+<td><code>countShard(shard, table, options?)</code></td>
+<td><code>string, string, ReadOptions</code></td>
+<td>Counts rows for a table on a named shard.</td>
+</tr>
+<tr>
+<td><code>runAllShards(sql, bindings = [], batchSize = 50)</code></td>
+<td><code>string, any[], number</code></td>
+<td>Runs a statement on every shard and returns each result.</td>
+</tr>
+<tr>
+<td><code>allAllShards(sql, bindings = [], batchSize = 50, options?)</code></td>
+<td><code>string, any[], number, ReadOptions</code></td>
+<td>Returns every row from every shard. SQL pagination applies per shard.</td>
+</tr>
+<tr>
+<td><code>firstAllShards(sql, bindings = [], batchSize = 50, options?)</code></td>
+<td><code>string, any[], number, ReadOptions</code></td>
+<td>Returns the first matching row from each shard.</td>
+</tr>
+<tr>
+<td><code>allAllShardsGlobal(sql, bindings = [], options = {})</code></td>
+<td><code>string, any[], GlobalAllShardsOptions</code></td>
+<td>Runs on every shard, then merges, sorts and paginates the combined result.</td>
+</tr>
+<tr>
+<td><code>firstAllShardsGlobal(sql, bindings = [], options = {})</code></td>
+<td><code>string, any[], Omit&lt;GlobalAllShardsOptions, 'limit'&gt;</code></td>
+<td>Like <code>allAllShardsGlobal</code>, returns the first row after the global step.</td>
+</tr>
+<tr>
+<td><code>countAllShards(table, batchSize = 50, options?)</code></td>
+<td><code>string, number, ReadOptions</code></td>
+<td>Counts rows per shard and the global total.</td>
+</tr>
+<tr>
+<td><code>explainShard(shard, sql, bindings = [], options?)</code></td>
+<td><code>string, string, any[], Omit&lt;ExplainOptions, 'batchSize'&gt;</code></td>
+<td>Runs an explain on a named shard.</td>
+</tr>
+<tr>
+<td><code>explainAllShards(sql, bindings = [], options = {})</code></td>
+<td><code>string, any[], ExplainOptions</code></td>
+<td>Runs an explain on every shard.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="indexes" class="tsd-anchor-link">Indexes<a href="#indexes" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>index(key, table, columns, options?)</code></td>
+<td><code>string, string, string or IndexColumnDefinition[], CreateIndexOptions</code></td>
+<td>Creates an index on the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>indexShard(shard, table, columns, options?)</code></td>
+<td><code>string, string, string or IndexColumnDefinition[], CreateIndexOptions</code></td>
+<td>Creates an index on a named shard.</td>
+</tr>
+<tr>
+<td><code>indexAllShards(table, columns, options = {})</code></td>
+<td><code>string, string or IndexColumnDefinition[], CreateIndexOptions</code></td>
+<td>Creates an index on every shard.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="lookup-keys" class="tsd-anchor-link">Lookup Keys<a href="#lookup-keys" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A lookup key maps a secondary value to a primary key. The <code>*ByLookupKey</code> functions read the mapping and fall back to a scan of every shard.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>setLookup(key, value, options = {})</code></td>
+<td><code>string, string, LookupOptions</code></td>
+<td>Stores or overwrites a secondary value.</td>
+</tr>
+<tr>
+<td><code>getLookup(key, options = {})</code></td>
+<td><code>string, LookupOptions</code></td>
+<td>Reads a secondary value, or <code>null</code>.</td>
+</tr>
+<tr>
+<td><code>deleteLookup(key, options = {})</code></td>
+<td><code>string, LookupOptions</code></td>
+<td>Deletes a secondary value.</td>
+</tr>
+<tr>
+<td><code>firstByLookupKey(lookupKey, sql, bindings = [], batchSize = 50, options?)</code></td>
+<td><code>string, string, any[], number, ReadOptions</code></td>
+<td>Returns the first row found through a lookup key, with fanout fallback.</td>
+</tr>
+<tr>
+<td><code>allByLookupKey(lookupKey, sql, bindings = [], batchSize = 50, options?)</code></td>
+<td><code>string, string, any[], number, ReadOptions</code></td>
+<td>Returns every row found through a lookup key, with fanout fallback.</td>
+</tr>
+<tr>
+<td><code>invalidateMappingCache(key?)</code></td>
+<td><code>string?</code></td>
+<td>Drops cached mappings so the next read loads them from KV.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="moves-and-recovery" class="tsd-anchor-link">Moves and Recovery<a href="#moves-and-recovery" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Moves need a journal once the configuration has more than one shard. Set <code>journalShard</code>. See <a href="shard-moves.html">Shard moves</a> for the protocol.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reassignShard(primaryKey, newBinding, tableName, options = {})</code></td>
+<td><code>string, string, string, MoveRecordOptions</code></td>
+<td>Moves one key and its row to another shard.</td>
+</tr>
+<tr>
+<td><code>rebalance(table, options = {})</code></td>
+<td><code>string, { concurrency?, dryRun? }</code></td>
+<td>Moves stored mappings onto the shard the placement function computes.</td>
+</tr>
+<tr>
+<td><code>recoverMigrations(options = {})</code></td>
+<td><code>{ olderThanMs? }</code></td>
+<td>Finishes the unfinished moves recorded in the journal. Returns a <code>RecoveryReport</code>.</td>
+</tr>
+<tr>
+<td><code>verifyMigrations(options = {})</code></td>
+<td><code>{ repair? }</code></td>
+<td>Checks the journal against the shards. Returns a <code>VerifyReport</code>.</td>
+</tr>
+<tr>
+<td><code>getMigrationStatus(key, table?)</code></td>
+<td><code>string, string?</code></td>
+<td>Returns what the journal records for a key, or <code>null</code>.</td>
+</tr>
+<tr>
+<td><code>purgeRetired()</code></td>
+<td>none</td>
+<td>Clears archived copies of moved rows once they are safe to remove. Returns a <code>PurgeReport</code>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="placement-topology-and-eligibility" class="tsd-anchor-link">Placement, Topology and Eligibility<a href="#placement-topology-and-eligibility" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>listKnownShards()</code></td>
+<td>none</td>
+<td>Lists the shard binding names known to the system.</td>
+</tr>
+<tr>
+<td><code>getShardStats()</code></td>
+<td>none</td>
+<td>Returns key counts and timestamps for each known shard.</td>
+</tr>
+<tr>
+<td><code>publishEligibility()</code></td>
+<td>none</td>
+<td>Re-evaluates eligibility. Publishes a new placement snapshot when the eligible set changed. Returns <code>{ eligible, published, epoch }</code>.</td>
+</tr>
+<tr>
+<td><code>pruneEpochs(options)</code></td>
+<td><code>PruneOptions</code></td>
+<td>Drops placement epochs that no row depends on. Returns a <code>PruneReport</code>.</td>
+</tr>
+<tr>
+<td><code>reconcileAllocations(options = {})</code></td>
+<td><code>ReconcileOptions</code></td>
+<td>Compares the coordinator's allocation ledger with the routing metadata. Needs a <code>coordinator</code>. See <a href="cloudflare.html">Cloudflare</a>.</td>
+</tr>
+<tr>
+<td><code>planQuery(sql, bindings = [], options = {})</code></td>
+<td><code>string, any[], PlanQueryOptions</code></td>
+<td>Returns the routing key or keys that a statement names.</td>
+</tr>
+<tr>
+<td><code>unroutableError(sql)</code></td>
+<td><code>string</code></td>
+<td>Builds the <code>UNROUTABLE_QUERY</code> error that the planner raises.</td>
+</tr>
+</tbody>
+</table>
+<p>The placement primitives are pure functions over a manifest. They take no configuration. See <a href="sharding.html">Sharding</a> for computed placement.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hrwShard(key, shards)</code></td>
+<td><code>string, string[]</code></td>
+<td>Picks a shard by rendezvous hashing.</td>
+</tr>
+<tr>
+<td><code>legacyModuloShard(key, shards)</code></td>
+<td><code>string, string[]</code></td>
+<td>Modulo placement, kept for keys placed by the earlier algorithm.</td>
+</tr>
+<tr>
+<td><code>createManifest(shards, algorithm)</code></td>
+<td><code>string[], PlacementAlgorithm</code></td>
+<td>Builds the first placement manifest for a deployment.</td>
+</tr>
+<tr>
+<td><code>withCurrentTopology(manifest, shards, algorithm = 'hrw')</code></td>
+<td><code>PlacementManifest, string[], PlacementAlgorithm</code></td>
+<td>Returns a manifest whose newest epoch matches <code>shards</code>.</td>
+</tr>
+<tr>
+<td><code>candidateShards(key, manifest, available)</code></td>
+<td><code>string, PlacementManifest, string[]</code></td>
+<td>Lists every shard a key could be on, newest epoch first, without repeats.</td>
+</tr>
+<tr>
+<td><code>shardForEpoch(key, epoch)</code></td>
+<td><code>string, PlacementEpoch</code></td>
+<td>Applies one epoch's algorithm to a key.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sizes" class="tsd-anchor-link">Sizes<a href="#sizes" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>These report the size of the database behind each shard. The <code>maxDatabaseSize</code> limit and its size checks are described in <a href="sharding.html">Sharding</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>getDatabaseSizeForKey(key)</code></td>
+<td><code>string</code></td>
+<td>Size in bytes of the shard that owns <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>getDatabaseSizeForShard(shard)</code></td>
+<td><code>string</code></td>
+<td>Size in bytes of a named shard.</td>
+</tr>
+<tr>
+<td><code>getDatabaseSizesAllShards(batchSize = 50)</code></td>
+<td><code>number</code></td>
+<td>Size of every shard, as <code>ShardSizeResult</code> entries.</td>
+</tr>
+<tr>
+<td><code>getTotalDatabaseSize(batchSize = 50)</code></td>
+<td><code>number</code></td>
+<td>Combined size in bytes across all shards.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sql-builders-and-identifiers" class="tsd-anchor-link">SQL Builders and Identifiers<a href="#sql-builders-and-identifiers" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>These build SQL strings and bindings without running them. They throw on invalid input, so they can be called before any database is touched.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>buildInsert(table, values, options = {})</code></td>
+<td><code>string, ColumnValues, BuildInsertOptions</code></td>
+<td>Builds an <code>INSERT</code> statement from a column-to-value object.</td>
+</tr>
+<tr>
+<td><code>buildUpdate(table, values, where, options = {})</code></td>
+<td><code>string, ColumnValues, ColumnValues, { returning?, dialect? }</code></td>
+<td>Builds an <code>UPDATE</code> statement from a changes object and a WHERE map.</td>
+</tr>
+<tr>
+<td><code>buildDelete(table, where, options = {})</code></td>
+<td><code>string, ColumnValues, { dialect? }</code></td>
+<td>Builds a <code>DELETE</code> statement from a WHERE map.</td>
+</tr>
+<tr>
+<td><code>buildUpsert(table, values, conflictColumns, options = {})</code></td>
+<td><code>string, ColumnValues, string or string[], BuildUpsertOptions</code></td>
+<td>Builds an upsert statement for the conflict columns.</td>
+</tr>
+<tr>
+<td><code>quoteIdentifier(identifier, dialect?)</code></td>
+<td><code>string, SQLDialect?</code></td>
+<td>Validates and quotes a SQL identifier, optionally schema-qualified.</td>
+</tr>
+<tr>
+<td><code>validateIdentifier(identifier)</code></td>
+<td><code>string</code></td>
+<td>Validates a SQL identifier and returns its parts without quotes.</td>
+</tr>
+</tbody>
+</table>
+<p><code>PROVEN_JOURNAL_DIALECTS</code> is the list of dialects the move journal is proven on: <code>sqlite</code>, <code>postgres</code> and <code>mysql</code>.</p>
+<h2 id="cache-and-kv-helpers" class="tsd-anchor-link">Cache and KV Helpers<a href="#cache-and-kv-helpers" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cached(key, fetcher, options = {})</code></td>
+<td><code>string, () =&gt; Promise&lt;T&gt;, CacheOptions</code></td>
+<td>Returns the cached value for <code>key</code>, or computes and stores it on a miss. <code>fetchTimeoutMs</code> bounds the fetch.</td>
+</tr>
+<tr>
+<td><code>invalidate(prefix, options = {})</code></td>
+<td><code>string, { kv?, concurrency? }</code></td>
+<td>Deletes every cache key that starts with <code>prefix</code>.</td>
+</tr>
+<tr>
+<td><code>withKVTimeout(kv, timeoutMs)</code></td>
+<td><code>KVStorage, number</code></td>
+<td>Wraps a KV store so each call rejects with <code>KV_TIMEOUT</code> after <code>timeoutMs</code>. <code>kvTimeoutMs</code> applies this to the configured store.</td>
+</tr>
+<tr>
+<td><code>KVShardMapper</code></td>
+<td>class</td>
+<td>Stores key-to-shard mappings in KV. Methods include <code>updateShardMapping</code> and <code>getKeysForShard</code>.</td>
+</tr>
+<tr>
+<td><code>flush()</code></td>
+<td>none</td>
+<td>Clears every shard mapping from KV and the coordinator. Development only.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="providers" class="tsd-anchor-link">Providers<a href="#providers" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Provider factories adapt a driver or client to CollegeDB's contracts. See <a href="providers.html">Providers</a> for when each one applies.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>createPostgreSQLProvider(client, sqlTag?)</code></td>
+<td><code>PostgresClientLike, SQLBatchOptions</code> or <code>DrizzleClientLike, DrizzleSqlTagLike</code></td>
+<td>Adapts a PostgreSQL client, or a Drizzle PostgreSQL database.</td>
+</tr>
+<tr>
+<td><code>createMySQLProvider(client, sqlTag?)</code></td>
+<td><code>MySQLClientLike, SQLBatchOptions</code> or <code>DrizzleClientLike, DrizzleSqlTagLike</code></td>
+<td>Adapts a MySQL or MariaDB client, or a Drizzle MySQL database.</td>
+</tr>
+<tr>
+<td><code>createSQLiteProvider(client, sqlTag?)</code></td>
+<td><code>SQLiteClientLike, SQLBatchOptions</code> or <code>DrizzleClientLike, DrizzleSqlTagLike</code></td>
+<td>Adapts a SQLite or D1 client, or a Drizzle SQLite database.</td>
+</tr>
+<tr>
+<td><code>createDrizzleSQLProvider(client, sqlTag, dialect?)</code></td>
+<td><code>DrizzleClientLike, DrizzleSqlTagLike, SQLDialect</code></td>
+<td>Generic Drizzle adapter.</td>
+</tr>
+<tr>
+<td><code>createHyperdrivePostgresProvider(hyperdrive, clientFactory, options = {})</code></td>
+<td><code>HyperdriveBindingLike, HyperdrivePostgresClientFactory, HyperdriveProviderOptions</code></td>
+<td>Adapts PostgreSQL through a Hyperdrive binding.</td>
+</tr>
+<tr>
+<td><code>createHyperdriveMySQLProvider(hyperdrive, clientFactory, options = {})</code></td>
+<td><code>HyperdriveBindingLike, HyperdriveMySQLClientFactory, HyperdriveProviderOptions</code></td>
+<td>Adapts MySQL or MariaDB through a Hyperdrive binding.</td>
+</tr>
+<tr>
+<td><code>createWorkersKVProvider(kv, options = {})</code></td>
+<td><code>WorkersKVNamespaceLike, WorkersKVProviderOptions</code></td>
+<td>Wraps a Workers KV namespace in the <code>KVStorage</code> contract.</td>
+</tr>
+<tr>
+<td><code>createRedisKVProvider(client, options = {})</code></td>
+<td><code>RedisLikeClient, { scanCount? }</code></td>
+<td>Adapts a Redis client to <code>KVStorage</code>.</td>
+</tr>
+<tr>
+<td><code>createValkeyKVProvider(client, options = {})</code></td>
+<td><code>RedisLikeClient, { scanCount? }</code></td>
+<td>Adapts a Valkey client to <code>KVStorage</code>.</td>
+</tr>
+<tr>
+<td><code>createNuxtHubKVProvider(client)</code></td>
+<td><code>NuxtHubKVLike</code></td>
+<td>Adapts a NuxtHub or Unstorage KV client to <code>KVStorage</code>.</td>
+</tr>
+<tr>
+<td><code>toProvider(binding, options = {})</code></td>
+<td><code>unknown, ToProviderOptions</code></td>
+<td>Detects the provider for an arbitrary binding.</td>
+</tr>
+<tr>
+<td><code>isKVStorage(value)</code></td>
+<td><code>unknown</code></td>
+<td>Returns <code>true</code> when a value satisfies <code>KVStorage</code>.</td>
+</tr>
+<tr>
+<td><code>isSQLDatabase(value)</code></td>
+<td><code>unknown</code></td>
+<td>Returns <code>true</code> when a value satisfies <code>SQLDatabase</code>.</td>
+</tr>
+<tr>
+<td><code>createInMemoryKVProvider()</code></td>
+<td>none</td>
+<td>Creates an in-memory <code>KVStorage</code>, for tests and local runs.</td>
+</tr>
+<tr>
+<td><code>createInMemorySQLProvider()</code></td>
+<td>none</td>
+<td>Creates an in-memory <code>SQLDatabase</code>, for tests and local runs.</td>
+</tr>
+</tbody>
+</table>
+<p><code>InMemoryKVStorage</code> and <code>InMemorySQLDatabase</code> are the classes behind those two factories.</p>
+<h2 id="drop-in-functions" class="tsd-anchor-link">Drop-in Functions<a href="#drop-in-functions" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>These bring an existing database into CollegeDB without moving its rows. See <a href="drop-in.html">Drop-in</a> for the workflow.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>autoDetectAndMigrate(db, shard, config, options?)</code></td>
+<td><code>SQLDatabase, string, CollegeDBConfig, options</code></td>
+<td>Detects a database that holds unmapped data, then migrates it.</td>
+</tr>
+<tr>
+<td><code>checkMigrationNeeded(db, shard, config, statusCache?)</code></td>
+<td><code>SQLDatabase, string, CollegeDBConfig, Map</code></td>
+<td>Checks whether a shard holds data that is not mapped yet.</td>
+</tr>
+<tr>
+<td><code>integrateExistingDatabase(db, shard, mapper, options = {})</code></td>
+<td><code>SQLDatabase, string, KVShardMapper, IntegrationOptions</code></td>
+<td>Runs a full drop-in integration of an existing database.</td>
+</tr>
+<tr>
+<td><code>createMappingsForExistingKeys(primaryKeys, shardBindings, strategy, mapper, options = {})</code></td>
+<td><code>string[], string[], 'hash' or 'round-robin' or 'random', KVShardMapper, { concurrency? }</code></td>
+<td>Writes mappings for keys that already exist.</td>
+</tr>
+<tr>
+<td><code>validateTableForSharding(db, table, primaryKeyColumn)</code></td>
+<td><code>SQLDatabase, string, string</code></td>
+<td>Checks that a table exists and has a usable primary key column.</td>
+</tr>
+<tr>
+<td><code>discoverExistingPrimaryKeys(db, table, primaryKeyColumn = 'id')</code></td>
+<td><code>SQLDatabase, string, string</code></td>
+<td>Lists every primary key in a table.</td>
+</tr>
+<tr>
+<td><code>discoverExistingRecordsWithColumns(db, table, primaryKeyColumn = 'id')</code></td>
+<td><code>SQLDatabase, string, string</code></td>
+<td>Lists the existing records with their extra columns, for multi-key mapping.</td>
+</tr>
+<tr>
+<td><code>migrateRecord(source, target, primaryKey, table, options = {})</code></td>
+<td><code>SQLDatabase, SQLDatabase, string, string, MigrateRecordOptions</code></td>
+<td>Copies one row to another database. <code>onConflict</code> defaults to <code>fail</code>.</td>
+</tr>
+<tr>
+<td><code>createSchemaAcrossShards(shards, schema)</code></td>
+<td><code>Record&lt;string, SQLDatabase&gt;, string or function</code></td>
+<td>Applies a schema to every database in parallel.</td>
+</tr>
+<tr>
+<td><code>dropSchema(db, ...tables)</code></td>
+<td><code>SQLDatabase, string[]</code></td>
+<td>Runs <code>DROP TABLE IF EXISTS</code> for each named table. Destructive. Errors are logged, not thrown.</td>
+</tr>
+<tr>
+<td><code>listTables(db)</code></td>
+<td><code>SQLDatabase</code></td>
+<td>Lists the user tables in a database.</td>
+</tr>
+<tr>
+<td><code>schemaExists(db, table)</code></td>
+<td><code>SQLDatabase, string</code></td>
+<td>Checks whether the expected schema is present.</td>
+</tr>
+<tr>
+<td><code>clearMigrationCache()</code></td>
+<td>none</td>
+<td>Clears the cache of shards already checked for migration.</td>
+</tr>
+<tr>
+<td><code>clearShardMigrationCache(shard)</code></td>
+<td><code>string</code></td>
+<td>Clears the cache entry for one shard.</td>
+</tr>
+</tbody>
+</table>
+<p><code>IntegrationOptions.strategy</code> is <code>@deprecated</code>. It has no effect and will be removed in 2.0.</p>
+<h2 id="telemetry" class="tsd-anchor-link">Telemetry<a href="#telemetry" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th>Function or class</th>
+<th>Parameters</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>setPhaseObserver(next)</code></td>
+<td><code>PhaseObserver or null</code></td>
+<td>Installs the phase observer on the default instance, or clears it with <code>null</code>.</td>
+</tr>
+<tr>
+<td><code>isPhaseObserverActive()</code></td>
+<td>none</td>
+<td>Reports whether phase timing is active on the default instance.</td>
+</tr>
+<tr>
+<td><code>PhaseCollector</code></td>
+<td>class</td>
+<td>Collects phase spans and summarizes them per phase.</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>onPhase</code> configuration field sends the same spans to one configuration. See <a href="configuration.html">Configuration</a>.</p>
+<h2 id="errors" class="tsd-anchor-link">Errors<a href="#errors" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>CollegeDBError</code> extends <code>Error</code> and adds an optional <code>code</code> string. Check <code>error instanceof CollegeDBError</code> before reading <code>code</code>.</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">run</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">run</span><span class="hl-1">(</span><span class="hl-2">&#39;invalid-key&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;SELECT * FROM users WHERE id = ?&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;invalid-key&#39;</span><span class="hl-1">]);</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">	</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-8">CollegeDBError</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">error</span><span class="hl-1">(</span><span class="hl-2">`CollegeDB error (</span><span class="hl-6">${</span><span class="hl-5">error</span><span class="hl-10">.</span><span class="hl-5">code</span><span class="hl-6">}</span><span class="hl-2">): </span><span class="hl-6">${</span><span class="hl-5">error</span><span class="hl-10">.</span><span class="hl-5">message</span><span class="hl-6">}</span><span class="hl-2">`</span><span class="hl-1">);</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The Retry column uses three values:</p>
+<ul>
+<li><strong>Yes</strong>: the message says to retry, or the failure is transient.</li>
+<li><strong>No</strong>: the message says a retry will not help, or the input or configuration has to change first.</li>
+<li><strong>Not stated</strong>: the message names no retry, and the outcome depends on the underlying failure.</li>
+</ul>
+<h3 id="setup-and-input" class="tsd-anchor-link">Setup and Input<a href="#setup-and-input" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NOT_INITIALIZED</code></td>
+<td>A routed helper runs before <code>initialize</code>, or a cache helper has no KV store.</td>
+<td>No. Call <code>initialize</code> first.</td>
+</tr>
+<tr>
+<td><code>NO_KV</code></td>
+<td><code>initializeFromEnv</code> finds no KV binding and none was passed.</td>
+<td>No. Pass <code>kv</code> or set <code>env.KV</code>.</td>
+</tr>
+<tr>
+<td><code>NO_SHARDS</code></td>
+<td>The configuration has no shards. An insert also throws it when no shard is eligible.</td>
+<td>No for an empty configuration. An insert can succeed once eligibility changes.</td>
+</tr>
+<tr>
+<td><code>CONCURRENT_CONFIG</code></td>
+<td><code>collegedb</code> runs a callback with a different configuration while another is active, and the runtime has no <code>AsyncLocalStorage</code>.</td>
+<td>Not stated. The message says to wait, or to use <code>createClient</code>.</td>
+</tr>
+<tr>
+<td><code>INVALID_CONSISTENCY</code></td>
+<td>A read names a <code>consistency</code> mode that does not exist.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>CONSISTENCY_UNSUPPORTED</code></td>
+<td>A shard cannot serve the requested <code>consistency</code> mode.</td>
+<td>No. Choose a mode the shard supports.</td>
+</tr>
+<tr>
+<td><code>BOOKMARK_IDENTITY_UNVERIFIED</code></td>
+<td>A session read passes bookmarks for a binding that has no <code>id</code> in <code>shardState</code>.</td>
+<td>No until <code>shardState</code> names the database id.</td>
+</tr>
+<tr>
+<td><code>INVALID_IDENTIFIER</code></td>
+<td>A table or column name is not a bare SQL identifier.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>EMPTY_WHERE</code></td>
+<td>A WHERE map has no usable condition for an <code>UPDATE</code> or <code>DELETE</code> builder.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>EMPTY_INSERT</code></td>
+<td>An insert builder receives no column values.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>EMPTY_UPDATE</code></td>
+<td><code>buildUpdate</code> receives no column values.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>EMPTY_CONFLICT</code></td>
+<td><code>buildUpsert</code> receives no conflict column.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>INVALID_INDEX_COLUMNS</code></td>
+<td>An index call has no columns, or a column with no name.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>INVALID_TABLE_NAME</code></td>
+<td>A migration function receives a table name that is not valid.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>INVALID_QUERY_INPUT</code></td>
+<td>The in-memory SQL backend receives a query input it does not support.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_PK_MISSING</code></td>
+<td>A row or snapshot lacks its primary key column.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_VERSION_COLUMN_MISSING</code></td>
+<td>A snapshot lacks its version column.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>EMPTY_SOURCE_RECORD</code></td>
+<td>A source record has no columns.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>QUERY_FAILED</code></td>
+<td>The backend reports the statement as unsuccessful.</td>
+<td>Not stated. The message includes the backend error.</td>
+</tr>
+<tr>
+<td><code>SIZE_QUERY_FAILED</code></td>
+<td>No size statement worked on the backend.</td>
+<td>Not stated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="client-adapters-and-schema" class="tsd-anchor-link">Client Adapters and Schema<a href="#client-adapters-and-schema" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SQLITE_CLIENT_INVALID</code></td>
+<td>A SQLite client lacks the methods the adapter needs (<code>execute</code>, or <code>prepare</code> with <code>run</code>, <code>all</code> or <code>get</code>).</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>MYSQL_CLIENT_INVALID</code></td>
+<td>A MySQL client lacks <code>execute</code> or <code>query</code>.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>DRIZZLE_CLIENT_INVALID</code></td>
+<td>A Drizzle client lacks <code>run</code>, <code>execute</code> or <code>all</code>.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>NUXTHUB_KV_CLIENT_INVALID</code></td>
+<td>A NuxtHub KV client lacks a get, set, delete or key-listing method.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>DRIZZLE_BINDINGS_MISMATCH</code></td>
+<td>A Drizzle statement has a different placeholder count than its bindings.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>SCHEMA_CREATION_FAILED</code></td>
+<td>Creating the schema on one shard fails.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>SCHEMA_MIGRATION_FAILED</code></td>
+<td>A schema migration fails.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>DISCOVERY_FAILED</code></td>
+<td>Scanning a table for primary keys or records fails.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_VERIFY_FAILED</code></td>
+<td>A destination copy does not match its source row.</td>
+<td>Not stated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="kv-and-cache" class="tsd-anchor-link">KV and Cache<a href="#kv-and-cache" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KV_TIMEOUT</code></td>
+<td>A KV call runs past <code>kvTimeoutMs</code>. Never resolves as &quot;not found&quot;.</td>
+<td>Not stated. The underlying call is not cancelled.</td>
+</tr>
+<tr>
+<td><code>KV_JSON_PARSE_FAILED</code></td>
+<td>A stored KV value is not valid JSON.</td>
+<td>Not stated. A retry reads the same value.</td>
+</tr>
+<tr>
+<td><code>KV_PUT_MANY_FAILED</code></td>
+<td>A Workers KV <code>putMany</code> write fails. The message names the key.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>CACHE_FETCH_TIMEOUT</code></td>
+<td>A <code>cached</code> fetch runs past <code>fetchTimeoutMs</code>. The fetch is not cancelled, and a late result is still stored.</td>
+<td>Not stated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="keys-and-mappings" class="tsd-anchor-link">Keys and Mappings<a href="#keys-and-mappings" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SHARD_NOT_FOUND</code></td>
+<td>A mapping or call names a binding that is not in <code>shards</code>.</td>
+<td>No. Fix the configuration.</td>
+</tr>
+<tr>
+<td><code>MAPPING_NOT_FOUND</code></td>
+<td><code>reassignShard</code>, <code>updateShardMapping</code>, <code>addLookupKeys</code> or <code>getAllLookupKeys</code> finds no mapping for the key.</td>
+<td>No. The key has no mapping yet.</td>
+</tr>
+<tr>
+<td><code>GENERATED_KEY_UNAVAILABLE</code></td>
+<td>An insert returns no id. Pass <code>idColumn</code> when the primary key is not named <code>id</code> or <code>rowid</code>.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>GENERATED_KEY_COLLISION</code></td>
+<td>A generated id is already mapped to another shard. The row this insert wrote is removed.</td>
+<td>Not stated. The message says to delete the orphan row or pass <code>table</code>.</td>
+</tr>
+<tr>
+<td><code>UNROUTABLE_QUERY</code></td>
+<td>The planner cannot prove a routing key and <code>onUnroutable</code> is <code>throw</code>.</td>
+<td>No. Pass the key, declare the table in <code>keyColumns</code>, or set <code>fanout</code>.</td>
+</tr>
+<tr>
+<td><code>WRITE_UNRESOLVED</code></td>
+<td>After a topology change, the probe that finds the row cannot run. The write is not applied.</td>
+<td>Not stated. The message says the table must exist on every shard.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="coordinator" class="tsd-anchor-link">Coordinator<a href="#coordinator" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>COORDINATOR_NOT_CONFIGURED</code></td>
+<td><code>reconcileAllocations</code> runs without a <code>coordinator</code>.</td>
+<td>No. Add <code>coordinator</code>.</td>
+</tr>
+<tr>
+<td><code>COORDINATOR_ERROR</code></td>
+<td>The coordinator returns a non-OK response while reconcile lists or prunes allocations.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>RECONCILE_VERIFY_REQUIRED</code></td>
+<td><code>reconcileAllocations</code> runs in repair mode without <code>verifyRecords</code>.</td>
+<td>No. Add <code>verifyRecords</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="moves-and-journal" class="tsd-anchor-link">Moves and Journal<a href="#moves-and-journal" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>JOURNAL_NOT_CONFIGURED</code></td>
+<td>A move, <code>pruneEpochs</code>, <code>recoverMigrations</code>, <code>verifyMigrations</code>, <code>getMigrationStatus</code> or <code>purgeRetired</code> runs on a multi-shard configuration without <code>journalShard</code>.</td>
+<td>No. Set <code>journalShard</code>.</td>
+</tr>
+<tr>
+<td><code>INVALID_JOURNAL_SHARD</code></td>
+<td><code>journalShard</code> names a binding that is not configured.</td>
+<td>No. Fix the configuration.</td>
+</tr>
+<tr>
+<td><code>JOURNAL_UNAVAILABLE</code></td>
+<td>A read or write to the migration journal fails. The cause is attached.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_UNSUPPORTED_DIALECT</code></td>
+<td>A journaled move involves a shard on a dialect outside <code>PROVEN_JOURNAL_DIALECTS</code>.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_NO_BATCH</code></td>
+<td>A move or guarded write needs a batch, and the shard has no <code>runBatch</code>.</td>
+<td>No. Use a provider that implements <code>runBatch</code>.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_NO_ATOMIC_BATCH</code></td>
+<td>A shard's <code>runBatch</code> does not declare <code>atomicBatch</code>.</td>
+<td>No. Use an adapter that declares it, or set <code>atomicBatch</code> after a failing-batch test.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_IN_PROGRESS</code></td>
+<td>Another move holds the claim on this key.</td>
+<td>Yes. The message says to run <code>recoverMigrations()</code> or retry.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_CUTOVER_PENDING</code></td>
+<td>The key has moved off its shard, and the new owner is not published yet. The write is not applied.</td>
+<td>Yes. The message says to retry.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_LOOKUP_UNAVAILABLE</code></td>
+<td>The tombstone lookup failed (Yes), or the tombstone names a shard that is not configured (No).</td>
+<td>Yes for a failed lookup. No for an unknown shard.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_CHAIN_EXCEEDED</code></td>
+<td>The move chain for a key loops back, or runs past four tombstone hops.</td>
+<td>No. The message says a retry will not help.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_ABORTED</code></td>
+<td><code>reassignShard</code> stops with a reason. The key stays on its current shard.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_SOURCE_TOMBSTONED</code></td>
+<td>The source shard holds a tombstone for the key from another move.</td>
+<td>No until <code>verifyMigrations()</code> has run.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_ROW_TOO_WIDE</code></td>
+<td>The row needs more bind parameters than <code>maxBindParameters</code>, and no <code>versionColumn</code> was given.</td>
+<td>No. Pass <code>versionColumn</code>.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_UNSUPPORTED_VALUE</code></td>
+<td>A column value has a type that cannot be archived.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>DESTINATION_CONFLICT</code></td>
+<td>The destination holds a different row, and <code>onConflict</code> is not <code>replace</code>.</td>
+<td>No. Pass <code>onConflict: 'replace'</code> to overwrite.</td>
+</tr>
+<tr>
+<td><code>RECORD_NOT_FOUND</code></td>
+<td><code>migrateRecord</code> or a move finds no source row.</td>
+<td>No.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_PUBLISH_FAILED</code></td>
+<td>The move is committed, but publishing derived state failed.</td>
+<td>Yes. Run <code>recoverMigrations()</code> to finish it.</td>
+</tr>
+<tr>
+<td><code>MIGRATION_AMBIGUOUS</code></td>
+<td>Recovery finds a cut-over row that does not match its archive.</td>
+<td>Not stated. Resolve the mismatch before retrying.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="recovery" class="tsd-anchor-link">Recovery<a href="#recovery" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RECOVERY_IN_PROGRESS</code></td>
+<td>Another recovery holds the lease for this scope.</td>
+<td>Yes. The message says to retry later.</td>
+</tr>
+<tr>
+<td><code>RECOVERY_FENCED</code></td>
+<td>This recovery lost its lease mid-run and made no further writes.</td>
+<td>No. The new lease holder owns the work.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="placement-and-topology" class="tsd-anchor-link">Placement and Topology<a href="#placement-and-topology" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PLACEMENT_UNVERIFIED</code></td>
+<td>The placement manifest cannot be confirmed because KV or the journal failed. Nothing is routed.</td>
+<td>Yes. The message says to retry.</td>
+</tr>
+<tr>
+<td><code>PLACEMENT_CONFLICT</code></td>
+<td>Five manifest compare-and-swap attempts in a row lost to other writers.</td>
+<td>Yes. The message says to retry.</td>
+</tr>
+<tr>
+<td><code>TOO_MANY_EPOCHS</code></td>
+<td>The manifest already holds 8 epochs.</td>
+<td>No. Move keys to their owners, then prune epochs.</td>
+</tr>
+<tr>
+<td><code>STALE_TOPOLOGY</code></td>
+<td>A write from an older manifest generation is refused, even after a reload. The write is not applied.</td>
+<td>Yes. The message says to retry.</td>
+</tr>
+<tr>
+<td><code>PRUNE_REFUSED</code></td>
+<td><code>pruneEpochs</code> cannot prove that no row depends on an epoch. The message gives the reason.</td>
+<td>Not stated.</td>
+</tr>
+<tr>
+<td><code>MANIFEST_CORRUPT</code></td>
+<td>The stored placement manifest is not readable.</td>
+<td>Not stated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="eligibility" class="tsd-anchor-link">Eligibility<a href="#eligibility" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Thrown when</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NO_ELIGIBLE_SHARD</code></td>
+<td>No shard accepts new keys. Each one is read-only, draining, retired, or rejected by <code>eligible</code>. Thrown on allocation and on writes; reads still work.</td>
+<td>Not stated. Eligibility must change.</td>
+</tr>
+<tr>
+<td><code>ELIGIBILITY_FAILED</code></td>
+<td>The <code>eligible</code> predicate throws or rejects. A shard whose eligibility is unknown never counts as eligible.</td>
+<td>Yes. The message says to retry the operation.</td>
+</tr>
+</tbody>
+</table>
+<p>Several migration functions also fill a report with a reason code (for example <code>CAS_MISS</code>, <code>SOURCE_CHANGED</code>, <code>SOURCE_ROW_MISSING</code>, <code>VERIFY_FAILED</code>, <code>RETENTION_NOT_ELAPSED</code>). Those values are report fields, not thrown errors, so they are not listed here.</p>
+<h2 id="coordinator-1" class="tsd-anchor-link">Coordinator<a href="#coordinator-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The <code>ShardCoordinator</code> Durable Object and its HTTP API are described in <a href="cloudflare.html">Cloudflare</a>.</p>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#api-reference"><span>API <wbr/>Reference</span></a>
+<ul>
+<li><a href="#client-and-setup"><span>Client and <wbr/>Setup</span></a></li>
+<li><a href="#reads-and-writes"><span>Reads and <wbr/>Writes</span></a></li>
+<li><a href="#shard-targeted-and-all-shard-queries"><span>Shard-<wbr/>Targeted and <wbr/>All-<wbr/>Shard <wbr/>Queries</span></a></li>
+<li><a href="#indexes"><span>Indexes</span></a></li>
+<li><a href="#lookup-keys"><span>Lookup <wbr/>Keys</span></a></li>
+<li><a href="#moves-and-recovery"><span>Moves and <wbr/>Recovery</span></a></li>
+<li><a href="#placement-topology-and-eligibility"><span>Placement, <wbr/>Topology and <wbr/>Eligibility</span></a></li>
+<li><a href="#sizes"><span>Sizes</span></a></li>
+<li><a href="#sql-builders-and-identifiers"><span>SQL <wbr/>Builders and <wbr/>Identifiers</span></a></li>
+<li><a href="#cache-and-kv-helpers"><span>Cache and <wbr/>KV <wbr/>Helpers</span></a></li>
+<li><a href="#providers"><span>Providers</span></a></li>
+<li><a href="#drop-in-functions"><span>Drop-<wbr/>in <wbr/>Functions</span></a></li>
+<li><a href="#telemetry"><span>Telemetry</span></a></li>
+<li><a href="#errors"><span>Errors</span></a></li>
+<li>
+<ul>
+<li><a href="#setup-and-input"><span>Setup and <wbr/>Input</span></a></li>
+<li><a href="#client-adapters-and-schema"><span>Client <wbr/>Adapters and <wbr/>Schema</span></a></li>
+<li><a href="#kv-and-cache"><span>KV and <wbr/>Cache</span></a></li>
+<li><a href="#keys-and-mappings"><span>Keys and <wbr/>Mappings</span></a></li>
+<li><a href="#coordinator"><span>Coordinator</span></a></li>
+<li><a href="#moves-and-journal"><span>Moves and <wbr/>Journal</span></a></li>
+<li><a href="#recovery"><span>Recovery</span></a></li>
+<li><a href="#placement-and-topology"><span>Placement and <wbr/>Topology</span></a></li>
+<li><a href="#eligibility"><span>Eligibility</span></a></li></ul></li>
+<li><a href="#coordinator-1"><span>Coordinator</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>shard-moves | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">shard-moves</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="shard-moves" class="tsd-anchor-link">Shard Moves<a href="#shard-moves" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page covers moving a key's rows from one shard to another, the topology and epoch records that route keys during a change, and reconciling the coordinator's allocation ledger. It is for anyone running <code>reassignShard</code>, <code>rebalance</code> or <code>recoverMigrations</code>, and for anyone scheduling recovery. The <a href="migration-protocol.html">migration protocol</a> holds the proofs and names the test behind each claim. This page describes what the API does and what the caller has to arrange.</p>
+<h2 id="safe-shard-moves" class="tsd-anchor-link">Safe Shard Moves<a href="#safe-shard-moves" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>reassignShard</code>, <code>rebalance</code> and <code>recoverMigrations</code> move rows through a journal. The journal records each step before the work for that step runs, so <code>recoverMigrations()</code> can finish or abort a move that a crash interrupted. The journal lives on the shard named by <code>journalShard</code>:</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">initialize</span><span class="hl-1">, </span><span class="hl-5">reassignShard</span><span class="hl-1">, </span><span class="hl-5">recoverMigrations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-0">initialize</span><span class="hl-1">({</span><br/><span class="hl-1">	</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1"> },</span><br/><span class="hl-1">	</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">journalShard:</span><span class="hl-1"> </span><span class="hl-2">&#39;db-east&#39;</span><br/><span class="hl-1">});</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">reassignShard</span><span class="hl-1">(</span><span class="hl-2">&#39;user-california-123&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;users&#39;</span><span class="hl-1">);</span><br/><br/><span class="hl-3">// run after any deploy that may have interrupted a move</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">recoverMigrations</span><span class="hl-1">();</span>
+</code><button type="button">Copy</button></pre>
+
+<p>A move is per key, not per table. <code>reassignShard</code> moves one table's row for one key. An organization whose related rows sit in several tables needs one move per table, which is an application procedure.</p>
+<h3 id="configuration" class="tsd-anchor-link">Configuration<a href="#configuration" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><code>journalShard</code> names the binding that holds the journal tables. <code>initialize</code> rejects a value that is not a configured binding with <code>INVALID_JOURNAL_SHARD</code>. With more than one shard and no <code>journalShard</code>, <code>reassignShard</code> and <code>recoverMigrations</code> throw <code>JOURNAL_NOT_CONFIGURED</code>, and so does a <code>rebalance</code> that is not a dry run. A single-shard configuration uses its only shard as the journal.</p>
+<p><code>journalScope</code> (default <code>'default'</code>) keeps separate journals when several sets share one database. With <code>journalShard</code> set, every data shard also holds the <code>collegedb_retired</code> and <code>collegedb_topology</code> tables.</p>
+<p><code>createClient(config)</code> exposes <code>reassignShard</code>, <code>rebalance</code>, <code>recoverMigrations</code>, <code>verifyMigrations</code>, <code>pruneEpochs</code> and <code>reconcileAllocations</code> as methods. Each client reads <code>journalShard</code> and <code>journalScope</code> from its own config.</p>
+<h3 id="requirements" class="tsd-anchor-link">Requirements<a href="#requirements" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>A move runs only between shards on a proven dialect: SQLite (including D1 and a raw binding with no <code>dialect</code>), Postgres, and MySQL or MariaDB. A shard on any other dialect throws <code>MIGRATION_UNSUPPORTED_DIALECT</code>.</p>
+<p>The source and destination shards must also declare <code>atomicBatch</code>, which means their <code>runBatch</code> rolls back the whole group when one statement fails. A shard without the declaration refuses with <code>MIGRATION_NO_ATOMIC_BATCH</code>. A shard with no <code>runBatch</code> at all refuses with <code>MIGRATION_NO_BATCH</code>.</p>
+<p>These adapters declare <code>atomicBatch</code>:</p>
+<ul>
+<li>The native Postgres, MySQL, MariaDB and SQLite adapters.</li>
+<li>The Drizzle adapters over Postgres, MySQL, MariaDB and <code>bun:sqlite</code>.</li>
+<li>The Hyperdrive Postgres and MySQL providers.</li>
+<li>A D1 binding passed through <code>toProvider</code>, tested on local workerd.</li>
+</ul>
+<p>Drizzle over D1 and libsql over HTTP declare nothing, so a move from either refuses. Rollback on production D1 is unproven (see <a href="#limits">limits</a>).</p>
+<p>Single-connection adapters (<code>singleConnection: true</code>) hold their other statements until an open batch commits. A caller <code>lease</code> gates statements only when <code>singleConnection: true</code> is also set. Pooled adapters are not affected.</p>
+<h3 id="write-ordering-and-recovery" class="tsd-anchor-link">Write Ordering and Recovery<a href="#write-ordering-and-recovery" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Every router-issued write either commits before the cutover and is reflected in the cutover's comparison, or runs after the source is fenced and cannot create a stale source row. A write that cannot tell which shard owns the key fails with <code>MIGRATION_CUTOVER_PENDING</code>. It is never acknowledged.</p>
+<p>A crash after the cutover leaves the key readable, and its writes fail with <code>MIGRATION_CUTOVER_PENDING</code> until <code>recoverMigrations()</code> runs. Schedule recovery for this reason. <code>getMigrationStatus(key, table)</code> returns the latest recorded state of the key's move, or <code>null</code> when there is none.</p>
+<p>A read that finds nothing on a shard that holds a tombstone for the key follows the tombstone's <code>moved_to</code> shard, up to four hops. The read checks for tombstones only when <code>journalShard</code> is set. A failed tombstone lookup, a chain longer than four hops, a cycle, or a tombstone that names an unconfigured shard throws <code>MIGRATION_LOOKUP_UNAVAILABLE</code> or <code>MIGRATION_CHAIN_EXCEEDED</code>. Pass <code>bestEffort: true</code> in the read options to return the not-found result instead.</p>
+<h3 id="move-states" class="tsd-anchor-link">Move States<a href="#move-states" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>An operation moves through <code>prepared</code>, <code>copied</code>, <code>verified</code>, <code>cutover_pending</code>, <code>committed</code>, <code>published</code> and <code>retired</code>. Each state is a journal row written before the work that follows it. A cutover that misses returns the operation to <code>prepared</code> for another copy, up to three times. <code>aborted</code> ends an operation without moving the key.</p>
+<pre><code class="mermaid">stateDiagram-v2
+	[*] --&gt; prepared
+	prepared --&gt; copied
+	copied --&gt; verified
+	verified --&gt; cutover_pending
+	cutover_pending --&gt; committed
+	committed --&gt; published
+	published --&gt; retired
+	cutover_pending --&gt; prepared : cutover missed, copy again
+	cutover_pending --&gt; aborted : source gone or copies used up
+	retired --&gt; [*]
+	aborted --&gt; [*]
+</code><button type="button">Copy</button></pre>
+
+<p>The diagram follows the states in the migration protocol. Recovery resumes an operation from its last recorded state, using the rules in the protocol's recovery table.</p>
+<h3 id="move-sequence" class="tsd-anchor-link">Move Sequence<a href="#move-sequence" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>The next diagram shows one successful move. The router drives each step, and it writes the matching journal row first. After the copy, it reads the destination row and compares digests. After the commit, it publishes the mapping and the placement exception. &quot;Shards&quot; stands for the source and destination shards, which the router reaches through their bindings.</p>
+<pre><code class="mermaid">sequenceDiagram
+	participant R as Router
+	participant J as Journal
+	participant S as Shards
+	R-&gt;&gt;J: claim key
+	R-&gt;&gt;J: prepared with digest
+	R-&gt;&gt;S: copy to destination
+	R-&gt;&gt;J: copied
+	R-&gt;&gt;S: compare digests
+	R-&gt;&gt;J: verified
+	R-&gt;&gt;J: cutover_pending
+	R-&gt;&gt;S: archive and delete source
+	R-&gt;&gt;J: committed
+	R-&gt;&gt;R: publish mapping
+	R-&gt;&gt;J: published
+	R-&gt;&gt;J: retired
+	R-&gt;&gt;J: release claim
+</code><button type="button">Copy</button></pre>
+
+<p>The source cutover is one batch on the source shard. It inserts the archive row into <code>collegedb_retired</code> and deletes the source row under one predicate. A write that changed the row first makes the predicate fail, so the cutover writes nothing and the move is retried.</p>
+<h3 id="recovery-lease" class="tsd-anchor-link">Recovery Lease<a href="#recovery-lease" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Only one recovery runs per journal scope at a time, across isolates. <code>recoverMigrations()</code> takes a lease row in the journal first. The lease lasts 60 seconds without renewal. A call while the lease is live throws <code>RECOVERY_IN_PROGRESS</code>, which is the normal result for a scheduler that calls on every tick. The first call after a crashed recovery takes the lease over at a higher generation.</p>
+<p>A recovery that loses its lease stops and throws <code>RECOVERY_FENCED</code>. It makes no further writes, and the next scheduled call starts a fresh recovery. A live move does not take the lease. <code>verifyMigrations({ repair: true })</code> does.</p>
+<p>The first flowchart covers the lease check and the claim states. A claim in <code>prepared</code>, <code>copied</code> or <code>verified</code> state starts again from a fresh snapshot. A claim in <code>committed</code> or <code>published</code> state finishes the remaining steps. A claim in <code>cutover_pending</code> state goes to the cutover check in the second flowchart.</p>
+<pre><code class="mermaid">flowchart TD
+	A[recoverMigrations called] --&gt; B{Live lease?}
+	B -- yes --&gt; C[Throw RECOVERY_IN_PROGRESS]
+	B -- no --&gt; D[Take lease]
+	D --&gt; E{Claim state}
+	E -- prepared to verified --&gt; F[Start over]
+	E -- committed, published --&gt; G[Finish steps]
+	E -- cutover_pending --&gt; H[Cutover check]
+</code><button type="button">Copy</button></pre>
+
+<p>The cutover check reads the source row. If the row is still there and its digest matches, the cutover runs again. If the row has changed, the move aborts. If the row is gone, the archive row for the operation decides the outcome: when it exists, the destination is checked and the move is published; when it does not, the move aborts. Every abort drops the destination copy.</p>
+<pre><code class="mermaid">flowchart TD
+	H{Source row?} -- yes, digest matches --&gt; I[Run cutover again]
+	H -- yes, changed --&gt; X[Abort, drop destination copy]
+	H -- no --&gt; K{Archive row?}
+	K -- yes --&gt; L[Check destination, then publish]
+	K -- no --&gt; X
+</code><button type="button">Copy</button></pre>
+
+<p>The protocol's recovery table lists every state, and it is the reference for edge cases.</p>
+<p>A Workers scheduler runs recovery from <code>scheduled()</code> and treats <code>RECOVERY_IN_PROGRESS</code> as success:</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">initialize</span><span class="hl-1">, </span><span class="hl-5">recoverMigrations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">export</span><span class="hl-1"> </span><span class="hl-4">default</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-6">async</span><span class="hl-1"> </span><span class="hl-0">scheduled</span><span class="hl-1">(</span><span class="hl-5">controller</span><span class="hl-1">: </span><span class="hl-8">ScheduledController</span><span class="hl-1">, </span><span class="hl-5">env</span><span class="hl-1">: </span><span class="hl-8">Env</span><span class="hl-1">, </span><span class="hl-5">ctx</span><span class="hl-1">: </span><span class="hl-8">ExecutionContext</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-0">initialize</span><span class="hl-1">({</span><br/><span class="hl-1">			</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1"> },</span><br/><span class="hl-1">			</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-5">journalShard:</span><span class="hl-1"> </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-0">waitUntil</span><span class="hl-5">:</span><span class="hl-1"> (</span><span class="hl-5">promise</span><span class="hl-1">) </span><span class="hl-6">=&gt;</span><span class="hl-1"> </span><span class="hl-5">ctx</span><span class="hl-1">.</span><span class="hl-0">waitUntil</span><span class="hl-1">(</span><span class="hl-5">promise</span><span class="hl-1">)</span><br/><span class="hl-1">		});</span><br/><br/><span class="hl-1">		</span><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">			</span><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">recoverMigrations</span><span class="hl-1">();</span><br/><span class="hl-1">			</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">failed</span><span class="hl-1">.</span><span class="hl-5">length</span><span class="hl-1"> &gt; </span><span class="hl-9">0</span><span class="hl-1">) {</span><br/><span class="hl-1">				</span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">error</span><span class="hl-1">(</span><span class="hl-2">&#39;moves needing attention&#39;</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">failed</span><span class="hl-1">);</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">		} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">			</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-8">CollegeDBError</span><span class="hl-1"> &amp;&amp; </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">code</span><span class="hl-1"> === </span><span class="hl-2">&#39;RECOVERY_IN_PROGRESS&#39;</span><span class="hl-1">) {</span><br/><span class="hl-1">				</span><span class="hl-4">return</span><span class="hl-1">;</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">			</span><span class="hl-4">throw</span><span class="hl-1"> </span><span class="hl-5">error</span><span class="hl-1">;</span><br/><span class="hl-1">		}</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">};</span>
+</code><button type="button">Copy</button></pre>
+
+<p>A <code>RECOVERY_FENCED</code> error can also propagate. The Worker run fails, the lease belongs to another holder, and the next tick recovers normally.</p>
+<p><code>RecoveryReport</code> lists <code>examined</code>, <code>committed</code>, <code>aborted</code>, <code>released</code>, <code>skipped</code> and <code>failed</code>. An entry in <code>failed</code> names the operation, the key and the error, and the operation is left as it was.</p>
+<h3 id="stale-executors-and-verification" class="tsd-anchor-link">Stale Executors and Verification<a href="#stale-executors-and-verification" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>A recovery that stalls between its lease check and a shard write can still run that one write after another recovery takes over. Its journal writes are fenced, so it never returns a report and throws <code>RECOVERY_FENCED</code>. The stale write can leave a stranded copy on the destination of an aborted move, or archive a source row after the new holder aborted the move.</p>
+<p><code>verifyMigrations()</code> reports these leftovers and changes nothing. Its report has these fields:</p>
+<ul>
+<li><code>danglingOps</code>: operations still active in the journal.</li>
+<li><code>ghosts</code>: live rows on a shard that also holds a tombstone for the key.</li>
+<li><code>strandedArchives</code>: tombstones with no journal record.</li>
+<li><code>strandedCopies</code>: live rows on the destination of an aborted move that equal a row the move journaled.</li>
+<li><code>staleCutovers</code>: tombstones whose move the journal ended as aborted. Each entry says whether it is <code>restorable</code>.</li>
+<li><code>repaired</code>: what <code>repair</code> changed.</li>
+<li><code>clean</code>: true when nothing remains to report.</li>
+</ul>
+<p><code>verifyMigrations({ repair: true })</code> runs recovery first, so it takes the lease. It removes a ghost only when the row equals the archived payload. It removes a stranded copy by the same proof the abort used. It restores the archived row of a stale cutover only when the operation is the newest on the key, the archive still holds its payload, and the destination has no row. Otherwise the entry is reported with <code>restorable: false</code> and left as it is.</p>
+<p>One case cannot be detected. A stale destination insert lands after the new holder committed the move and an acknowledged delete removed the key. The protocol describes the conditions and the test that pins this behavior.</p>
+<h3 id="single-row-copy" class="tsd-anchor-link">Single-Row Copy<a href="#single-row-copy" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><code>migrateRecord(source, target, primaryKey, tableName, options)</code> copies one row from one database to another, then deletes the source row. It writes no journal, so a crash between the two writes is not recoverable. Use <code>reassignShard</code> when that matters.</p>
+<p><code>pkColumn</code> names the key column (default <code>id</code>). With <code>onConflict: 'fail'</code> (the default), a destination row that differs from the source makes the copy fail with <code>DESTINATION_CONFLICT</code>. An identical destination row counts as a retried copy. <code>onConflict: 'replace'</code> overwrites the destination row.</p>
+<h3 id="retention-and-purge" class="tsd-anchor-link">Retention and Purge<a href="#retention-and-purge" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>The archived source row is kept for seven days by default. <code>retire: { afterMs }</code> on <code>reassignShard</code> changes the period. <code>retire: 'immediate'</code> sets the deadline to now, but it does not purge anything by itself.</p>
+<p><code>purgeRetired()</code> clears the archived payload of a retired operation. It refuses an operation with <code>RETENTION_NOT_ELAPSED</code> before the deadline, and with <code>NOT_VERIFIED</code> when no clean verification pass has run since the move finished. Its report lists the <code>purged</code> and <code>refused</code> operations. The tombstone stays after a purge, so stale writers remain refused. Restoring an old row is a new explicit move from the archive.</p>
+<h3 id="limits" class="tsd-anchor-link">Limits<a href="#limits" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul>
+<li>The journal covers statements that CollegeDB routes. Raw SQL and raw <code>run()</code> or <code>all()</code> statements bypass it.</li>
+<li>Each move covers one table row. A <code>reassignShard</code> on one table leaves the key's rows in other tables where they were.</li>
+<li>Nothing is atomic across shards. The journal makes an interrupted move recoverable, and it does nothing more.</li>
+<li>Crash recovery is not a backup or a restore.</li>
+<li>Rollback of a failing batch on production D1 is unproven. The D1 declaration rests on local workerd runs.</li>
+</ul>
+<h3 id="reassignment-and-the-mapping-cache" class="tsd-anchor-link">Reassignment and the Mapping Cache<a href="#reassignment-and-the-mapping-cache" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><code>mappingCacheTtlMs</code> (default 30000 milliseconds) limits how long another process keeps routing a key to its old shard after a reassignment. The process that calls <code>reassignShard</code> is correct at once, because it clears its own cache entry. Other processes keep the old shard until their cached entry expires:</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">reassignShard</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">reassignShard</span><span class="hl-1">(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;users&#39;</span><span class="hl-1">);</span><br/><span class="hl-3">// this isolate routes user-123 to db-west now</span><br/><span class="hl-3">// other isolates may route it to db-east for up to mappingCacheTtlMs</span>
+</code><button type="button">Copy</button></pre>
+
+<p>Lower the TTL when a reassignment has to take effect quickly across isolates. The cost is more KV reads. A value of <code>0</code> reads the mapping on every call:</p>
+<pre><code class="typescript"><span class="hl-0">initialize</span><span class="hl-1">({ </span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">, </span><span class="hl-5">shards</span><span class="hl-1">, </span><span class="hl-5">mappingCacheTtlMs:</span><span class="hl-1"> </span><span class="hl-9">0</span><span class="hl-1"> });</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>reassignShard</code> throws <code>MAPPING_NOT_FOUND</code> when the key has no mapping and no computed owner. Under computed placement, a reassignment also bumps the manifest's exception version, so other isolates discard their cached exception set on the next manifest refresh.</p>
+<h2 id="topology-and-epochs" class="tsd-anchor-link">Topology and Epochs<a href="#topology-and-epochs" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>With <code>placement: 'computed'</code>, a key's shard comes from a placement manifest. The manifest is an ordered list of epochs, newest first. Each epoch records a shard set and the algorithm that computes an owner from it. A key placed under an older epoch still resolves through that epoch. <a href="sharding.html#computed-placement">Computed placement</a> explains the routing.</p>
+<p>A manifest holds at most 8 epochs, the current one included. Creating a ninth throws <code>TOO_MANY_EPOCHS</code>. CollegeDB never drops an epoch to make room, because a key placed under it would stop resolving. Move keys to their current owners and run <a href="#pruning-epochs">pruning epochs</a> first.</p>
+<p>A read that misses on the newest epoch checks older epochs, one query each. A key found through an older epoch is stored as a placement exception on its first hit, so later reads go straight to it. A move records a placement exception only when its destination differs from the computed owner.</p>
+<h3 id="manifest-storage" class="tsd-anchor-link">Manifest Storage<a href="#manifest-storage" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>With <code>journalShard</code> set on a proven dialect, the manifest is the <code>collegedb_manifest</code> row on the journal shard. Every update is a compare-and-swap on the manifest revision. A writer that loses five swaps in a row throws <code>PLACEMENT_CONFLICT</code>. KV holds a derived copy that isolates refresh on a timer.</p>
+<p>A read may use a cached manifest when KV cannot confirm the current one. A write needs a fresh manifest. When a write cannot confirm one, it throws <code>PLACEMENT_UNVERIFIED</code> and routes nothing. Retry the call.</p>
+<h3 id="topology-fence" class="tsd-anchor-link">Topology Fence<a href="#topology-fence" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Each data shard holds a fence, <code>min_generation</code>, in <code>collegedb_topology</code>. A write binds the generation of the manifest it routed with. A guarded insert or upsert matches no row while the fence is above that generation.</p>
+<p>The router distinguishes three zero-row results. A raised fence means the manifest is stale. The router reloads it once and throws <code>STALE_TOPOLOGY</code> if the write still cannot land. A tombstone follows the builder write rules in the <a href="migration-protocol.html">migration protocol</a>. An ignored conflict is a real zero-row result.</p>
+<h3 id="writes-after-a-topology-change" class="tsd-anchor-link">Writes After a Topology Change<a href="#writes-after-a-topology-change" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>After a topology change, a write first finds the shard that holds its row. The router probes the shards for the table's key column, which is <code>id</code> unless <code>keyColumns</code> names another one. It writes to the shard that has the row. A key no shard holds goes to the newest owner. When a probe cannot run, the write throws <code>WRITE_UNRESOLVED</code> and is not applied.</p>
+<p>The probe checks the key column only. A statement keyed on another column is not checked by this probe. The protocol lists that case as unproven.</p>
+<h3 id="pruning-epochs" class="tsd-anchor-link">Pruning Epochs<a href="#pruning-epochs" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><code>pruneEpochs({ tables, pkColumns, dryRun, pageSize, concurrency })</code> drops every epoch that no row depends on. It requires <code>journalShard</code> and throws <code>JOURNAL_NOT_CONFIGURED</code> without one. A failure to read the exception set throws <code>PRUNE_REFUSED</code>. List every table that holds keyed rows in <code>tables</code>. A census over fewer tables cannot show that no row depends on an epoch.</p>
+<p>A run raises the fence on every shard, counts the rows that depend on each epoch, and publishes the shorter manifest through the same compare-and-swap. A row depends on the newest epoch whose owner is the shard the row sits on. A key keeps an epoch when it has a placement exception and a mapping that points at the shard the row sits on. A KV mapping alone does not keep an epoch.</p>
+<p>With <code>dryRun: true</code>, the call returns the dependents of each epoch and changes nothing, the fence included. A writer that holds a manifest older than the fence is refused with <code>STALE_TOPOLOGY</code>.</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">pruneEpochs</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">plan</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">pruneEpochs</span><span class="hl-1">({ </span><span class="hl-5">tables:</span><span class="hl-1"> [</span><span class="hl-2">&#39;users&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">], </span><span class="hl-5">dryRun:</span><span class="hl-1"> </span><span class="hl-6">true</span><span class="hl-1"> });</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">plan</span><span class="hl-1">.</span><span class="hl-5">dependents</span><span class="hl-1">);</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">pruneEpochs</span><span class="hl-1">({ </span><span class="hl-5">tables:</span><span class="hl-1"> [</span><span class="hl-2">&#39;users&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">] });</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">removed</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">retained</span><span class="hl-1">);</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>PruneReport</code> lists the <code>removed</code> and <code>retained</code> epoch numbers, the <code>dependents</code> count for each epoch, and <code>scanned</code>, the rows one census pass read.</p>
+<h2 id="reconciling-allocations" class="tsd-anchor-link">Reconciling Allocations<a href="#reconciling-allocations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>reconcileAllocations</code> compares the coordinator's allocation ledger with routing: the KV mapping, or the computed owner for a key with no mapping. The KV mapping is the record, and the ledger is advisory. Call it after <code>initialize</code>. It throws <code>COORDINATOR_NOT_CONFIGURED</code> when the config has no <code>coordinator</code>.</p>
+<p>Routing agreement does not show that a row exists. Pass <code>verifyRecords</code> with the tables to check. Each key's primary key is probed on the shard that routing points at, which is the ledger shard when a key has no mapping. <code>pkColumn</code> names the key column of a table and defaults to <code>id</code>. Without <code>verifyRecords</code>, no shard is queried, and every examined row counts as <code>recordUnchecked</code>. With it, each row lands in one count: <code>recordVerified</code> when a listed table holds the key, <code>recordMissing</code> when none does, and <code>recordUnchecked</code> when the probe could not run. A probe cannot run when the shard is not configured, the table list is empty, or the query throws.</p>
+<p>A row on the routed shard is not proof that it is the authoritative copy. A shard that holds a tombstone can keep a retained row, and for moved keys the journal is the authority.</p>
+<p>The run writes nothing unless a flag is set:</p>
+<ul>
+<li><code>repair: true</code> writes a KV mapping for each key that has neither a KV mapping nor a computed owner. It uses the ledger shard, and only when the probe finds the row there. It requires <code>verifyRecords</code>, and the call throws <code>RECONCILE_VERIFY_REQUIRED</code> without it.</li>
+<li><code>pruneVerified: true</code> removes ledger rows that agree with routing and have an explicit KV mapping. With <code>verifyRecords</code>, the row must also be verified. Rows that match only the computed placement stay.</li>
+</ul>
+<p>Disagreements are reported and never resolved. Key lists in the report hold at most 1000 entries, and the counts are exact.</p>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">reconcileAllocations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">reconcileAllocations</span><span class="hl-1">({</span><br/><span class="hl-1">	</span><span class="hl-5">limit:</span><span class="hl-1"> </span><span class="hl-9">100</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">verifyRecords:</span><span class="hl-1"> { </span><span class="hl-5">tables:</span><span class="hl-1"> [{ </span><span class="hl-5">table:</span><span class="hl-1"> </span><span class="hl-2">&#39;users&#39;</span><span class="hl-1"> }] }</span><br/><span class="hl-1">});</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">examined</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">routingAgreed</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">recordMissingCount</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">disagreeingCount</span><span class="hl-1">);</span>
+</code><button type="button">Copy</button></pre>
+
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#shard-moves"><span>Shard <wbr/>Moves</span></a>
+<ul>
+<li><a href="#safe-shard-moves"><span>Safe <wbr/>Shard <wbr/>Moves</span></a></li>
+<li>
+<ul>
+<li><a href="#configuration"><span>Configuration</span></a></li>
+<li><a href="#requirements"><span>Requirements</span></a></li>
+<li><a href="#write-ordering-and-recovery"><span>Write <wbr/>Ordering and <wbr/>Recovery</span></a></li>
+<li><a href="#move-states"><span>Move <wbr/>States</span></a></li>
+<li><a href="#move-sequence"><span>Move <wbr/>Sequence</span></a></li>
+<li><a href="#recovery-lease"><span>Recovery <wbr/>Lease</span></a></li>
+<li><a href="#stale-executors-and-verification"><span>Stale <wbr/>Executors and <wbr/>Verification</span></a></li>
+<li><a href="#single-row-copy"><span>Single-<wbr/>Row <wbr/>Copy</span></a></li>
+<li><a href="#retention-and-purge"><span>Retention and <wbr/>Purge</span></a></li>
+<li><a href="#limits"><span>Limits</span></a></li>
+<li><a href="#reassignment-and-the-mapping-cache"><span>Reassignment and the <wbr/>Mapping <wbr/>Cache</span></a></li></ul></li>
+<li><a href="#topology-and-epochs"><span>Topology and <wbr/>Epochs</span></a></li>
+<li>
+<ul>
+<li><a href="#manifest-storage"><span>Manifest <wbr/>Storage</span></a></li>
+<li><a href="#topology-fence"><span>Topology <wbr/>Fence</span></a></li>
+<li><a href="#writes-after-a-topology-change"><span>Writes <wbr/>After a <wbr/>Topology <wbr/>Change</span></a></li>
+<li><a href="#pruning-epochs"><span>Pruning <wbr/>Epochs</span></a></li></ul></li>
+<li><a href="#reconciling-allocations"><span>Reconciling <wbr/>Allocations</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

@@ -1,0 +1,459 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>configuration | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">configuration</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="configuration" class="tsd-anchor-link">Configuration<a href="#configuration" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page lists every field of <code>CollegeDBConfig</code>, the strategy and region types, and example configurations. Read it when you write the object you pass to <code>initialize</code>, <code>collegedb</code> or <code>createClient</code>. Function signatures are in <a href="api-reference.html">API reference</a>.</p>
+<h2 id="config-fields" class="tsd-anchor-link">Config Fields<a href="#config-fields" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>kv</code> and <code>shards</code> are required. Every other field is optional, and the default applies when the field is omitted. A field marked &quot;none&quot; has no default and changes nothing when unset.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kv</code></td>
+<td>required</td>
+<td>Key-value store for shard mappings. See <a href="providers.html">Providers</a>.</td>
+</tr>
+<tr>
+<td><code>shards</code></td>
+<td>required</td>
+<td>Map of shard binding name to <code>SQLDatabase</code>.</td>
+</tr>
+<tr>
+<td><code>strategy</code></td>
+<td><code>'hash'</code></td>
+<td>Strategy for new keys: one <code>ShardingStrategy</code>, or a <code>MixedShardingStrategy</code> with separate <code>read</code> and <code>write</code> values. A partial object falls back to the other side, then to <code>hash</code>.</td>
+</tr>
+<tr>
+<td><code>coordinator</code></td>
+<td>none</td>
+<td><code>DurableObjectNamespace</code> for allocation. Used by every strategy when set. Setup is in <a href="cloudflare.html">Cloudflare</a>.</td>
+</tr>
+<tr>
+<td><code>coordinatorScope</code></td>
+<td><code>'default'</code></td>
+<td>Name passed to <code>idFromName</code> for the coordinator object. A new scope starts from an empty allocation ledger.</td>
+</tr>
+<tr>
+<td><code>targetRegion</code></td>
+<td>none</td>
+<td><code>D1Region</code> that the <code>location</code> strategy aims at. Without it, <code>location</code> falls back to <code>hash</code>.</td>
+</tr>
+<tr>
+<td><code>shardLocations</code></td>
+<td>none</td>
+<td>Region for each shard, as a <code>D1Region</code> or a <code>{ region, priority? }</code> object. <code>location</code> only picks shards that have an entry. See <a href="sharding.html">Sharding</a>.</td>
+</tr>
+<tr>
+<td><code>placement</code></td>
+<td><code>'kv'</code></td>
+<td><code>'computed'</code> resolves <code>hash</code> keys from the key itself and skips the KV read. It is opt-in and works only with <code>hash</code>. The other strategies always use <code>kv</code>.</td>
+</tr>
+<tr>
+<td><code>allocateOnRead</code></td>
+<td><code>false</code></td>
+<td>Records a mapping when a read finds no row. Writes always record a mapping.</td>
+</tr>
+<tr>
+<td><code>legacyMultiKeyLookup</code></td>
+<td><code>false</code></td>
+<td>Probes the pre-1.0.3 multi-key record on a miss. Costs a second KV read per miss. Enable it only while migrating older mappings.</td>
+</tr>
+<tr>
+<td><code>keyColumns</code></td>
+<td><code>id</code> for every table</td>
+<td>Primary-key column per table. The planner uses it to find the routing key, and topology probes use it to find a row.</td>
+</tr>
+<tr>
+<td><code>onUnroutable</code></td>
+<td><code>'throw'</code></td>
+<td><code>throw</code> rejects a statement whose routing key cannot be proven. <code>fanout</code> runs it on every shard.</td>
+</tr>
+<tr>
+<td><code>hashShardMappings</code></td>
+<td><code>true</code></td>
+<td>Hashes primary keys with SHA-256 before they are written to KV. With it on, a mapping's <code>originalKey</code> is not stored.</td>
+</tr>
+<tr>
+<td><code>mappingCacheTtlMs</code></td>
+<td><code>30000</code></td>
+<td>In-memory TTL, in milliseconds, for the key-to-shard cache.</td>
+</tr>
+<tr>
+<td><code>knownShardsCacheTtlMs</code></td>
+<td><code>10000</code></td>
+<td>In-memory TTL, in milliseconds, for the list of known shards.</td>
+</tr>
+<tr>
+<td><code>sizeCacheTtlMs</code></td>
+<td><code>30000</code></td>
+<td>In-memory TTL, in milliseconds, for shard size checks. Applies when <code>maxDatabaseSize</code> is set.</td>
+</tr>
+<tr>
+<td><code>maxDatabaseSize</code></td>
+<td>none</td>
+<td>Size limit in bytes. A shard at or above the limit takes no new keys. A shard whose size cannot be read is not excluded. See <a href="sharding.html">Sharding</a>.</td>
+</tr>
+<tr>
+<td><code>migrationConcurrency</code></td>
+<td><code>25</code></td>
+<td>Concurrent operations for migration mapping work and for <code>rebalance</code>.</td>
+</tr>
+<tr>
+<td><code>disableAutoMigration</code></td>
+<td><code>false</code></td>
+<td>Skips the background migration detection that <code>initialize</code> starts.</td>
+</tr>
+<tr>
+<td><code>journalShard</code></td>
+<td>none</td>
+<td>Binding that holds the migration journal. Required for moves on a multi-shard configuration. A single-shard configuration uses its only shard. See <a href="shard-moves.html">Shard moves</a>.</td>
+</tr>
+<tr>
+<td><code>journalScope</code></td>
+<td><code>'default'</code></td>
+<td>Partition of the journal, for deployments that share one journal database.</td>
+</tr>
+<tr>
+<td><code>kvTimeoutMs</code></td>
+<td>none</td>
+<td>Per-call time limit for KV reads and writes. A call past the limit rejects with <code>KV_TIMEOUT</code>. The underlying call is not cancelled.</td>
+</tr>
+<tr>
+<td><code>shardState</code></td>
+<td>none</td>
+<td>Known facts per shard binding: <code>id</code>, <code>writable</code>, <code>drain</code>, and <code>tags</code>. See <a href="sharding.html">Sharding</a>.</td>
+</tr>
+<tr>
+<td><code>eligible</code></td>
+<td>none</td>
+<td>Predicate <code>(shard, context) =&gt; boolean or Promise&lt;boolean&gt;</code> that decides whether a shard takes new keys. A throw fails the operation with <code>ELIGIBILITY_FAILED</code>.</td>
+</tr>
+<tr>
+<td><code>onPhase</code></td>
+<td>none</td>
+<td><code>(span: PhaseSpan) =&gt; void</code> observer for per-phase timings. Nothing is allocated when it is unset.</td>
+</tr>
+<tr>
+<td><code>waitUntil</code></td>
+<td>none</td>
+<td>Passes the Workers <code>ctx.waitUntil</code>. It keeps the background work started by <code>initialize</code> alive after the request ends.</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td><code>false</code></td>
+<td>Enables debug logging: size exclusions, shards whose size cannot be read, and auto-migration progress.</td>
+</tr>
+</tbody>
+</table>
+<p><code>shardState</code> takes the following fields. <code>writable</code> defaults to <code>true</code>, and <code>drain</code> defaults to <code>'active'</code>. Only a writable shard with <code>drain</code> set to <code>'active'</code> takes new keys. A shard that is not writable, or is <code>draining</code> or <code>retired</code>, keeps its existing keys readable.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td><code>string</code></td>
+<td>Physical database id. For D1, the database UUID. Session bookmarks are keyed by it.</td>
+</tr>
+<tr>
+<td><code>writable</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code> keeps the shard out of new allocations.</td>
+</tr>
+<tr>
+<td><code>drain</code></td>
+<td><code>'active' or 'draining' or 'retired'</code></td>
+<td>Where the shard is in being emptied. <code>retired</code> says its data should already be moved.</td>
+</tr>
+<tr>
+<td><code>tags</code></td>
+<td><code>Record&lt;string, string&gt;</code></td>
+<td>Labels for the <code>eligible</code> predicate, such as a jurisdiction or a schema version.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="strategy-types" class="tsd-anchor-link">Strategy Types<a href="#strategy-types" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The strategy types are declared in <code>src/types.ts</code>.</p>
+<pre><code class="typescript"><span class="hl-3">// one strategy for every operation</span><br/><span class="hl-6">type</span><span class="hl-1"> </span><span class="hl-8">ShardingStrategy</span><span class="hl-1"> = </span><span class="hl-2">&#39;round-robin&#39;</span><span class="hl-1"> | </span><span class="hl-2">&#39;random&#39;</span><span class="hl-1"> | </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1"> | </span><span class="hl-2">&#39;location&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-3">// separate strategies for reads and writes</span><br/><span class="hl-6">interface</span><span class="hl-1"> </span><span class="hl-8">MixedShardingStrategy</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-5">read</span><span class="hl-1">: </span><span class="hl-8">ShardingStrategy</span><span class="hl-1">;</span><br/><span class="hl-1">	</span><span class="hl-5">write</span><span class="hl-1">: </span><span class="hl-8">ShardingStrategy</span><span class="hl-1">;</span><br/><span class="hl-1">}</span><br/><br/><span class="hl-6">type</span><span class="hl-1"> </span><span class="hl-8">OperationType</span><span class="hl-1"> = </span><span class="hl-2">&#39;read&#39;</span><span class="hl-1"> | </span><span class="hl-2">&#39;write&#39;</span><span class="hl-1">;</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>hash</code> is the default. Under <code>kv</code> placement, a key's shard is recorded in KV, so a later change to the strategy does not move existing keys. See <a href="sharding.html">Sharding</a> for what each strategy does with a new key.</p>
+<h2 id="regions-and-shard-locations" class="tsd-anchor-link">Regions and Shard Locations<a href="#regions-and-shard-locations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>D1Region</code> names the region of a shard. The <code>location</code> strategy compares these codes against <code>targetRegion</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Region</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wnam</code></td>
+<td>Western North America (US West Coast)</td>
+</tr>
+<tr>
+<td><code>enam</code></td>
+<td>Eastern North America (US East Coast)</td>
+</tr>
+<tr>
+<td><code>weur</code></td>
+<td>Western Europe</td>
+</tr>
+<tr>
+<td><code>eeur</code></td>
+<td>Eastern Europe</td>
+</tr>
+<tr>
+<td><code>apac</code></td>
+<td>Asia Pacific</td>
+</tr>
+<tr>
+<td><code>oc</code></td>
+<td>Oceania</td>
+</tr>
+<tr>
+<td><code>me</code></td>
+<td>Middle East</td>
+</tr>
+<tr>
+<td><code>af</code></td>
+<td>Africa</td>
+</tr>
+</tbody>
+</table>
+<h2 id="example-configurations" class="tsd-anchor-link">Example Configurations<a href="#example-configurations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A single strategy for every operation:</p>
+<pre><code class="typescript"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">singleStrategyConfig</span><span class="hl-1">: </span><span class="hl-8">CollegeDBConfig</span><span class="hl-1"> = {</span><br/><span class="hl-1">	</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1"> }</span><br/><span class="hl-1">};</span>
+</code><button type="button">Copy</button></pre>
+
+<p>Separate strategies for reads and writes, with location data for the <code>location</code> side:</p>
+<pre><code class="typescript"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">mixedStrategyConfig</span><span class="hl-1">: </span><span class="hl-8">CollegeDBConfig</span><span class="hl-1"> = {</span><br/><span class="hl-1">	</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">strategy:</span><span class="hl-1"> {</span><br/><span class="hl-1">		</span><span class="hl-5">read:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">		</span><span class="hl-5">write:</span><span class="hl-1"> </span><span class="hl-2">&#39;location&#39;</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-5">targetRegion:</span><span class="hl-1"> </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">shardLocations:</span><span class="hl-1"> {</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">2</span><span class="hl-1"> },</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;enam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">1</span><span class="hl-1"> }</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1"> }</span><br/><span class="hl-1">};</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The <code>CollegeDBConfig</code> type comes from <code>@earth-app/collegedb</code>. Import it with <code>import type { CollegeDBConfig } from '@earth-app/collegedb';</code>.</p>
+<h2 id="types" class="tsd-anchor-link">Types<a href="#types" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The types below are exported from the package root. The option and result types used by the functions in <a href="api-reference.html">API reference</a> are exported too; their fields are documented in the source files that declare them.</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CollegeDBConfig</code></td>
+<td>The configuration object described in <a href="#config-fields">Config Fields</a>.</td>
+</tr>
+<tr>
+<td><code>Env</code></td>
+<td>Workers bindings: <code>KV</code>, <code>ShardCoordinator</code>, an optional <code>HYPERDRIVE</code> binding, and shard bindings by name.</td>
+</tr>
+<tr>
+<td><code>ShardingStrategy</code></td>
+<td>One strategy: <code>'round-robin'</code>, <code>'random'</code>, <code>'hash'</code> or <code>'location'</code>.</td>
+</tr>
+<tr>
+<td><code>MixedShardingStrategy</code></td>
+<td><code>{ read, write }</code> pair of <code>ShardingStrategy</code> values.</td>
+</tr>
+<tr>
+<td><code>OperationType</code></td>
+<td><code>'read'</code> or <code>'write'</code>. Selects the strategy in a mixed configuration.</td>
+</tr>
+<tr>
+<td><code>D1Region</code></td>
+<td>Region code, listed in <a href="#regions-and-shard-locations">Regions and Shard Locations</a>.</td>
+</tr>
+<tr>
+<td><code>ShardLocation</code></td>
+<td><code>{ region, priority? }</code>. Higher <code>priority</code> values are preferred.</td>
+</tr>
+<tr>
+<td><code>ShardState</code></td>
+<td>Per-binding facts used by <code>shardState</code>.</td>
+</tr>
+<tr>
+<td><code>EligibilityContext</code></td>
+<td>Argument to the <code>eligible</code> predicate: <code>key</code>, <code>operation</code>, <code>tags</code> and <code>state</code>.</td>
+</tr>
+<tr>
+<td><code>ReadConsistency</code></td>
+<td><code>{ mode: 'primary' }</code>, <code>{ mode: 'session', bookmarks? }</code> or <code>{ mode: 'eventual' }</code>.</td>
+</tr>
+<tr>
+<td><code>ReadOptions</code></td>
+<td>Options for read functions: <code>consistency</code>, and <code>bestEffort</code> for move lookups.</td>
+</tr>
+<tr>
+<td><code>ConsistencyCapabilities</code></td>
+<td>Which read modes a shard can honor: <code>primary</code>, <code>session</code>, <code>eventual</code>.</td>
+</tr>
+<tr>
+<td><code>KVStorage</code></td>
+<td>The key-value contract. Adapters in <a href="providers.html">Providers</a> implement it.</td>
+</tr>
+<tr>
+<td><code>KVListResult</code></td>
+<td>Result of a KV list call: <code>keys</code>, and an optional <code>cursor</code> and <code>list_complete</code>.</td>
+</tr>
+<tr>
+<td><code>SQLDatabase</code></td>
+<td>The SQL contract a shard implements.</td>
+</tr>
+<tr>
+<td><code>SQLDialect</code></td>
+<td><code>'sqlite'</code>, <code>'postgres'</code> or <code>'mysql'</code>.</td>
+</tr>
+<tr>
+<td><code>SQLSession</code></td>
+<td>A read session with <code>prepare</code> and <code>getBookmark</code>.</td>
+</tr>
+<tr>
+<td><code>PreparedStatement</code></td>
+<td><code>bind</code>, <code>run</code>, <code>all</code> and <code>first</code>, as the SQL contract defines them.</td>
+</tr>
+<tr>
+<td><code>BatchStatement</code></td>
+<td>A SQL string with its bindings, for <code>runBatch</code>.</td>
+</tr>
+<tr>
+<td><code>QueryResult</code></td>
+<td>Result of a statement: <code>success</code>, <code>results</code>, <code>meta</code>, and an optional <code>error</code>.</td>
+</tr>
+<tr>
+<td><code>QueryResultMeta</code></td>
+<td><code>duration</code>, and when available <code>changes</code> and <code>last_row_id</code>. Read consistency adds <code>bookmark</code> and <code>bookmarks</code>.</td>
+</tr>
+<tr>
+<td><code>ShardStats</code></td>
+<td><code>binding</code>, <code>count</code> and an optional <code>lastUpdated</code>, as returned by <code>getShardStats</code>.</td>
+</tr>
+<tr>
+<td><code>ShardMapping</code></td>
+<td>Stored key-to-shard record: <code>shard</code>, <code>createdAt</code>, <code>updatedAt</code> and an optional <code>originalKey</code>.</td>
+</tr>
+<tr>
+<td><code>ShardCoordinatorState</code></td>
+<td>Durable Object state: known shards, shard statistics, strategy, round-robin counter and sequence counters.</td>
+</tr>
+<tr>
+<td><code>CollegeDBClient</code></td>
+<td>The object returned by <code>createClient</code>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuration-templates" class="tsd-anchor-link">Configuration Templates<a href="#configuration-templates" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Each template is a complete configuration. Open the one that matches your strategy and copy it.</p>
+<details>
+<summary>Hash strategy</summary>
+<pre><code class="typescript"><span class="hl-1">{</span><br/><span class="hl-1">	</span><span class="hl-12">kv</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">strategy</span><span class="hl-1">: </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">shards</span><span class="hl-1">: { </span><span class="hl-2">&#39;db-1&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_1</span><span class="hl-1">, </span><span class="hl-2">&#39;db-2&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_2</span><span class="hl-1"> }</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+</details>
+<details>
+<summary>Location strategy</summary>
+<pre><code class="typescript"><span class="hl-1">{</span><br/><span class="hl-1">	</span><span class="hl-12">kv</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">strategy</span><span class="hl-1">: </span><span class="hl-2">&#39;location&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">targetRegion</span><span class="hl-1">: </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">shardLocations</span><span class="hl-1">: {</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">: { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">2</span><span class="hl-1"> },</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">: { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;enam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">1</span><span class="hl-1"> }</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-12">shards</span><span class="hl-1">: { </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1"> }</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+</details>
+<details>
+<summary>Round-robin strategy with a coordinator</summary>
+<pre><code class="typescript"><span class="hl-1">{</span><br/><span class="hl-1">	</span><span class="hl-12">kv</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">coordinator</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">strategy</span><span class="hl-1">: </span><span class="hl-2">&#39;round-robin&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">shards</span><span class="hl-1">: { </span><span class="hl-2">&#39;db-1&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_1</span><span class="hl-1">, </span><span class="hl-2">&#39;db-2&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_2</span><span class="hl-1">, </span><span class="hl-2">&#39;db-3&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_3</span><span class="hl-1"> }</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+</details>
+<details>
+<summary>Mixed strategy: hash reads, location writes</summary>
+<pre><code class="typescript"><span class="hl-1">{</span><br/><span class="hl-1">	</span><span class="hl-12">kv</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">strategy</span><span class="hl-1">: {</span><br/><span class="hl-1">		</span><span class="hl-12">read</span><span class="hl-1">: </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">		</span><span class="hl-12">write</span><span class="hl-1">: </span><span class="hl-2">&#39;location&#39;</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-12">targetRegion</span><span class="hl-1">: </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-12">shardLocations</span><span class="hl-1">: {</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">: { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;wnam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">2</span><span class="hl-1"> },</span><br/><span class="hl-1">		</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">: { </span><span class="hl-5">region:</span><span class="hl-1"> </span><span class="hl-2">&#39;enam&#39;</span><span class="hl-1">, </span><span class="hl-5">priority:</span><span class="hl-1"> </span><span class="hl-9">1</span><span class="hl-1"> }</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-12">shards</span><span class="hl-1">: { </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">: </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1"> }</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+</details>
+<h2 id="strategy-selection-guide" class="tsd-anchor-link">Strategy Selection Guide<a href="#strategy-selection-guide" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Pick the strategy from what a new key must do. The <a href="sharding.html">Sharding</a> page covers the trade-offs in detail.</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>New key goes to</th>
+<th>Coordinator</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hash</code></td>
+<td>The eligible shard with the highest rendezvous score</td>
+<td>Optional. Used when set.</td>
+</tr>
+<tr>
+<td><code>round-robin</code></td>
+<td>The next eligible shard in order</td>
+<td>Optional. Without one, each isolate keeps its own counter, so the split is only even per isolate.</td>
+</tr>
+<tr>
+<td><code>random</code></td>
+<td>A random eligible shard</td>
+<td>Optional. Used when set.</td>
+</tr>
+<tr>
+<td><code>location</code></td>
+<td>The eligible shard nearest <code>targetRegion</code></td>
+<td>Optional. Used when set. Needs <code>targetRegion</code>, or it falls back to <code>hash</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>For a mixed strategy, see the mixed-strategy example in <a href="sharding.html">Sharding</a>.</p>
+<h2 id="database-size" class="tsd-anchor-link">Database Size<a href="#database-size" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Two fields control size checks: <code>maxDatabaseSize</code> sets the limit, and <code>sizeCacheTtlMs</code> sets how long a measured size is reused. The size checks and the behavior when every shard is over the limit are described in <a href="sharding.html">Sharding</a>.</p>
+<p>The size functions, such as <code>getDatabaseSizeForShard</code>, are listed in <a href="api-reference.html">API reference</a>.</p>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#configuration"><span>Configuration</span></a>
+<ul>
+<li><a href="#config-fields"><span>Config <wbr/>Fields</span></a></li>
+<li><a href="#strategy-types"><span>Strategy <wbr/>Types</span></a></li>
+<li><a href="#regions-and-shard-locations"><span>Regions and <wbr/>Shard <wbr/>Locations</span></a></li>
+<li><a href="#example-configurations"><span>Example <wbr/>Configurations</span></a></li>
+<li><a href="#types"><span>Types</span></a></li>
+<li><a href="#configuration-templates"><span>Configuration <wbr/>Templates</span></a></li>
+<li><a href="#strategy-selection-guide"><span>Strategy <wbr/>Selection <wbr/>Guide</span></a></li>
+<li><a href="#database-size"><span>Database <wbr/>Size</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

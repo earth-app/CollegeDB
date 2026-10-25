@@ -1,0 +1,415 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>migration-protocol | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">migration-protocol</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="key-migration-protocol" class="tsd-anchor-link">Key migration protocol<a href="#key-migration-protocol" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This is the contract for moving one keyed record from one shard to another. The implementation is in <code>src/migrations.ts</code>; the tests that hold it to this document are <code>tests/migration-journal.spec.ts</code>, plus the real-concurrency harness in <code>tests/helpers/concurrent-sqlite.ts</code>.</p>
+<p>Anything marked UNPROVEN has no passing test behind it. It is written down so nobody reads it as a guarantee.</p>
+<h2 id="what-the-protocol-promises" class="tsd-anchor-link">What the protocol promises<a href="#what-the-protocol-promises" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>An interrupted move converges to one authoritative owner. Every update or delete that a router-issued builder call acknowledged is on that owner afterward. A router-issued write from a stale caller cannot create a row on a shard the key has left. A write that cannot tell who owns the key is refused with the retryable <code>MIGRATION_CUTOVER_PENDING</code>; it is never acknowledged.</p>
+<h2 id="what-it-does-not-promise" class="tsd-anchor-link">What it does not promise<a href="#what-it-does-not-promise" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>There is no atomicity across shards. A mutation on shard A is never atomic with a journal write on shard B, and nothing here pretends otherwise. Durable journal state is the recovery mechanism.</p>
+<p>The protocol does not cover raw SQL issued outside CollegeDB, and it does not cover raw <code>run()</code> or <code>all()</code> statements, which the planner routes but does not rewrite. Those can still write to a shard the key has left.</p>
+<p>The journal moves one table row at a time. Moving an organisation's related rows from several tables is an application procedure built from several moves. The key mapping is per key, not per table, so a one-table move strands the key's rows in other tables unless the caller moves them too.</p>
+<p>The journal is crash recovery. It is not a backup, and rollback is a new explicit move.</p>
+<h2 id="configuration" class="tsd-anchor-link">Configuration<a href="#configuration" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>journalShard</code> names the shard binding that holds the journal tables. <code>journalScope</code> (default <code>default</code>) partitions journals that share one database. With more than one shard and no <code>journalShard</code>, <code>reassignShard</code>, <code>rebalance</code> and <code>recoverMigrations</code> throw <code>JOURNAL_NOT_CONFIGURED</code>. A single-shard config uses its only shard. <code>initialize</code> rejects a <code>journalShard</code> that is not a configured binding (<code>INVALID_JOURNAL_SHARD</code>).</p>
+<p><code>PROVEN_JOURNAL_DIALECTS</code> is <code>sqlite</code>, <code>postgres</code> and <code>mysql</code>. <code>sqlite</code> includes D1 and a raw binding with no <code>dialect</code>. <code>mysql</code> covers MariaDB, which shares the dialect value, so both engines had to pass before it joined the list. A move where the source, destination or journal shard speaks any other dialect throws <code>MIGRATION_UNSUPPORTED_DIALECT</code>, and builder writes on such a shard keep their unguarded statement. Each proven dialect has a concurrency test with a control arm behind it; see Per-dialect serialization. A move also needs its source shard to declare <code>atomicBatch</code>, and a builder write on Postgres, MySQL or MariaDB needs the same; a shard that does not declare it is refused with <code>MIGRATION_NO_ATOMIC_BATCH</code>. See Atomicity requirements.</p>
+<h2 id="tables" class="tsd-anchor-link">Tables<a href="#tables" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>On the journal shard:</p>
+<ul>
+<li><code>collegedb_migration_active(scope, table_name, primary_key, op_id, claimed_at)</code>, primary key <code>(scope, table_name, primary_key)</code>. A move claims its key by insert. A second claim fails, so two moves of one key cannot run. The row is deleted at a terminal state.</li>
+<li><code>collegedb_migration_history(op_id, state, attempt, scope, table_name, primary_key, source, destination, generation, placement_epoch, digest, detail, at)</code>, primary key <code>(op_id, state, attempt)</code>. Append only. The current state of an operation is the highest state it has reached. The index <code>collegedb_history_by_key</code> on <code>(scope, primary_key, table_name)</code> serves <code>getMigrationStatus</code> and the generation lookup of a new move. <code>ensureIndex</code> creates it, on a new table and on an existing one, the first time a provider makes a journal call. SQLite and Postgres run <code>CREATE INDEX IF NOT EXISTS</code>. MySQL and MariaDB report one <code>mysql</code> dialect and MySQL has no such form, so there <code>ensureIndex</code> looks the name up in <code>information_schema.statistics</code> for the current database, creates the index when it is missing, and counts error 1061 (<code>ER_DUP_KEYNAME</code>) from a concurrent creator as success. The check runs once per provider object, so a long-lived process spends one lookup query per journal shard.</li>
+<li><code>collegedb_recovery_lease(scope, holder, generation, expires_at)</code>, primary key <code>scope</code>. The row that serializes recovery. See Recovery lease.</li>
+<li><code>collegedb_placement_exceptions(scope, hashed_key, added_at)</code>. The durable record of keys placed off their computed shard. The KV set is a derived copy.</li>
+<li><code>collegedb_migration_verification(scope, completed_at, clean)</code>. The last completed verification pass.</li>
+</ul>
+<p>On every data shard:</p>
+<ul>
+<li><code>collegedb_retired(scope, table_name, primary_key, pk_column, op_id, generation, moved_to, payload, archived_at, purged_at)</code>, primary key <code>(scope, table_name, primary_key)</code>. One row per key that left this shard. It is the archive of the old row and the tombstone that fences stale writers.</li>
+<li><code>collegedb_topology(min_generation)</code>. The fence. A guarded insert or upsert binds the writer's manifest generation and matches no row while <code>min_generation</code> is above it. <code>pruneEpochs</code> raises it on every shard before it counts rows. The router tells a raised fence from a tombstone and from an ignored conflict, reloads the manifest once, and then throws <code>STALE_TOPOLOGY</code>.</li>
+<li><code>collegedb_lock_stripes(stripe)</code>, on MySQL and MariaDB only. 256 rows for the key locks plus one row, <code>FENCE_STRIPE</code>, for the fence lock.</li>
+</ul>
+<p>On the journal shard, when <code>journalShard</code> is set and the dialect is proven, <code>collegedb_manifest(scope, revision, generation, body)</code> holds the placement manifest. Every write to it is a compare-and-swap on <code>revision</code>, a lost swap reloads and applies its change again, and five lost swaps throw <code>PLACEMENT_CONFLICT</code>. KV holds a derived copy. <code>pruneEpochs</code> refuses with <code>PRUNE_REFUSED</code> when its proof is incomplete.</p>
+<p>The schema uses no partial indexes and no autoincrement, so one definition works on every dialect. Key columns are <code>VARCHAR(190)</code> on MySQL so the three-column primary keys fit its index limit. <code>InMemorySQLDatabase</code> cannot host these tables or run the cutover; use a real SQL engine for anything that sets <code>journalShard</code>.</p>
+<h2 id="states" class="tsd-anchor-link">States<a href="#states" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>An operation moves through <code>prepared</code>, <code>copied</code>, <code>verified</code>, <code>cutover_pending</code>, <code>committed</code>, <code>published</code>, <code>retired</code>. <code>aborted</code> is the other terminal state. Each state is a journal row written before the work that follows it, and every step can be run again.</p>
+<p>A snapshot is the typed encoding of the source row at one moment, plus its SHA-256 digest. A move may take several snapshots. Each attempt is numbered, and the digest of an attempt is journaled in <code>prepared</code> before the destination is written, so the journal always knows every row the destination could hold on this operation's behalf.</p>
+<h2 id="steps" class="tsd-anchor-link">Steps<a href="#steps" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ol>
+<li>Check dialects, ensure the sidecar tables exist on the source and destination, and claim the key in <code>collegedb_migration_active</code>. A claim held by another operation fails with <code>MIGRATION_IN_PROGRESS</code>. A tombstone on the source from another operation means a row exists where the key already left; the move refuses with <code>MIGRATION_SOURCE_TOMBSTONED</code>.</li>
+<li>Read the source row. A missing row ends the operation (<code>RECORD_NOT_FOUND</code> when it was the first read). Encode the snapshot. If the row is too wide for the bind-parameter limit (default 100, the D1 limit) and the caller gave no <code>versionColumn</code>, refuse with <code>MIGRATION_ROW_TOO_WIDE</code> before anything is copied.</li>
+<li>Journal <code>prepared</code> with the digest. Copy the row to the destination. A destination row equal to the snapshot is a retried copy and is kept. A different destination row that this operation journaled is replaced. Any other different row is a conflict: with <code>onConflict: 'fail'</code> (the default) the move aborts with <code>DESTINATION_CONFLICT</code>; with <code>'replace'</code> the row is overwritten. Journal <code>copied</code>.</li>
+<li>Read the destination row back and compare digests. Journal <code>verified</code>.</li>
+<li>Journal <code>cutover_pending</code> with the digest. Nothing after this point may assume the source is unchanged.</li>
+<li>Cutover. One source-shard transaction through <code>runBatch</code>, led on Postgres, MySQL and MariaDB by the key lock statements, with two statements, both conditional on the same predicate: insert the archive row into <code>collegedb_retired</code>, then delete the source row. The predicate is the primary key plus a null-safe, byte-exact equality of every column to the snapshot (SQLite <code>IS</code>, Postgres <code>IS NOT DISTINCT FROM</code>, MySQL <code>&lt;=&gt;</code>). With a <code>versionColumn</code> the predicate is the key plus that column. Because both statements use one predicate inside one transaction, a mismatch writes no archive row and no tombstone. The outcome is read back, not inferred from the batch: the archive row for this operation exists, or it does not.</li>
+<li>On a miss, take a new snapshot and go back to step 3, up to three recopies. After that, or when the source row is gone, abort. Abort deletes the destination copy only where it still equals a digest this operation journaled. The source stays authoritative, and <code>reassignShard</code> throws <code>MIGRATION_ABORTED</code> with the reason. The discarded copy is not archived, because after an acknowledged delete a retained copy would defeat the delete.</li>
+<li>On a hit, journal <code>committed</code> with the new generation (one more than the highest generation journaled for the key). Delete tombstones for this key on the destination that belong to other operations, since the key is now home there. Publish the derived state: KV mapping, placement exception, coordinator allocation, caches. Journal <code>published</code>.</li>
+<li>Journal <code>retired</code> with a <code>retire_after</code> time, then delete the active claim.</li>
+</ol>
+<h2 id="write-ordering-invariant" class="tsd-anchor-link">Write-ordering invariant<a href="#write-ordering-invariant" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Every router-issued write either commits before the successful source cutover and is reflected in the snapshot comparison, or runs after the source is fenced and cannot create a stale source row.</p>
+<p>The first case: a write that changes the row before the cutover statement makes the predicate fail, the cutover misses, and the acknowledged write stays on the source, which is still the owner. The second case: after the cutover, the row is gone and the tombstone exists in the same transaction, so a builder write finds either a missing row or the tombstone.</p>
+<p>Builder writes (<code>insertInto</code>, <code>insertReturning</code>, <code>upsert</code>, <code>updateRow</code>, <code>patch</code>, <code>deleteRow</code>, <code>deleteById</code>) follow these rules when <code>journalShard</code> is set and the shard dialect is proven:</p>
+<ul>
+<li>Insert and upsert run as one guarded statement: <code>INSERT ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM collegedb_retired WHERE ...) AND (SELECT COALESCE(MAX(min_generation), 0) FROM collegedb_topology) &lt;= ?</code>. SQLite upserts need the select to end in a <code>WHERE</code> before <code>ON CONFLICT</code>. MySQL needs <code>FROM DUAL</code>.</li>
+<li>When a write changes zero rows, or the driver cannot report a change count, the caller checks the shard-local tombstone. No tombstone means the zero was real (a missing row, or an ignored conflict) and the result is returned. A tombstone means the caller routed on a stale mapping. It drops the cached mapping, resolves again, and retries once on a different shard if there is one. Otherwise it throws <code>MIGRATION_CUTOVER_PENDING</code>.</li>
+<li>A write is never acknowledged on an unverified zero-row result.</li>
+</ul>
+<h2 id="reads" class="tsd-anchor-link">Reads<a href="#reads" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Reads need no journal. When a routed read finds nothing on a shard and the shard holds a tombstone for the key, the read follows <code>moved_to</code>, up to four hops. The destination holds a verified identical copy by construction, so this is correct at every state from <code>cutover_pending</code> on. A shard with no tombstone, the common case, costs one extra local lookup on a miss and nothing on a hit.</p>
+<p>This replaces the idea that reads of keys with an unfinished operation resolve through the journal. Following the tombstone is available when the journal is not, and it cannot return a row the cutover did not already copy. If the tombstone lookup itself fails, the read returns what it found.</p>
+<h2 id="recovery" class="tsd-anchor-link">Recovery<a href="#recovery" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>recoverMigrations()</code> lists every active claim and resumes each one by state. If the journal cannot be read, nothing proceeds and the call throws.</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>prepared</code>, <code>copied</code>, <code>verified</code></td>
+<td>Nothing irreversible happened. Start again at step 2 with a fresh snapshot.</td>
+</tr>
+<tr>
+<td><code>cutover_pending</code>, source row absent, archive row for this operation present</td>
+<td>The cutover ran. Read the destination row and compare it with the archive payload. Equal: go to step 8. Different or missing: report <code>MIGRATION_AMBIGUOUS</code> and leave the operation for an operator.</td>
+</tr>
+<tr>
+<td><code>cutover_pending</code>, source row absent, no archive row</td>
+<td>An acknowledged delete removed the row first. Abort and remove the destination copy.</td>
+</tr>
+<tr>
+<td><code>cutover_pending</code>, source row present and its digest equals the journaled digest</td>
+<td>The cutover never ran. Run step 6 again.</td>
+</tr>
+<tr>
+<td><code>cutover_pending</code>, source row present and changed</td>
+<td>A writer got in. Abort and remove the destination copy. The source stays authoritative.</td>
+</tr>
+<tr>
+<td><code>committed</code></td>
+<td>Run step 8 again from the tombstone cleanup.</td>
+</tr>
+<tr>
+<td><code>published</code></td>
+<td>Run step 9.</td>
+</tr>
+<tr>
+<td><code>retired</code>, <code>aborted</code></td>
+<td>Only the claim is left. Delete it.</td>
+</tr>
+</tbody>
+</table>
+<p>Every rule is covered by a crash test that injects a failure before or after the statement in question.</p>
+<p>A claim with no journal history, left by a crash between the claim and the first record, is released only after 60 seconds, so recovery does not release the claim of a move that is starting. <code>recoverMigrations({ olderThanMs })</code> also leaves alone any operation that changed more recently than that.</p>
+<p>Recovery and a live move may drive the same operation at once. Every step is safe to run twice, and an abort is refused once the operation's archive row exists, which is the physical proof that the cutover ran. Tests run recovery inside a live move after each step. A live move does not take the recovery lease below.</p>
+<p>Nothing starts recovery on its own. A crash after the cutover leaves the key readable but refuses its writes with <code>MIGRATION_CUTOVER_PENDING</code> until <code>recoverMigrations()</code> runs, so schedule it, and run it after any deploy that may have interrupted a move. A claim left by a crash also blocks a second move of that key with <code>MIGRATION_IN_PROGRESS</code>.</p>
+<p><code>rebalance</code> needs a journal for the same reason. A dry run only reports and does not.</p>
+<h2 id="recovery-lease" class="tsd-anchor-link">Recovery lease<a href="#recovery-lease" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>One recovery runs per journal scope. <code>recoverMigrations()</code> first takes a row in <code>collegedb_recovery_lease</code> with one compare-and-swap statement: insert when the scope has no row, or update when <code>expires_at</code> is at or before the caller's clock. Each takeover adds one to <code>generation</code>. The caller then reads the row back and compares the holder, because drivers differ on whether they report an update that changed nothing. If another holder has a live lease, the call throws <code>RECOVERY_IN_PROGRESS</code> before it touches any operation. The error is retryable and a scheduler should treat it as a normal outcome, since another recovery is doing the work.
+The lease lasts 60 seconds. The holder renews it before each operation, with a statement conditional on its generation, so a long pass keeps it. A normal finish sets <code>expires_at</code> to 0 and keeps the row, so the generation never goes backward. A holder that crashes leaves the lease to run out, and the next caller after expiry takes it at generation plus one. <code>verifyMigrations({ repair: true })</code> runs recovery, so it takes the lease the same way and throws the same errors.</p>
+<p>Expiry compares the clocks of the isolates. Skew between them only shortens or lengthens the wait before a takeover. It never decides who may write, because the generation does.</p>
+<p>Fencing. A holder that is paused or slow can lose its lease while it still runs. Every journal write the recovery executor makes (state rows, claim release, renewal) carries the condition &quot;the lease row of this scope still holds my generation&quot; inside the statement, so a stale executor's write matches no row. A write that reports no change is ambiguous (a fenced miss, an ignored duplicate, a claim already gone), so the executor reads the lease then. If the generation moved, it stops, makes no further shard writes, and throws <code>RECOVERY_FENCED</code>. That error is not retryable by that executor: the new holder owns the work, and the next scheduled call starts a fresh recovery. Before each cross-shard step (the destination copy or its removal, the cleanup of old tombstones, the source cutover, the publish of derived state) the executor also reads the generation and stops if it changed. When a step fails, the executor reads the lease again before it reports the failure. A step that failed because it ran into the new holder's work therefore ends as <code>RECOVERY_FENCED</code> and never appears in <code>report.failed</code>.</p>
+<p>The remaining window. A journal write and a shard write live in different databases, so the check before a shard step cannot be atomic with the step. An executor that is paused after its check and resumes after a takeover still runs that one statement. The tests hold an executor there, after the check and before the statement, for the destination copy and for the source cutover (<code>Recovery lease window</code>). Each case ends the same way for the executor: it never returns a report, its next fenced journal write matches no row, and it throws <code>RECOVERY_FENCED</code>. The journal keeps exactly the new holder's rows. What the stale statement does to the shards depends on what the new holder did first:</p>
+<ul>
+<li>Destination copy after the new holder finished the move. The insert meets the new holder's row on the destination key and fails. Nothing is left behind.</li>
+<li>Destination copy after the new holder aborted the move, because the source row was deleted or kept changing. The insert lands. The source stays the owner and routing ignores the copy, but a count sees it, and after a delete it is a row that came back. <code>verifyMigrations()</code> lists it under <code>strandedCopies</code>, and <code>verifyMigrations({ repair: true })</code> removes it. The proof is the one the abort itself uses: the destination row equals a row the operation journaled, and the operation is the newest on that key, so no later move can have made the destination the owner.</li>
+<li>Source cutover after the new holder committed. The cutover deleted the source row, so the stale archive insert and delete match nothing.</li>
+<li>Source cutover after the new holder aborted, where the source row changed and then returned to exactly the snapshot. The cutover compares the row to the snapshot, finds it equal, archives it and deletes it. The abort already removed the destination copy, so the key has no live row on any shard, and the archive holds the only copy. A router read finds nothing. <code>verifyMigrations()</code> lists the tombstone under <code>staleCutovers</code>, and <code>verifyMigrations({ repair: true })</code> restores the archived row and removes the tombstone. It does that only when the operation is the newest on the key, the archive still holds its payload, and the destination has no row. Otherwise it reports <code>restorable: false</code> and changes nothing.</li>
+</ul>
+<p>One case cannot be detected. The new holder finishes the move, someone deletes the key on the destination, and then the stale destination insert runs. The insert succeeds and the row comes back. The journal calls the move committed and the row equals its snapshot, so <code>verifyMigrations()</code> cannot tell it from a real row. It takes an executor stalled for longer than the 60-second lease between one read and its next statement, a complete move by the new holder in that time, and an acknowledged delete of the same key in the same interval. Closing it needs a check against the lease on the destination shard itself, which this protocol does not have. A test pins the behavior so a change to it shows up.</p>
+<p>A scheduler on Workers runs recovery from <code>scheduled()</code> and treats <code>RECOVERY_IN_PROGRESS</code> as success:</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">initialize</span><span class="hl-1">, </span><span class="hl-5">recoverMigrations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">export</span><span class="hl-1"> </span><span class="hl-4">default</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-6">async</span><span class="hl-1"> </span><span class="hl-0">scheduled</span><span class="hl-1">(</span><span class="hl-5">controller</span><span class="hl-1">: </span><span class="hl-8">ScheduledController</span><span class="hl-1">, </span><span class="hl-5">env</span><span class="hl-1">: </span><span class="hl-8">Env</span><span class="hl-1">, </span><span class="hl-5">ctx</span><span class="hl-1">: </span><span class="hl-8">ExecutionContext</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-0">initialize</span><span class="hl-1">({</span><br/><span class="hl-1">			</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1"> },</span><br/><span class="hl-1">			</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-5">journalShard:</span><span class="hl-1"> </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-0">waitUntil</span><span class="hl-5">:</span><span class="hl-1"> (</span><span class="hl-5">promise</span><span class="hl-1">) </span><span class="hl-6">=&gt;</span><span class="hl-1"> </span><span class="hl-5">ctx</span><span class="hl-1">.</span><span class="hl-0">waitUntil</span><span class="hl-1">(</span><span class="hl-5">promise</span><span class="hl-1">)</span><br/><span class="hl-1">		});</span><br/><br/><span class="hl-1">		</span><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">			</span><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">recoverMigrations</span><span class="hl-1">();</span><br/><span class="hl-1">			</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">failed</span><span class="hl-1">.</span><span class="hl-5">length</span><span class="hl-1"> &gt; </span><span class="hl-9">0</span><span class="hl-1">) {</span><br/><span class="hl-1">				</span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">error</span><span class="hl-1">(</span><span class="hl-2">&#39;moves needing attention&#39;</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">failed</span><span class="hl-1">);</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">		} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">			</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-8">CollegeDBError</span><span class="hl-1"> &amp;&amp; </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">code</span><span class="hl-1"> === </span><span class="hl-2">&#39;RECOVERY_IN_PROGRESS&#39;</span><span class="hl-1">) {</span><br/><span class="hl-1">				</span><span class="hl-4">return</span><span class="hl-1">;</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">			</span><span class="hl-4">throw</span><span class="hl-1"> </span><span class="hl-5">error</span><span class="hl-1">;</span><br/><span class="hl-1">		}</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">};</span>
+</code><button type="button">Copy</button></pre>
+
+<p>A <code>RECOVERY_FENCED</code> throw is also safe to let through: the Worker run fails, the lease belongs to someone else, and the next tick recovers normally.</p>
+<h2 id="retention" class="tsd-anchor-link">Retention<a href="#retention" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The default policy is <code>retire: { afterMs: 7 days }</code>. <code>'immediate'</code> is opt-in and sets the deadline to now. It does not purge anything by itself.</p>
+<p><code>verifyMigrations()</code> is observational. It reports unfinished operations, ghost rows (a live row on a shard that also holds a tombstone for the key), tombstones with no journal record, and the two leftovers of a stale recovery executor (<code>strandedCopies</code> and <code>staleCutovers</code>, see Recovery lease). <code>verifyMigrations({ repair: true })</code> runs recovery and removes a ghost only when it equals the archived payload; any other ghost is reported and kept. It also removes a stranded copy that equals a row the aborted operation journaled, and restores the archived row of a stale cutover when nothing else owns the key. A completed pass is recorded in <code>collegedb_migration_verification</code>. The stranded-copy check reads every aborted operation of the scope, so its cost grows with the number of aborted moves in the history.</p>
+<p><code>purgeRetired()</code> clears the archive payload of a retired operation. It refuses an operation until its <code>retire_after</code> has passed and a verification pass completed after the move finished cleanly. Refusals come back with a reason. The tombstone row stays after a purge so a stale writer is still fenced, which costs one small row per moved key. Restoring an old row is a new explicit move from the archive, never an automatic undo. A key that returns to a shard replaces that shard's older tombstone, and with it the older archive.</p>
+<h2 id="placement-exceptions" class="tsd-anchor-link">Placement exceptions<a href="#placement-exceptions" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A move records a placement exception only when the destination differs from the key's computed owner. The exception goes into <code>collegedb_placement_exceptions</code> with an insert that ignores duplicates, so concurrent adds cannot lose each other. The KV set is rebuilt from that table. Rebuilds in one process run one at a time, and each re-reads the table, so the last rebuild sees every row. Another isolate can still overwrite the KV copy with an older snapshot; <code>recoverMigrations()</code> and <code>verifyMigrations({ repair: true })</code> rebuild it. Callers without a journal keep the old KV read-modify-write, now serialized within the process.</p>
+<h2 id="topology-fence" class="tsd-anchor-link">Topology fence<a href="#topology-fence" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Each data shard holds the fence in <code>collegedb_topology</code>. A builder write binds the generation of the manifest it routed with, and a guarded insert or upsert matches no row while the fence is above that generation. <code>pruneEpochs</code> raises the fence on every shard before its census. The raise runs in one transaction that holds the fence lock exclusively.</p>
+<p>A zero-row write then has three possible causes, and the router tells them apart. A raised fence means the manifest is stale: the router reloads it once and throws <code>STALE_TOPOLOGY</code> if the write still cannot land. A tombstone follows the builder write rules under Write-ordering invariant. An ignored conflict is a real zero-row result.</p>
+<p><code>PRUNE_REFUSED</code> means the prune's proof is incomplete. <code>PLACEMENT_CONFLICT</code> means the manifest compare-and-swap lost five times in a row.</p>
+<h2 id="atomicity-requirements" class="tsd-anchor-link">Atomicity requirements<a href="#atomicity-requirements" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The cutover depends on <code>runBatch</code> rolling back the whole group when any statement fails. An adapter says so with <code>atomicBatch: true</code> on its <code>SQLDatabase</code>, and sets it only for a <code>runBatch</code> whose rollback a test has shown. The move refuses a source shard that does not declare it before it claims or copies anything (<code>MIGRATION_NO_ATOMIC_BATCH</code>; <code>MIGRATION_NO_BATCH</code> when there is no <code>runBatch</code> at all), <code>recoverMigrations</code> reports such an operation as failed, and a builder write on Postgres, MySQL or MariaDB refuses the same way. The declaration is about rollback only. It does not make a single connection safe against unrelated statements from the same process, see below.</p>
+<p>The sandbox <code>batch_rollback</code> scenario runs a batch whose third statement repeats a primary key and checks that the two statements before it left no row. It also checks the declaration against the result: an adapter that declares <code>atomicBatch</code> must roll back, and one that rolls back must declare it. These declare it and pass:</p>
+<ul>
+<li>Postgres, MySQL, MariaDB and SQLite (<code>singleConnection: true</code>) through the native adapters, and through the Drizzle adapters on Postgres, MySQL, MariaDB and over <code>bun:sqlite</code>.</li>
+<li>The Hyperdrive Postgres and MySQL providers, on Docker Postgres, MySQL and MariaDB and through the local Hyperdrive binding in the Cloudflare lane.</li>
+<li>A D1 binding through <code>toProvider</code>, on local workerd. The D1 docs contradict themselves on failed-batch rollback, and local workerd D1 is SQLite on workerd, not Cloudflare's production D1. Rollback on production D1 stays UNPROVEN, and the declaration there rests on the local run.</li>
+</ul>
+<p>Drizzle over a synchronous driver (<code>bun:sqlite</code>, <code>better-sqlite3</code>) used to fail this check. Its transaction commits as soon as the callback returns, so an async callback committed before its statements ran and a failed batch left its early rows. The adapter now runs the group inside a callback that stays synchronous until a driver hands back a promise, so a synchronous driver gets one real transaction and an asynchronous one is awaited as before. Drizzle over D1 and libsql over HTTP, which have a native <code>batch</code>, still run a batch statement by statement and declare nothing, because their <code>transaction()</code> is refused by the backend. A journal move whose source is such a shard refuses.</p>
+<p>The Hyperdrive providers treat the client of a request as one connection. A batch takes a gate on it and runs alone, and a plain statement from the same request waits until the batch commits, so nothing slips into the open transaction. The factory must return one connection (a <code>pg</code> <code>Client</code>, a <code>mysql2</code> connection).</p>
+<p>The plain Postgres, MySQL and SQLite adapters declared through <code>singleConnection: true</code> hold their other statements behind an open batch, through the same gate. A caller <code>lease</code> gates only when <code>singleConnection: true</code> is also set. Pooled adapters lease a connection per batch and are not gated. The gate is checked with order-logging fakes for <code>pg.Client</code> and <code>mysql2</code>; the SQLite path ran on a real handle (see UNPROVEN).</p>
+<p>A driver must hand back 64-bit integers without loss. The tests use a <code>node:sqlite</code> adapter that returns an integer outside the safe range as a <code>bigint</code>. A driver that returns it as a rounded number cannot be told apart from a real column value, so the move would compare rounded values. UNPROVEN beyond that adapter.</p>
+<p>SQLite equality treats <code>1</code> and <code>1.0</code> as equal in a column with no declared type. A column with a declared type normalizes both. UNPROVEN for untyped columns.</p>
+<h2 id="per-dialect-serialization" class="tsd-anchor-link">Per-dialect serialization<a href="#per-dialect-serialization" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>SQLite and D1 serialize writers. One statement is atomic, so the guarded insert and the cutover cannot interleave, and statement atomicity is enough. The worker-thread harness checks this on a shared WAL file.</p>
+<p>Postgres, MySQL and MariaDB do not serialize writers. A guarded insert can read &quot;no tombstone&quot; before the cutover commits and insert after the row is deleted. An update can also race the cutover's two statements: the archive insert sees the old row, the delete then misses the updated row, and the shard ends with a tombstone beside a live row that holds an acknowledged write. So the cutover and every router builder write run lock statements first, in the same transaction on the same connection, and the second of two contenders waits for the first to commit and then reads committed state. <code>runCutover</code> takes the lock for the move, and <code>runGuardedWrite</code> takes it for builder writes. The router has to call <code>runGuardedWrite</code> for every builder write on a shard whose dialect needs it; a write that skips it is unserialized. Update and delete take the key lock on Postgres, MySQL and MariaDB as well as insert and upsert.</p>
+<p>The lock is built from <code>(scope, table, key)</code> hashed with 64-bit FNV-1a.</p>
+<ul>
+<li>Postgres runs <code>SET TRANSACTION ISOLATION LEVEL READ COMMITTED</code>, then <code>pg_advisory_xact_lock</code> on the hash. The isolation statement is required. In a session whose default is REPEATABLE READ or SERIALIZABLE the snapshot is taken at the lock statement, before the wait, and the race run showed ghost rows, inserts acknowledged over an existing key and serialization errors with the lock in place. With the statement, the same sessions passed.</li>
+<li>MySQL and MariaDB run <code>SELECT ... FOR UPDATE</code> on one of 256 rows in <code>collegedb_lock_stripes</code>, chosen by the hash. A row lock lasts until commit. A named lock would have to be released by hand after the commit, which a <code>runBatch</code> group cannot do. Two keys on one stripe wait for each other, which costs concurrency and cannot deadlock, because each transaction takes one stripe lock and takes it first. At the default REPEATABLE READ the <code>INSERT ... SELECT</code> guard reads current rows and the race did not show without the lock. Under READ COMMITTED it did. The lock holds the protocol at both.</li>
+<li>A shard that needs the lock and has no <code>runBatch</code> refuses builder writes with <code>MIGRATION_NO_BATCH</code>, and one whose <code>runBatch</code> is not declared atomic refuses with <code>MIGRATION_NO_ATOMIC_BATCH</code>. The Hyperdrive providers have a <code>runBatch</code> now, so their shards take the lock like any other.</li>
+<li>The builder <code>upsert</code> on MySQL and MariaDB is <code>INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)</code>. The row-alias form is MySQL only, and <code>VALUES()</code> ran on both engines. MySQL reacts to a conflict on any unique key of the table, so name the key you mean in <code>conflictColumns</code>. The affected-row count is 1 for an insert, 2 when the update changed the row and 0 when it changed nothing, and the router reads any positive count as acknowledged.</li>
+</ul>
+<p>The fence needs a lock of its own. A guarded insert checks the fence inside its own statement, so on Postgres, MySQL and MariaDB a writer that read the old fence could still commit after <code>pruneEpochs</code> raised the fence and ran its census, and the census then missed the row. A sandbox race showed it on Postgres: 26 of 150 stale-generation writers landed a row after the census read none, with the key lock in place. Every builder write now takes a shared fence lock after its key lock, and the fence raise runs in one transaction that takes the same lock exclusively. The raise waits for writers already in flight and holds back the ones that follow, so a writer either commits before the raise or reads the new fence. Postgres uses <code>pg_advisory_xact_lock_shared</code> and <code>pg_advisory_xact_lock</code> on one constant id. MySQL and MariaDB lock the <code>FENCE_STRIPE</code> row with <code>LOCK IN SHARE MODE</code> and <code>FOR UPDATE</code>, which both engines accept and which holds under READ COMMITTED. A fence raise on a shard without an atomic <code>runBatch</code> refuses, so <code>pruneEpochs</code> refuses the prune.</p>
+<ul>
+<li>Postgres infers untyped parameters in an <code>INSERT ... SELECT</code> list from the target column. The guarded insert needs no casts: BIGINT, BOOLEAN, BYTEA, JSONB, NUMERIC, UUID, TIMESTAMPTZ, REAL and NULL all inserted on Postgres 18.</li>
+</ul>
+<h2 id="what-the-tests-establish" class="tsd-anchor-link">What the tests establish<a href="#what-the-tests-establish" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The table lists what the suite runs. Anything not listed is UNPROVEN.</p>
+<table>
+<thead>
+<tr>
+<th>Claim</th>
+<th>Where it is checked</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fault at every operation of a move, before and after the operation, recovers to one owner with no lost acknowledged write</td>
+<td><code>tests/migration-journal.spec.ts</code> fault sweep</td>
+</tr>
+<tr>
+<td>Crash right after the source cutover commits, before the journal advances</td>
+<td>same file, named case</td>
+</tr>
+<tr>
+<td>Zero-row write in the cutover window gets <code>MIGRATION_CUTOVER_PENDING</code></td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Two concurrent moves of one key, exactly one wins</td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Move back onto a shard that holds a tombstone</td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Journal unavailable, KV unavailable during publish</td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Update, delete, insert and upsert racing the cutover in separate threads on one WAL file</td>
+<td>same file, through <code>tests/helpers/concurrent-sqlite.ts</code></td>
+</tr>
+<tr>
+<td>Blob, 64-bit integer, NULL against empty string, unicode survive the archive and the cutover predicate</td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Concurrent <code>addPlacementException</code> loses nothing</td>
+<td>same file</td>
+</tr>
+<tr>
+<td>Builder writes honor the tombstone</td>
+<td><code>tests/crud.spec.ts</code></td>
+</tr>
+<tr>
+<td>Statement shapes per dialect, the key lock statements, the lock hash and the MySQL stripe table</td>
+<td><code>tests/query.spec.ts</code></td>
+</tr>
+<tr>
+<td>The cutover and <code>runGuardedWrite</code> run the lock first in one batch; a locking dialect with no <code>runBatch</code> refuses</td>
+<td><code>tests/migration-journal.spec.ts</code>, The per-key lock</td>
+</tr>
+<tr>
+<td>Update, delete, insert and upsert racing the cutover on Postgres, MySQL and MariaDB, with control arms</td>
+<td>sandbox scenario <code>stale_route_write</code>, not in vitest</td>
+</tr>
+<tr>
+<td>A journaled move on each engine, then tombstone-checked writes and refused stale-route writes</td>
+<td>sandbox scenario <code>journal_move</code></td>
+</tr>
+<tr>
+<td>A failing batch rolls back the whole group, and <code>atomicBatch</code> agrees with the result</td>
+<td>sandbox scenario <code>batch_rollback</code></td>
+</tr>
+<tr>
+<td><code>atomicBatch</code> on every adapter that holds a transaction, a refused move and refused guarded write without it, the Hyperdrive gate, Drizzle over a synchronous driver</td>
+<td><code>tests/providers.spec.ts</code>, <code>tests/migration-journal.spec.ts</code></td>
+</tr>
+<tr>
+<td>MySQL and MariaDB upsert statements, the fence lock statements and the fence raise batch</td>
+<td><code>tests/query.spec.ts</code>, <code>tests/migration-journal.spec.ts</code></td>
+</tr>
+<tr>
+<td>Manifest compare-and-swap, the fence race with a control arm, <code>pruneEpochs</code> dry run then real, and the DDL twice, on Postgres, MySQL, MariaDB and SQLite</td>
+<td>sandbox scenario <code>topology_cas</code></td>
+</tr>
+<tr>
+<td>Upsert on MySQL and MariaDB over a moved key and racing the cutover</td>
+<td>sandbox scenarios <code>journal_move</code>, <code>stale_route_write</code></td>
+</tr>
+<tr>
+<td>The single-connection gate on SQLite, <code>pg.Client</code> and <code>mysql2</code>: plain statements wait behind an open batch and batches run one at a time</td>
+<td><code>tests/providers.spec.ts</code>, <code>Single-connection batch gate</code></td>
+</tr>
+<tr>
+<td>Two recoveries started together: one runs, the other throws <code>RECOVERY_IN_PROGRESS</code>, for a move left at <code>prepared</code>, <code>cutover_pending</code> and <code>committed</code></td>
+<td><code>tests/migration-journal.spec.ts</code>, <code>Recovery lease</code></td>
+</tr>
+<tr>
+<td>A stale executor throws <code>RECOVERY_FENCED</code>, writes no journal row, and writes no destination row (the second test makes no write at all) after a takeover</td>
+<td>same describe</td>
+</tr>
+<tr>
+<td>A crashed holder blocks recovery until expiry, a later call takes over at generation plus one, and the generation rises across acquire, release, acquire</td>
+<td>same describe</td>
+</tr>
+<tr>
+<td><code>verifyMigrations({ repair: true })</code> takes the lease; a plain verify and a live move do not</td>
+<td>same describe</td>
+</tr>
+<tr>
+<td>The lease table and history index created twice over one SQLite database, and the index added to a history table created without it</td>
+<td>same describe</td>
+</tr>
+<tr>
+<td>Lease acquire, renew, release and fenced insert statements per dialect, and the journal DDL per dialect</td>
+<td><code>tests/query.spec.ts</code>, <code>recovery lease statements</code></td>
+</tr>
+<tr>
+<td>A stale executor held after its lease check, before the destination copy or the source cutover, throws <code>RECOVERY_FENCED</code> and leaves the new holder's rows</td>
+<td><code>tests/migration-journal.spec.ts</code>, <code>Recovery lease window</code></td>
+</tr>
+<tr>
+<td>A stale copy and a stale cutover after an abort: verify reports them, repair fixes them, and only where the journal proves it</td>
+<td>same describe</td>
+</tr>
+<tr>
+<td>A stale copy that brings back a row deleted after the new holder committed goes undetected</td>
+<td>same describe, named <code>residual</code></td>
+</tr>
+<tr>
+<td><code>ensureIndex</code> on a recording fake: lookup, create, 1061 is success, other errors propagate, one lookup per provider</td>
+<td><code>tests/query.spec.ts</code>, <code>ensureIndex</code></td>
+</tr>
+<tr>
+<td>A key read from a shard with no sidecar tables answers not found with no DDL, and the tables stay absent; a renamed column throws <code>MIGRATION_LOOKUP_UNAVAILABLE</code> (or reads as not found with <code>bestEffort</code>); a revoked privilege does the same on Postgres, MySQL and MariaDB; the driver's missing-table error classifies as absent, native and Drizzle</td>
+<td>sandbox scenario <code>missing_sidecar_lookup</code>, live run, not in vitest</td>
+</tr>
+<tr>
+<td><code>reconcileAllocations</code> with <code>verifyRecords</code>: a failed probe or a missing table reads as unchecked, repair and prune act on verified rows only, no probe runs without <code>verifyRecords</code>, and both control arms trip</td>
+<td>sandbox scenario <code>reconcile_record_probe</code>, live run, not in vitest</td>
+</tr>
+<tr>
+<td>Lease takeover at 60,000 ms: the new holder finishes at generation 2, the stale executor throws <code>RECOVERY_FENCED</code> and changes nothing; pairs and quads yield one winner; three control arms (no generation on journal writes, no generation read before a shard step, acquire with no expiry condition) are detected</td>
+<td>sandbox scenario <code>recovery_lease_takeover</code>, live run, not in vitest</td>
+</tr>
+<tr>
+<td>The history index added by <code>ensureJournalSchema</code> to a journal made without it, <code>ensureIndex</code> repeated and run four at once over a dropped index, one index afterward, checked in the engine catalog</td>
+<td>sandbox scenario <code>history_index_ensure</code>, live run, not in vitest</td>
+</tr>
+</tbody>
+</table>
+<h2 id="what-the-runs-measured" class="tsd-anchor-link">What the runs measured<a href="#what-the-runs-measured" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The fault sweep injects a failure before and after each of the 22 operations a clean move makes, 44 crash points, and checks each one for a readable key before recovery and one owner after it. The race harness has two control arms, a cutover that compares only the key and an insert without the tombstone guard, and both must report violations or the suite fails. A soak of 1,000 iterations for each of the four write kinds over three seeds found no violation.</p>
+<p>The sandbox scenario <code>stale_route_write</code> races update, delete, insert and upsert writers against the cutover on separate pool connections. Each iteration launches the writer at a random protocol step with a random delay of up to 7 ms, and holds the cutover or the writer open for 4 ms before its commit in two of every three iterations, so the vulnerable window is hit often. A soak of 500 iterations per write kind on Postgres, MySQL and MariaDB found no violation in the protocol arm, at the default isolation and, on MySQL and MariaDB, under READ COMMITTED as well. Upsert is in that soak on MySQL and MariaDB since it gained its <code>ON DUPLICATE KEY UPDATE</code> form: 500 iterations each at both isolations, no violation. On Postgres, 100 iterations per kind under REPEATABLE READ and under SERIALIZABLE session defaults also found none, once the transaction pins READ COMMITTED.</p>
+<p>The control arm strips the lock statements and ran 250 iterations per kind. It reported 164, 44, 280 and 416 violations on Postgres (update, delete, insert, upsert), 220, 56 and 372 on MySQL under READ COMMITTED, and 148, 32 and 67 on MariaDB under READ COMMITTED. MySQL and MariaDB at the default REPEATABLE READ reported none, which is why their control runs under READ COMMITTED; the harness fails a run whose required control stays silent. In the soak that added the fence lock, the control upsert reported 540 violations on MySQL and 213 on MariaDB under READ COMMITTED.</p>
+<p>The sandbox scenario <code>topology_cas</code> runs on Postgres, MySQL, MariaDB and SQLite, through the native adapters and through Drizzle, at 500 iterations per race kind in the protocol arms and 250 in the control arms. It creates the manifest, sidecar and journal tables twice on every shard, so the DDL is idempotent. Two or four clients publish the next epoch through <code>commitJournalManifest</code> on a fresh scope each iteration, and each round must end with consecutive epochs, one revision per publisher and no publisher returning without a write. A stale-generation writer races the fence raise and the census that follows it, in three orders (writer first, fence first, together) with the writer held open for 4 ms in one iteration of three, and a row that exists although the census read none counts as a violation. Last, <code>pruneEpochs</code> runs on three shards with 40 rows, as a dry run that must change nothing, as a real run that must keep an epoch rows still depend on, and as a real run after those keys are read, which removes the old epoch with every key still resolving and a generation 1 writer turned away.</p>
+<table>
+<thead>
+<tr>
+<th>Engine and adapter</th>
+<th>CAS protocol violations</th>
+<th>CAS control violations (250)</th>
+<th>Fence protocol violations</th>
+<th>Fence controls (250 each)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Postgres, native and Drizzle</td>
+<td>0 of 500</td>
+<td>250</td>
+<td>0 of 500</td>
+<td>no fence lock 39 and 36, no fence 55 and 55</td>
+</tr>
+<tr>
+<td>MySQL, native and Drizzle, default and READ COMMITTED</td>
+<td>0 of 500</td>
+<td>250</td>
+<td>0 of 500 at each</td>
+<td>no fence lock at READ COMMITTED 37 and 35, no fence 76 and 76</td>
+</tr>
+<tr>
+<td>MariaDB, native and Drizzle, default and READ COMMITTED</td>
+<td>0 of 500</td>
+<td>250</td>
+<td>0 of 500 at each</td>
+<td>no fence lock at READ COMMITTED 35 and 36, no fence 76 and 76</td>
+</tr>
+<tr>
+<td>SQLite, native and Drizzle</td>
+<td>0 of 500</td>
+<td>250</td>
+<td>0 of 500</td>
+<td>no fence 67 and 67 (the lock does not apply)</td>
+</tr>
+</tbody>
+</table>
+<p>The first run of the fence race on Postgres, before the fence lock existed, found 26 violations in 150 protocol iterations. That is the defect the lock fixes. The Hyperdrive providers ran the same scenario, <code>journal_move</code> and <code>batch_rollback</code> at 60 iterations with one connection per client and no violation; their stale-route race is skipped, since a gate runs a batch alone and the writers never race.</p>
+<p>The four live-engine scenarios (<code>missing_sidecar_lookup</code>, <code>reconcile_record_probe</code>, <code>recovery_lease_takeover</code> and <code>history_index_ensure</code>) ran once on the working tree, with the default race iterations (60) and Redis KV, on Postgres 18, MySQL, MariaDB 12 and SQLite, through the native and Drizzle adapters. Eight environment rows ran, and each reported 4 scenarios passed and 0 failed. The lease arms ran 15 iterations per protocol arm and 8 per control arm. Every protocol arm reported 0 violating iterations, and every control arm reported violations on every row. The index scenario ran 15 rounds of 4 concurrent <code>ensureIndex</code> calls per row, and the control plain <code>CREATE INDEX</code> failed on every row. The reconcile control arms tripped 2 and 3 checks. The missing-table lookup read 9 absent keys as not found per row. The Cloudflare lane skips all four. The first run found three defects, and each now has a fix and unit tests: Drizzle wrapped missing-table errors read as lookup failures on Postgres, MySQL and MariaDB (<code>driver errors wrapped by Drizzle</code>); Drizzle over SQLite returned one row for a two-row result (<code>Drizzle result shapes per driver</code>); and concurrent <code>CREATE INDEX IF NOT EXISTS</code> on Postgres lost races with a catalog unique violation (<code>Concurrent creates on Postgres</code>). The one live pass after the fixes saw no failed index round, and the Postgres race did not reproduce in it. One run does not close that race, so the 120-iteration run stays open. The full sandbox matrix, which includes these four scenarios, later ran in CI at commit <code>87e896b</code> with the compose image bumped to MariaDB 13, and all 19 environment rows passed.</p>
+<p>Values with no portable encoding, such as a JSON object column returned as an object or a <code>Date</code>, make a move refuse with <code>MIGRATION_UNSUPPORTED_VALUE</code> before anything is copied. Those are UNPROVEN on the real engines, as are these:</p>
+<ul>
+<li>Column types beyond <code>VARCHAR</code> and <code>BIGINT</code> in the race on Postgres and MySQL, including JSON, bytea and timestamps.</li>
+<li>A <code>BIGINT</code> above 2^53 on MySQL, where <code>mysql2</code> returns a rounded number unless <code>supportBigNumbers</code> is set.</li>
+<li>A MySQL or MariaDB session under SERIALIZABLE, and a second writer racing the cutover on any engine; the harness races one.</li>
+<li>KV convergence across isolates. Local workerd KV is not eventually consistent, so no probe built on it can show convergence.</li>
+<li>Rollback of a failing batch on production D1, as above.</li>
+<li>A native-batch Drizzle driver (D1, libsql over HTTP) as a journal source. It declares nothing and refuses. A batch through <code>db.batch</code> with <code>db.run</code> statements might work and has not been tried.</li>
+<li>The <code>pg.Client</code> and <code>mysql2</code> single-connection gate on a real Postgres or MySQL server. Only order-logging fakes have run it.</li>
+<li>The manifest swap and the fence under a second writer on the Cloudflare lane. Local D1 is one SQLite file, so <code>topology_cas</code> is skipped there.</li>
+<li>A MySQL or MariaDB upsert whose table has a second unique key. <code>ON DUPLICATE KEY UPDATE</code> reacts to any of them.</li>
+<li>The fallback that settles a write on a driver that reports no change count, by reading the row back.</li>
+<li>First journal adoption. When KV returns no manifest on the first cold start after <code>journalShard</code> is set, the isolate publishes epoch 1 into an empty journal.</li>
+<li>Loss of KV mappings for keys moved off their computed owner. Nothing here repairs them.</li>
+<li><code>isPinned</code>, used by <code>pruneEpochs</code>, may read a mapping from the mapper's cache window. Run a prune from a fresh process.</li>
+<li>The placement probe ran on <code>node:sqlite</code> and the in-memory provider only. It has not run on Postgres, MySQL, MariaDB, D1 or workerd.</li>
+<li>Writes keyed on a column other than the table's key column after a topology change. The probe checks the key column only.</li>
+<li>Concurrent writers to one key during a topology change. The probe and the write are not atomic.</li>
+<li>Manifest and KV refresh across isolates with real KV and D1.</li>
+<li>The recovery lease on D1. Postgres, MySQL, MariaDB and SQLite run the takeover, fencing and concurrent-start arms in <code>recovery_lease_takeover</code> (15 iterations per protocol arm, one live run). The earlier one-off probe, with 40 concurrent pairs and 40 concurrent quads on each of Postgres, MySQL and MariaDB, is not part of any suite. The Cloudflare lane skips the scenario, and nothing has run the lease on D1.</li>
+<li>The residual lease window: a recovery executor paused between its lease check and the shard statement it guards. The window tests (<code>Recovery lease window</code>) ran on <code>node:sqlite</code> only. The live scenario <code>recovery_lease_takeover</code> does not pause an executor between a check and a shard statement, so no live engine has run that window, and D1 is not run. See Recovery lease for the one case verify cannot detect.</li>
+<li><code>ensureIndex</code> on a live MySQL or MariaDB with separate processes racing to create the index. The live scenario <code>history_index_ensure</code> ran 4 concurrent calls per round, 15 rounds per row, and every call succeeded. It did not run separate processes. The suite checks the lookup against a recording fake.</li>
+<li>Concurrent <code>ensureIndex</code> on Postgres after the catalog-race fix. Before the fix, 7 to 8 of 15 rounds lost the race. One live pass after the fix saw no failed round. A 120-iteration run is not recorded. The concurrent <code>CREATE TABLE IF NOT EXISTS</code> race on Postgres is covered by a fake catalog only.</li>
+<li>Drizzle result shapes of libsql, D1 and postgres-js were checked against driver source, not run against those drivers. The two-row fix for Drizzle over SQLite was checked with <code>bun:sqlite</code> and <code>node:sqlite</code> probes.</li>
+</ul>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#key-migration-protocol"><span>Key migration protocol</span></a><a href="#what-the-protocol-promises"><span>What the protocol promises</span></a><a href="#what-it-does-not-promise"><span>What it does not promise</span></a><a href="#configuration"><span>Configuration</span></a><a href="#tables"><span>Tables</span></a><a href="#states"><span>States</span></a><a href="#steps"><span>Steps</span></a><a href="#write-ordering-invariant"><span>Write-<wbr/>ordering invariant</span></a><a href="#reads"><span>Reads</span></a><a href="#recovery"><span>Recovery</span></a><a href="#recovery-lease"><span>Recovery lease</span></a><a href="#retention"><span>Retention</span></a><a href="#placement-exceptions"><span>Placement exceptions</span></a><a href="#topology-fence"><span>Topology fence</span></a><a href="#atomicity-requirements"><span>Atomicity requirements</span></a><a href="#per-dialect-serialization"><span>Per-<wbr/>dialect serialization</span></a><a href="#what-the-tests-establish"><span>What the tests establish</span></a><a href="#what-the-runs-measured"><span>What the runs measured</span></a></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

@@ -1,0 +1,448 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>benchmarks | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">benchmarks</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="benchmarks" class="tsd-anchor-link">Benchmarks<a href="#benchmarks" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page covers the sandbox benchmark runner: which combinations it runs, what each scenario asserts, how to read its report, and how to measure the same phases on your own deployment. It is for maintainers running the sandbox and for operators sizing a deployment.</p>
+<p>This page does not publish measured results. A measured figure goes here with its date and the command that produced it, and nowhere else in the docs.</p>
+<h2 id="benchmark-suite" class="tsd-anchor-link">Benchmark Suite<a href="#benchmark-suite" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The runner, <a href="https://github.com/earth-app/CollegeDB/blob/master/scripts/sandbox/run.ts"><code>scripts/sandbox/run.ts</code></a>, executes each SQL and KV combination under each adapter profile, then writes a Markdown report. The Cloudflare lane runs the sandbox worker under <code>wrangler dev --local</code>.</p>
+<p>The layout below shows how the matrix is built. The Docker lanes cross SQL providers with KV providers and profiles. The Cloudflare lane runs its own profiles.</p>
+<pre><code class="mermaid">flowchart TD
+	A[Sandbox runner] --&gt; B[Docker lanes]
+	A --&gt; C[Cloudflare lane under wrangler dev]
+	B --&gt; D[SQL: Postgres, MySQL, MariaDB, SQLite]
+	B --&gt; E[KV: Redis, Valkey]
+	D --&gt; F[Profiles: native, drizzle, per-statement-connection]
+	E --&gt; F
+	C --&gt; G[Profiles: native, drizzle, hyperdrive]
+</code><button type="button">Copy</button></pre>
+
+<h3 id="adapter-profiles" class="tsd-anchor-link">Adapter Profiles<a href="#adapter-profiles" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>A profile selects how the runner connects to a provider.</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>Lane</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>native</td>
+<td>Docker and Cloudflare</td>
+<td>Direct provider clients (Cloudflare bindings or driver-native adapters)</td>
+</tr>
+<tr>
+<td>drizzle</td>
+<td>Docker and Cloudflare</td>
+<td>Drizzle interop through SQL provider adapters</td>
+</tr>
+<tr>
+<td>hyperdrive</td>
+<td>Cloudflare only</td>
+<td>A <code>HYPERDRIVE</code> binding, supplied by <code>wrangler dev</code> from a local Postgres</td>
+</tr>
+<tr>
+<td>per-statement-connection</td>
+<td>Docker only, not for SQLite</td>
+<td>A fresh driver connection per statement</td>
+</tr>
+</tbody>
+</table>
+<p>The default profiles are <code>native</code> and <code>drizzle</code>. <code>per-statement-connection</code> is excluded from the default matrix, because it measures a connection pattern that no supported deployment uses.</p>
+<p>The <code>hyperdrive</code> profile needs a Workers runtime. With <code>wrangler dev</code> and <code>localConnectionString</code>, Cloudflare states that Hyperdrive's connection pooling and query caching do not take effect. The hyperdrive cell therefore checks correctness and connection count, not pooling latency.</p>
+<h2 id="scenario-catalog" class="tsd-anchor-link">Scenario Catalog<a href="#scenario-catalog" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The runner defines 28 scenarios. The workload column gives the default run: <code>--iterations=20</code>, <code>--bulk-size=160</code>, and <code>--race-iterations=60</code>. Other iteration counts scale from these defaults.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>What it asserts or measures</th>
+<th>Default workload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>basic_crud</td>
+<td>Insert, read, update and delete of a user through routed queries</td>
+<td>20 iterations; 4 routed SQL ops each</td>
+</tr>
+<tr>
+<td>advanced_usage</td>
+<td>Writes a user and a post, adds lookup aliases, validates a join and alias-based lookup</td>
+<td>15 iterations; about 5 routed SQL ops and KV lookup-key updates each</td>
+</tr>
+<tr>
+<td>migration_mapping</td>
+<td>Inserts legacy records on one shard, builds shard mappings in a batch, validates routing</td>
+<td>10 iterations; 20 legacy records mapped each</td>
+</tr>
+<tr>
+<td>bulk_crud</td>
+<td>Bulk inserts, half updates, a full delete sweep, and shard-wide totals</td>
+<td>7 iterations; 160 inserts, 80 updates and 160 deletes each</td>
+</tr>
+<tr>
+<td>auto_increment</td>
+<td>Generated primary keys. Docker lanes insert with <code>insertShard</code> and read the captured key back. Cloudflare lanes allocate with <code>nextId</code>, read back, then expect <code>GENERATED_KEY_COLLISION</code> when one id reaches two shards</td>
+<td>9 iterations; Cloudflare adds a refusal arm</td>
+</tr>
+<tr>
+<td>indexing</td>
+<td>Queries the indexed path after an index on <code>posts(user_id)</code></td>
+<td>15 iterations after a warmup dataset</td>
+</tr>
+<tr>
+<td>metadata_fetch</td>
+<td>Reads table metadata rows from one shard</td>
+<td>30 iterations; 1 query each</td>
+</tr>
+<tr>
+<td>pragma_or_info</td>
+<td>Runs the provider-specific PRAGMA or info query</td>
+<td>30 iterations; 1 query each</td>
+</tr>
+<tr>
+<td>counting</td>
+<td>Counts users across all shards</td>
+<td>30 iterations; 1 all-shard count each</td>
+</tr>
+<tr>
+<td>shard_fanout</td>
+<td>Runs a query on every shard and aggregates the responses</td>
+<td>30 iterations; 1 all-shard query each</td>
+</tr>
+<tr>
+<td>reassignment</td>
+<td>Creates a record, reassigns it to another shard, verifies routed reads</td>
+<td>10 iterations</td>
+</tr>
+<tr>
+<td>mapping_miss</td>
+<td>Reads a key that was never written</td>
+<td>20 iterations; 1 routed read each</td>
+</tr>
+<tr>
+<td>next_id</td>
+<td>Allocates a cluster-unique id with <code>nextId</code></td>
+<td>20 iterations; 1 allocation each</td>
+</tr>
+<tr>
+<td>paginate</td>
+<td>One sorted page across all shards, with the per-shard limit pushed down</td>
+<td>30 iterations after a warmup dataset</td>
+</tr>
+<tr>
+<td>batch_write</td>
+<td>Routed statements grouped into one round trip per shard</td>
+<td>7 iterations; 160 statements each</td>
+</tr>
+<tr>
+<td>cold_mapping_cache</td>
+<td>Reads an existing key with the in-memory mapping cache disabled</td>
+<td>20 iterations; 1 routed read each</td>
+</tr>
+<tr>
+<td>concurrent_load</td>
+<td>Routed reads issued concurrently instead of one at a time</td>
+<td>20 iterations; 16 concurrent reads each</td>
+</tr>
+<tr>
+<td>journal_move</td>
+<td>Moves a key through the journal, then runs tombstone-checked writes and a stale-route refusal</td>
+<td>10 iterations</td>
+</tr>
+<tr>
+<td>stale_route_write</td>
+<td>Races update, delete, insert and upsert writers against a cutover. Every acknowledged write must sit on the owner shard, with no ghost row. A control arm without the key lock must report violations</td>
+<td><code>--race-iterations</code> per write kind; Postgres, MySQL and MariaDB</td>
+</tr>
+<tr>
+<td>kv_bulk_read</td>
+<td><code>getMany</code> over 100 keys, a tenth of them absent, checked against 100 single gets</td>
+<td>20 iterations; 1 <code>getMany</code> each</td>
+</tr>
+<tr>
+<td>batch_rollback</td>
+<td>A batch whose third statement repeats a primary key; the first two must roll back</td>
+<td>10 iterations; 1 failing 3-statement batch each</td>
+</tr>
+<tr>
+<td>topology_cas</td>
+<td>Compare-and-swap races on the manifest, a stale-generation writer against the fence, and <code>pruneEpochs</code> on three shards. Control arms must report violations</td>
+<td><code>--race-iterations</code> per race kind</td>
+</tr>
+<tr>
+<td>missing_sidecar_lookup</td>
+<td>A journaled read on a shard without sidecar tables answers not found and issues no DDL. A broken lookup throws <code>MIGRATION_LOOKUP_UNAVAILABLE</code>, or answers not found with <code>bestEffort</code></td>
+<td>A few reads per arm</td>
+</tr>
+<tr>
+<td>reconcile_record_probe</td>
+<td><code>reconcileAllocations</code> against live shards: verified, missing, and unchecked rows, and a run without <code>verifyRecords</code> issues no SQL</td>
+<td>9 runs per engine and adapter; 6 ledger keys over 3 shards</td>
+</tr>
+<tr>
+<td>recovery_lease_takeover</td>
+<td>Lease expiry and takeover during a move. A fenced recovery throws <code>RECOVERY_FENCED</code> and writes nothing. Overlapping recoveries leave one winner and <code>RECOVERY_IN_PROGRESS</code> for the rest</td>
+<td>About a quarter of <code>--race-iterations</code> per arm; 3 protocol and 3 control arms</td>
+</tr>
+<tr>
+<td>history_index_ensure</td>
+<td><code>ensureJournalSchema</code> adds the history index to journal tables created without it. Concurrent ensures leave one index behind</td>
+<td>2 sequential ensures and about a quarter of <code>--race-iterations</code> rounds of 4 concurrent ensures</td>
+</tr>
+<tr>
+<td>als_overlap</td>
+<td>Overlapping <code>collegedb</code> calls with different shard sets on local workerd with <code>nodejs_compat</code>. Cloudflare lane only</td>
+<td>200 overlapping pairs per arm</td>
+</tr>
+<tr>
+<td>als_no_compat</td>
+<td>The same overlap without <code>nodejs_compat</code>. A callback with a different configuration is refused with <code>CONCURRENT_CONFIG</code>. Cloudflare lane only. Can fail on constrained runners because of an upstream <code>wrangler dev</code> proxy race (<a href="https://github.com/cloudflare/workers-sdk/issues/16348">cloudflare/workers-sdk#16348</a>)</td>
+<td>200 iterations</td>
+</tr>
+</tbody>
+</table>
+<p><code>als_no_compat</code> can fail on constrained runners because of an upstream <code>wrangler dev</code> proxy race (<a href="https://github.com/cloudflare/workers-sdk/issues/16348">cloudflare/workers-sdk#16348</a>), so a failure there does not by itself show a library regression.</p>
+<p>Scenarios marked as the Cloudflare lane only, and the race scenarios that need a second connection, are reported as <code>N/A</code> with a reason in the lanes that do not run them. Local D1 is one SQLite file behind workerd, so the race scenarios that need two connections have no Cloudflare arm.</p>
+<h3 id="runner-options" class="tsd-anchor-link">Runner Options<a href="#runner-options" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--db=</code></td>
+<td>all</td>
+<td><code>postgres</code>, <code>mysql</code>, <code>mariadb</code>, or <code>sqlite</code>. <code>postgresql</code> is accepted as an alias.</td>
+</tr>
+<tr>
+<td><code>--kv=</code></td>
+<td>all</td>
+<td><code>redis</code> or <code>valkey</code></td>
+</tr>
+<tr>
+<td><code>--profile=</code></td>
+<td>all</td>
+<td><code>native</code>, <code>drizzle</code>, <code>per-statement-connection</code>, or <code>hyperdrive</code>. <code>all</code> runs the default profiles.</td>
+</tr>
+<tr>
+<td><code>--iterations=</code></td>
+<td>20</td>
+<td>Base iteration count. Other scenario counts scale from it.</td>
+</tr>
+<tr>
+<td><code>--bulk-size=</code></td>
+<td>160</td>
+<td>Routed operations per bulk iteration. Minimum 10.</td>
+</tr>
+<tr>
+<td><code>--strategy-statements=</code></td>
+<td>100</td>
+<td>Statements per strategy-matrix run. Minimum 10.</td>
+</tr>
+<tr>
+<td><code>--race-iterations=</code></td>
+<td>60</td>
+<td>Iterations per race kind. Minimum 2.</td>
+</tr>
+<tr>
+<td><code>--only=</code></td>
+<td>none</td>
+<td>Comma-separated scenario keys. Runs only these and skips the strategy matrix.</td>
+</tr>
+<tr>
+<td><code>--include-cloudflare</code></td>
+<td>off</td>
+<td>Adds the Cloudflare lane.</td>
+</tr>
+<tr>
+<td><code>--cloudflare-only</code></td>
+<td>off</td>
+<td>Runs only the Cloudflare lane. Implies <code>--include-cloudflare</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>The runner has no <code>--help</code> flag. The options above come from <code>scripts/sandbox/run.ts</code>.</p>
+<h3 id="common-commands" class="tsd-anchor-link">Common Commands<a href="#common-commands" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>The Docker lanes need Docker with the Compose plugin, plus Bun. The Cloudflare lane runs through <code>wrangler</code>, which the project installs as a dev dependency.</p>
+<pre><code class="bash"><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:all</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:cloudflare</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:drizzle</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:per-statement-connection</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:hyperdrive</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:sandbox:postgres+redis</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>test:sandbox</code> runs every SQL and KV combination under the default profiles, plus the Cloudflare lane. <code>test:sandbox:all</code> skips the Cloudflare lane. Pairwise scripts such as <code>test:sandbox:postgres+redis</code> are listed in <code>package.json</code>.</p>
+<h2 id="reading-the-report" class="tsd-anchor-link">Reading the Report<a href="#reading-the-report" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Every run writes a timestamped Markdown report to <code>sandbox/results/</code> and updates <code>sandbox/results/latest.md</code> to the newest report.</p>
+<p>The report contains these matrices:</p>
+<ul>
+<li><code>Matrix: SQL x KV (Overall)</code></li>
+<li><code>Matrix: Where a Routed Operation Spends Its Time</code></li>
+<li><code>Matrix: Adapter Profiles (Overall Avg)</code></li>
+<li><code>Matrix: Core Scenario Latency (avg/p95)</code></li>
+<li><code>Matrix: Introspection and Routing Latency (avg/p95)</code></li>
+<li><code>Matrix: Strategy Key Distribution (imbalance / chi-square)</code></li>
+<li><code>Cloudflare Worker (wrangler dev --local)</code></li>
+<li><code>Matrix: Cloudflare Adapter Profiles (Overall Avg)</code></li>
+</ul>
+<p>Latency cells show <code>avg / p95</code> in milliseconds. <code>FAILED</code> means the scenario returned an error. <code>N/A</code> means the scenario did not run in that environment, and the report gives the reason where one applies. The per-scenario detail list adds <code>p50</code>, <code>min</code>, <code>max</code>, and the sample count <code>n</code>.</p>
+<p>A combination's status is <code>PASSED</code> when every scenario passed, <code>PARTIAL_PASSED</code> when at least 66% passed, and <code>FAILED</code> below that.</p>
+<p>Two averages appear in the matrices:</p>
+<ul>
+<li><code>Per-Op Avg</code> divides each scenario by the routed operations it performs, so scenarios with different workloads can be compared. Use it to compare backends.</li>
+<li><code>Overall Avg</code> is the unweighted mean of the scenario averages. <code>bulk_crud</code> dominates it, so it is not a ranking of backends.</li>
+</ul>
+<h2 id="measuring-your-own-deployment" class="tsd-anchor-link">Measuring Your Own Deployment<a href="#measuring-your-own-deployment" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Attach a <code>PhaseCollector</code> to see the same breakdown for your own traffic. <code>onPhase</code> is off unless set, and when unset it records nothing.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">PhaseCollector</span><span class="hl-1">, </span><span class="hl-5">initialize</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">phases</span><span class="hl-1"> = </span><span class="hl-6">new</span><span class="hl-1"> </span><span class="hl-0">PhaseCollector</span><span class="hl-1">();</span><br/><br/><span class="hl-0">initialize</span><span class="hl-1">({</span><br/><span class="hl-1">	</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_WEST</span><span class="hl-1"> },</span><br/><span class="hl-1">	</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">onPhase:</span><span class="hl-1"> </span><span class="hl-5">phases</span><span class="hl-1">.</span><span class="hl-5">observer</span><br/><span class="hl-1">});</span><br/><br/><span class="hl-3">// ... run some queries, then read the breakdown</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">table</span><span class="hl-1">(</span><span class="hl-5">phases</span><span class="hl-1">.</span><span class="hl-0">stats</span><span class="hl-1">());</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>PhaseStats</code> reports <code>count</code>, <code>totalMs</code>, <code>avgMs</code>, <code>minMs</code>, <code>maxMs</code>, <code>p50Ms</code>, and <code>p95Ms</code> for each phase. Timings use <code>performance.now()</code> where it exists, so sub-millisecond phases are visible.</p>
+<p>The phases are:</p>
+<ul>
+<li><code>kv.get</code>, <code>kv.put</code>, <code>kv.delete</code>, <code>kv.list</code>: one span per KV call. The detail is the key prefix.</li>
+<li><code>shard.select</code>: choosing a shard with the placement strategy. The detail is the strategy name.</li>
+<li><code>coordinator.fetch</code>: a call to the Durable Object coordinator.</li>
+<li><code>sql.prepare</code> and <code>sql.exec</code>: preparing and running SQL on a shard. The detail is the shard binding.</li>
+</ul>
+<p>The <code>hash</code> name exists in the type, but the router never emits it. The hash for the placement decision is timed inside <code>shard.select</code>, and the hash of a mapping key is not timed separately.</p>
+<p>For a stream instead of a summary, pass a function:</p>
+<pre><code class="ts"><span class="hl-0">initialize</span><span class="hl-1">({</span><br/><span class="hl-1">	</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">shards:</span><span class="hl-1"> { </span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">DB_EAST</span><span class="hl-1"> },</span><br/><span class="hl-1">	</span><span class="hl-0">onPhase</span><span class="hl-5">:</span><span class="hl-1"> (</span><span class="hl-5">span</span><span class="hl-1">) </span><span class="hl-6">=&gt;</span><span class="hl-1"> {</span><br/><span class="hl-1">		</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">span</span><span class="hl-1">.</span><span class="hl-5">durationMs</span><span class="hl-1"> &gt; </span><span class="hl-9">50</span><span class="hl-1">) {</span><br/><span class="hl-1">			</span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">warn</span><span class="hl-1">(</span><span class="hl-2">`slow </span><span class="hl-6">${</span><span class="hl-5">span</span><span class="hl-10">.</span><span class="hl-5">phase</span><span class="hl-6">}</span><span class="hl-2"> on </span><span class="hl-6">${</span><span class="hl-5">span</span><span class="hl-10">.</span><span class="hl-5">detail</span><span class="hl-6">}</span><span class="hl-2">: </span><span class="hl-6">${</span><span class="hl-5">span</span><span class="hl-10">.</span><span class="hl-5">durationMs</span><span class="hl-10">.</span><span class="hl-0">toFixed</span><span class="hl-10">(</span><span class="hl-9">1</span><span class="hl-10">)</span><span class="hl-6">}</span><span class="hl-2">ms`</span><span class="hl-1">);</span><br/><span class="hl-1">		}</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">});</span>
+</code><button type="button">Copy</button></pre>
+
+<p>An observer that throws is ignored, so a broken observer does not fail the query it measures.</p>
+<h3 id="where-time-goes-in-a-routed-operation" class="tsd-anchor-link">Where Time Goes in a Routed Operation<a href="#where-time-goes-in-a-routed-operation" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>The flowchart shows the phases a routed statement passes through, in order. Each box names the phase that times it.</p>
+<pre><code class="mermaid">flowchart TD
+	A[Routed statement with a key] --&gt; B{Mapping in process cache?}
+	B -- yes --&gt; H[sql.prepare]
+	B -- no --&gt; C[kv.get mapping key]
+	C --&gt; D{Mapping found?}
+	D -- yes --&gt; H
+	D -- no --&gt; E{Coordinator configured?}
+	E -- yes --&gt; F[coordinator.fetch allocate]
+	E -- no --&gt; G[shard.select]
+	F --&gt; I{Write or allocateOnRead?}
+	G --&gt; I
+	I -- yes --&gt; J[kv.put mapping]
+	I -- no --&gt; H
+	J --&gt; H
+	H --&gt; K[sql.exec on the shard]
+</code><button type="button">Copy</button></pre>
+
+<p>A key that already has a mapping skips the allocation branch. A read of a key with no mapping allocates a shard but does not store the mapping, unless <code>allocateOnRead</code> is set.</p>
+<h2 id="what-costs-what" class="tsd-anchor-link">What Costs What<a href="#what-costs-what" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>This table counts the KV calls and SQL round trips on the mapping path, for one routed operation.</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>KV reads</th>
+<th>KV writes</th>
+<th>SQL round trips</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mapping in process cache</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Cold cache, mapping exists</td>
+<td>1</td>
+<td>0</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Key not yet mapped, write</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Key not yet mapped, read</td>
+<td>1</td>
+<td>0</td>
+<td>1</td>
+</tr>
+</tbody>
+</table>
+<p>A read that finds no row does not write a mapping. Set <code>allocateOnRead: true</code> to store a mapping on reads as well.</p>
+<h2 id="platform-limits" class="tsd-anchor-link">Platform Limits<a href="#platform-limits" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>These are Cloudflare's published limits. CollegeDB does not control them, but they shape what a deployment can do.</p>
+<ul>
+<li><a href="https://developers.cloudflare.com/kv/platform/limits/">Workers KV</a> allows 1,000 writes per day to different keys on the free plan. Writes to the same key are limited to one per second. Each new primary key costs one KV write, so a free-plan deployment has a daily budget for new keys.</li>
+<li><a href="https://developers.cloudflare.com/d1/platform/limits/">D1</a> allows 1,000 queries per Worker invocation on the Workers Paid plan and 50 on the Free plan. A <code>batch()</code> call counts as one query, so use it for bulk writes.</li>
+<li><a href="https://developers.cloudflare.com/workers/configuration/smart-placement/">Smart Placement</a> runs the Worker near its back-end service. Cloudflare states that reducing per-query round-trip latency from 20 to 30 milliseconds to 1 to 3 milliseconds improves response times.</li>
+</ul>
+<h2 id="fault-tolerance" class="tsd-anchor-link">Fault Tolerance<a href="#fault-tolerance" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A single database is a single point of failure. With N shards and an even key distribution, losing one shard affects about 1/N of the keys. When a routed read through <code>firstResilient</code> finds no row, it runs a cross-shard scan before it returns <code>null</code>.</p>
+<h2 id="when-to-use-collegedb" class="tsd-anchor-link">When to Use CollegeDB<a href="#when-to-use-collegedb" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Use CollegeDB when:</p>
+<ul>
+<li>The dataset approaches the size or throughput limit of one database.</li>
+<li>Write throughput exceeds what one database instance sustains.</li>
+<li>Data needs to sit in particular regions.</li>
+<li>A failure should affect a fraction of the dataset instead of all of it.</li>
+</ul>
+<p>Avoid it when:</p>
+<ul>
+<li>One database serves the dataset without strain.</li>
+<li>The workload runs mostly cross-shard queries, which fan out to every shard.</li>
+<li>The primary key is a database-generated sequence that must span shards, unless ids come from <code>nextId()</code>.</li>
+</ul>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#benchmarks"><span>Benchmarks</span></a>
+<ul>
+<li><a href="#benchmark-suite"><span>Benchmark <wbr/>Suite</span></a></li>
+<li>
+<ul>
+<li><a href="#adapter-profiles"><span>Adapter <wbr/>Profiles</span></a></li></ul></li>
+<li><a href="#scenario-catalog"><span>Scenario <wbr/>Catalog</span></a></li>
+<li>
+<ul>
+<li><a href="#runner-options"><span>Runner <wbr/>Options</span></a></li>
+<li><a href="#common-commands"><span>Common <wbr/>Commands</span></a></li></ul></li>
+<li><a href="#reading-the-report"><span>Reading the <wbr/>Report</span></a></li>
+<li><a href="#measuring-your-own-deployment"><span>Measuring <wbr/>Your <wbr/>Own <wbr/>Deployment</span></a></li>
+<li>
+<ul>
+<li><a href="#where-time-goes-in-a-routed-operation"><span>Where <wbr/>Time <wbr/>Goes in a <wbr/>Routed <wbr/>Operation</span></a></li></ul></li>
+<li><a href="#what-costs-what"><span>What <wbr/>Costs <wbr/>What</span></a></li>
+<li><a href="#platform-limits"><span>Platform <wbr/>Limits</span></a></li>
+<li><a href="#fault-tolerance"><span>Fault <wbr/>Tolerance</span></a></li>
+<li><a href="#when-to-use-collegedb"><span>When to <wbr/>Use <wbr/>College<wbr/>DB</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

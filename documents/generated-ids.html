@@ -1,0 +1,165 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>generated-ids | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">generated-ids</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="generated-ids" class="tsd-anchor-link">Generated Ids<a href="#generated-ids" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page covers primary keys that the database assigns on insert, and how CollegeDB routes those rows. It is for developers who insert into a table whose key comes from an AUTOINCREMENT, SERIAL or identity column, and for anyone choosing between <code>insert()</code>, <code>insertShard()</code> and <code>nextId()</code>.</p>
+<h2 id="why-database-generated-ids-collide" class="tsd-anchor-link">Why Database-Generated Ids Collide<a href="#why-database-generated-ids-collide" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A database-generated id is only unique within its own shard. Each shard runs its own AUTOINCREMENT or SERIAL sequence, so <code>db-a</code> and <code>db-b</code> both hand out 1, then 2, then 3. A table spread across shards eventually receives the same id twice. The second mapping would overwrite the first, and the earlier row would sit on a shard that no key routes to.</p>
+<p>CollegeDB refuses the second insert with <code>GENERATED_KEY_COLLISION</code>. The section on collisions below covers what happens to the row that the refused INSERT wrote.</p>
+<h2 id="insert-helpers" class="tsd-anchor-link">Insert Helpers<a href="#insert-helpers" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>insert()</code> runs the statement on the shard the router allocates for a new key. <code>insertShard()</code> runs it on the shard you name. Both run the INSERT, read the generated id, and store the id-to-shard mapping, so <code>first()</code> and <code>all()</code> find the row through the routed read path.</p>
+<p>Both return the write result with a <code>generatedId</code> field.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">first</span><span class="hl-1">, </span><span class="hl-5">insertShard</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">created</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO audit_log (action, at) VALUES (?, ?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;login&#39;</span><span class="hl-1">, </span><span class="hl-5">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">()]);</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">row</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">first</span><span class="hl-1">(</span><span class="hl-0">String</span><span class="hl-1">(</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">), </span><span class="hl-2">&#39;SELECT * FROM audit_log WHERE id = ?&#39;</span><span class="hl-1">, [</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">]);</span>
+</code><button type="button">Copy</button></pre>
+
+<h2 id="reading-the-id-from-the-statement" class="tsd-anchor-link">Reading the Id from the Statement<a href="#reading-the-id-from-the-statement" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>CollegeDB reads the generated id from the statement's <code>RETURNING</code> row when the SQL contains <code>RETURNING</code>. Otherwise it reads the driver's last-insert metadata. Specifically:</p>
+<ul>
+<li>If the statement returns a row, CollegeDB reads <code>id</code> or <code>rowid</code> from that row, ignoring letter case, along with a few driver aliases such as <code>lastInsertId</code>. It does not fall back to driver metadata.</li>
+<li>If the statement returns no row, CollegeDB reads the driver's last-insert id.</li>
+<li>If neither yields an id, the call throws <code>GENERATED_KEY_UNAVAILABLE</code>.</li>
+</ul>
+<p>Include <code>RETURNING</code> in the statement when the primary key is not named <code>id</code> or <code>rowid</code>. Pass <code>idColumn</code> to name the key column:</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">insert</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">created</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insert</span><span class="hl-1">(</span><span class="hl-2">&#39;INSERT INTO things (uuid, label) VALUES (?, ?) RETURNING uuid, label&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;abc&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;Widget&#39;</span><span class="hl-1">], {</span><br/><span class="hl-1">	</span><span class="hl-5">idColumn:</span><span class="hl-1"> </span><span class="hl-2">&#39;uuid&#39;</span><br/><span class="hl-1">});</span><br/><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">); </span><span class="hl-3">// &#39;abc&#39;</span>
+</code><button type="button">Copy</button></pre>
+
+<p>With <code>idColumn</code> set, CollegeDB reads only that column from the returned row. A missing value throws <code>GENERATED_KEY_UNAVAILABLE</code>. The helper does not fall back to the first column or to the rowid. On a <code>TEXT PRIMARY KEY</code> table the rowid is a different value from the key, so routing on it places the row where no reader looks.</p>
+<p>Without <code>RETURNING</code>, <code>idColumn</code> has no effect, and the driver's last-insert id is used.</p>
+<h2 id="examples-by-dialect" class="tsd-anchor-link">Examples by Dialect<a href="#examples-by-dialect" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The example below assumes <code>db-east</code> is the only shard. It uses SQLite syntax, which D1 also accepts.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">createSchema</span><span class="hl-1">, </span><span class="hl-5">first</span><span class="hl-1">, </span><span class="hl-5">insert</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">createSchema</span><span class="hl-1">(</span><br/><span class="hl-1">	</span><span class="hl-5">env</span><span class="hl-1">[</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">],</span><br/><span class="hl-1">	</span><span class="hl-2">`</span><br/><span class="hl-2">	CREATE TABLE IF NOT EXISTS auto_users (</span><br/><span class="hl-2">		id INTEGER PRIMARY KEY AUTOINCREMENT,</span><br/><span class="hl-2">		name TEXT NOT NULL,</span><br/><span class="hl-2">		email TEXT UNIQUE,</span><br/><span class="hl-2">		created_at INTEGER</span><br/><span class="hl-2">	)</span><br/><span class="hl-2">`</span><br/><span class="hl-1">);</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">created</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insert</span><span class="hl-1">(</span><span class="hl-2">&#39;INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Ada&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;ada@example.com&#39;</span><span class="hl-1">, </span><span class="hl-5">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">()]);</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">row</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">first</span><span class="hl-1">(</span><span class="hl-0">String</span><span class="hl-1">(</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">), </span><span class="hl-2">&#39;SELECT * FROM auto_users WHERE id = ?&#39;</span><span class="hl-1">, [</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">]);</span>
+</code><button type="button">Copy</button></pre>
+
+<details>
+<summary>PostgreSQL variant with an identity column</summary>
+<p>This variant uses PostgreSQL identity syntax and a <code>RETURNING</code> clause, so the id comes from the returned row.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">createSchema</span><span class="hl-1">, </span><span class="hl-5">first</span><span class="hl-1">, </span><span class="hl-5">insert</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">createSchema</span><span class="hl-1">(</span><br/><span class="hl-1">	</span><span class="hl-5">env</span><span class="hl-1">[</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">],</span><br/><span class="hl-1">	</span><span class="hl-2">`</span><br/><span class="hl-2">	CREATE TABLE IF NOT EXISTS auto_users (</span><br/><span class="hl-2">		id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,</span><br/><span class="hl-2">		name VARCHAR(255) NOT NULL,</span><br/><span class="hl-2">		email VARCHAR(255) UNIQUE,</span><br/><span class="hl-2">		created_at BIGINT</span><br/><span class="hl-2">	)</span><br/><span class="hl-2">`</span><br/><span class="hl-1">);</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">created</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insert</span><span class="hl-1">(</span><span class="hl-2">&#39;INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?) RETURNING id&#39;</span><span class="hl-1">, [</span><br/><span class="hl-1">	</span><span class="hl-2">&#39;Ada&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-2">&#39;ada@example.com&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">()</span><br/><span class="hl-1">]);</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">row</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">first</span><span class="hl-1">(</span><span class="hl-0">String</span><span class="hl-1">(</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">), </span><span class="hl-2">&#39;SELECT * FROM auto_users WHERE id = ?&#39;</span><span class="hl-1">, [</span><span class="hl-5">created</span><span class="hl-1">.</span><span class="hl-5">generatedId</span><span class="hl-1">]);</span>
+</code><button type="button">Copy</button></pre>
+
+</details>
+<h2 id="choosing-an-approach" class="tsd-anchor-link">Choosing an Approach<a href="#choosing-an-approach" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The flowchart shows how the choice splits. A table that spans shards needs ids that are unique across the cluster. A table on one shard can keep the database sequence.</p>
+<pre><code class="mermaid">flowchart TD
+	A[Table needs a primary key] --&gt; B{Spans shards?}
+	B -- No --&gt; C[insertShard, or insert with one shard configured]
+	B -- Yes --&gt; D{Keep the database sequence?}
+	D -- Yes --&gt; E[insert, refused on collision]
+	D -- No --&gt; F[nextId, then insertInto with the id]
+</code><button type="button">Copy</button></pre>
+
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Spans shards</th>
+<th>Concurrency-safe</th>
+<th>Cost per id</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nextId()</code> + explicit id</td>
+<td>Yes</td>
+<td>With a coordinator</td>
+<td>One coordinator call</td>
+</tr>
+<tr>
+<td><code>insertShard()</code> on one shard</td>
+<td>No</td>
+<td>Yes, the database guarantees it</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code>insert()</code> across shards</td>
+<td>Yes</td>
+<td>No, throws on collision</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<h3 id="allocating-ids-with-nextid" class="tsd-anchor-link">Allocating Ids with nextId<a href="#allocating-ids-with-nextid" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Use <code>nextId()</code> for a table that spans shards. The id is allocated before the insert, so it is unique across the cluster, and the row routes on it directly.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">insertInto</span><span class="hl-1">, </span><span class="hl-5">nextId</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">id</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">nextId</span><span class="hl-1">(</span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">);</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertInto</span><span class="hl-1">(</span><span class="hl-0">String</span><span class="hl-1">(</span><span class="hl-5">id</span><span class="hl-1">), </span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">, {</span><br/><span class="hl-1">	</span><span class="hl-5">id</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">title:</span><span class="hl-1"> </span><span class="hl-2">&#39;Printer is on fire&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">created_at:</span><span class="hl-1"> </span><span class="hl-5">Math</span><span class="hl-1">.</span><span class="hl-0">floor</span><span class="hl-1">(</span><span class="hl-5">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">() / </span><span class="hl-9">1000</span><span class="hl-1">)</span><br/><span class="hl-1">});</span>
+</code><button type="button">Copy</button></pre>
+
+<p><code>nextId()</code> reads <code>MAX(column)</code> across every shard and continues from that value. A per-shard maximum does not see rows on other shards, so the cross-shard read is required.</p>
+<ul>
+<li>With a <code>ShardCoordinator</code> Durable Object configured, the id comes from the coordinator's atomic sequence. The first call for a table seeds the sequence from the cross-shard maximum, which costs one query per shard. Every later call costs one coordinator call and no shard queries.</li>
+<li>Without a coordinator, <code>nextId()</code> returns the maximum plus one. That value is correct across shards, but it is not safe under concurrent writers on its own. Pair it with a coordinator or a unique constraint.</li>
+</ul>
+<p>Two options adjust the result:</p>
+<pre><code class="ts"><span class="hl-3">// scan a column other than id</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">next</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">nextId</span><span class="hl-1">(</span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">, { </span><span class="hl-5">column:</span><span class="hl-1"> </span><span class="hl-2">&#39;ticket_number&#39;</span><span class="hl-1"> });</span><br/><br/><span class="hl-3">// never return below a known watermark, for example after importing legacy rows</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">safe</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">nextId</span><span class="hl-1">(</span><span class="hl-2">&#39;tickets&#39;</span><span class="hl-1">, { </span><span class="hl-5">min:</span><span class="hl-1"> </span><span class="hl-9">100_000</span><span class="hl-1"> });</span>
+</code><button type="button">Copy</button></pre>
+
+<h3 id="keeping-the-database-sequence-with-insertshard" class="tsd-anchor-link">Keeping the Database Sequence with insertShard<a href="#keeping-the-database-sequence-with-insertshard" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Use <code>insertShard()</code> when the table can live on one shard. Pinning the table to one shard keeps its AUTOINCREMENT or SERIAL sequence authoritative, with no coordinator call. Append-only tables that do not need to span shards fit this pattern.</p>
+<h3 id="using-insert-on-one-shard" class="tsd-anchor-link">Using insert on One Shard<a href="#using-insert-on-one-shard" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><code>insert()</code> with one shard configured behaves like <code>insertShard()</code> on that shard. The collision check does not run while only one shard exists. Once a second shard is configured, an id that is already mapped to another shard is refused, and the refusal happens only when a collision actually occurs.</p>
+<h2 id="generated-id-collisions" class="tsd-anchor-link">Generated Id Collisions<a href="#generated-id-collisions" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The collision check runs only when more than one shard is configured. Before storing the mapping, CollegeDB reads the existing mapping for the generated id. If the id is mapped to a different shard, the insert throws <code>GENERATED_KEY_COLLISION</code>. An id already mapped to the same shard is not a collision.</p>
+<p>The INSERT has already run when the refusal happens, so the refused row exists on the shard. CollegeDB receives a SQL string and does not parse it, which means it cannot tell which table to clean. Two cases follow:</p>
+<ul>
+<li>With <code>{ table }</code>, CollegeDB deletes the row it just wrote, matched on <code>idColumn</code> (default <code>id</code>), before it throws. It validates the table and id column names before the INSERT runs. The error message says the row was removed. If the delete fails or matches no row, the error keeps the <code>GENERATED_KEY_COLLISION</code> code, names the leftover row, and carries the delete failure as <code>cause</code>.</li>
+<li>Without <code>table</code>, the row stays on the shard. The error names the shard and id, and deleting the row is the caller's job.</li>
+</ul>
+<p>The sequence below shows a refused insert with <code>table</code> set. CollegeDB reads the mapping for the generated id, finds it on <code>db-a</code>, and deletes the row on <code>db-b</code> before it throws.</p>
+<pre><code class="mermaid">sequenceDiagram
+	participant R as CollegeDB
+	participant K as KV mapping
+	participant B as Shard db-b
+	R-&gt;&gt;B: INSERT row
+	B--&gt;&gt;R: generated id 1
+	R-&gt;&gt;K: read mapping
+	K--&gt;&gt;R: mapped to db-a
+	R-&gt;&gt;B: DELETE row
+	B--&gt;&gt;R: row removed
+	Note over R,B: throws GENERATED_KEY_COLLISION
+</code><button type="button">Copy</button></pre>
+
+<p>The example below catches the refusal and retries with an id from <code>nextId()</code>:</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">CollegeDBError</span><span class="hl-1">, </span><span class="hl-5">insertShard</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-a&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Ada&#39;</span><span class="hl-1">]); </span><span class="hl-3">// id 1 on db-a</span><br/><br/><span class="hl-4">try</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">insertShard</span><span class="hl-1">(</span><span class="hl-2">&#39;db-b&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;INSERT INTO auto_users (name) VALUES (?)&#39;</span><span class="hl-1">, [</span><span class="hl-2">&#39;Grace&#39;</span><span class="hl-1">], { </span><span class="hl-5">table:</span><span class="hl-1"> </span><span class="hl-2">&#39;auto_users&#39;</span><span class="hl-1"> }); </span><span class="hl-3">// also id 1</span><br/><span class="hl-1">} </span><span class="hl-4">catch</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1">) {</span><br/><span class="hl-1">	</span><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">error</span><span class="hl-1"> </span><span class="hl-6">instanceof</span><span class="hl-1"> </span><span class="hl-8">CollegeDBError</span><span class="hl-1"> &amp;&amp; </span><span class="hl-5">error</span><span class="hl-1">.</span><span class="hl-5">code</span><span class="hl-1"> === </span><span class="hl-2">&#39;GENERATED_KEY_COLLISION&#39;</span><span class="hl-1">) {</span><br/><span class="hl-1">		</span><span class="hl-3">// the row on db-b is gone; retry with a cluster-unique id from nextId()</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+<p>Avoid collisions in the first place by allocating ids with <code>nextId()</code> for a table that spans shards, or by confining the table to one shard.</p>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#generated-ids"><span>Generated <wbr/>Ids</span></a>
+<ul>
+<li><a href="#why-database-generated-ids-collide"><span>Why <wbr/>Database-<wbr/>Generated <wbr/>Ids <wbr/>Collide</span></a></li>
+<li><a href="#insert-helpers"><span>Insert <wbr/>Helpers</span></a></li>
+<li><a href="#reading-the-id-from-the-statement"><span>Reading the <wbr/>Id from the <wbr/>Statement</span></a></li>
+<li><a href="#examples-by-dialect"><span>Examples by <wbr/>Dialect</span></a></li>
+<li><a href="#choosing-an-approach"><span>Choosing an <wbr/>Approach</span></a></li>
+<li>
+<ul>
+<li><a href="#allocating-ids-with-nextid"><span>Allocating <wbr/>Ids with next<wbr/>Id</span></a></li>
+<li><a href="#keeping-the-database-sequence-with-insertshard"><span>Keeping the <wbr/>Database <wbr/>Sequence with insert<wbr/>Shard</span></a></li>
+<li><a href="#using-insert-on-one-shard"><span>Using insert on <wbr/>One <wbr/>Shard</span></a></li></ul></li>
+<li><a href="#generated-id-collisions"><span>Generated <wbr/>Id <wbr/>Collisions</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>

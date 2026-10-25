@@ -1,0 +1,251 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="../"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>coordinator | @earth-app/collegedb</title><meta name="description" content="Documentation for @earth-app/collegedb"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="../assets/style.css"/><link rel="stylesheet" href="../assets/highlight.css"/><link rel="stylesheet" href="../assets/custom.css"/><script defer src="../assets/main.js"></script><script defer src="../assets/custom.js"></script><script async src="../assets/icons.js" id="tsd-icons-script"></script><script async src="../assets/search.js" id="tsd-search-script"></script><script async src="../assets/navigation.js" id="tsd-nav-script"></script><script async src="../assets/hierarchy.js" id="tsd-hierarchy-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="../index.html" class="title">@earth-app/collegedb</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<ul class="tsd-breadcrumb" aria-label="Breadcrumb">
+<li><a href="" aria-current="page">coordinator</a></li></ul></div>
+<div class="tsd-panel tsd-typography"><h1 id="coordinator" class="tsd-anchor-link">Coordinator<a href="#coordinator" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>This page covers the ShardCoordinator Durable Object: how to bind it, the HTTP endpoints and methods it exposes, the storage upgrade from 1.3.x, and what the router does when the coordinator fails. It is for deployers who bind the coordinator and for anyone upgrading from 1.3.x. The coordinator runs only on Cloudflare Workers, and it is optional. Without it, the router allocates each new key with the local strategy.</p>
+<h2 id="when-to-use-it" class="tsd-anchor-link">When to Use It<a href="#when-to-use-it" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The coordinator makes allocation decisions for its scope, so round-robin uses one counter across every isolate. It also keeps the shard list and the per-shard statistics in one place. <a href="architecture.html">Architecture</a> shows where it sits in the routing path. Sequence values for generated ids are served by the coordinator when one is configured, see <a href="generated-ids.html">Generated ids</a>.</p>
+<h2 id="setup" class="tsd-anchor-link">Setup<a href="#setup" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Declare the class in <code>wrangler.jsonc</code>. The coordinator keeps its state in the object's SQLite database (<code>ctx.storage.sql</code>), so the class goes under <code>new_sqlite_classes</code>.</p>
+<pre><code class="jsonc"><span class="hl-1">{</span><br/><span class="hl-1">	</span><span class="hl-11">&quot;durable_objects&quot;</span><span class="hl-1">: {</span><br/><span class="hl-1">		</span><span class="hl-11">&quot;bindings&quot;</span><span class="hl-1">: [</span><br/><span class="hl-1">			{</span><br/><span class="hl-1">				</span><span class="hl-11">&quot;name&quot;</span><span class="hl-1">: </span><span class="hl-2">&quot;ShardCoordinator&quot;</span><span class="hl-1">,</span><br/><span class="hl-1">				</span><span class="hl-11">&quot;class_name&quot;</span><span class="hl-1">: </span><span class="hl-2">&quot;ShardCoordinator&quot;</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">		]</span><br/><span class="hl-1">	},</span><br/><span class="hl-1">	</span><span class="hl-11">&quot;migrations&quot;</span><span class="hl-1">: [</span><br/><span class="hl-1">		{</span><br/><span class="hl-1">			</span><span class="hl-11">&quot;tag&quot;</span><span class="hl-1">: </span><span class="hl-2">&quot;v1&quot;</span><span class="hl-1">,</span><br/><span class="hl-1">			</span><span class="hl-11">&quot;new_sqlite_classes&quot;</span><span class="hl-1">: [</span><span class="hl-2">&quot;ShardCoordinator&quot;</span><span class="hl-1">]</span><br/><span class="hl-1">		}</span><br/><span class="hl-1">	]</span><br/><span class="hl-1">}</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The Worker exports the class and passes the binding as <code>coordinator</code>. Set <code>coordinatorScope</code> to split keys across coordinator objects. The scope is the name passed to <code>idFromName</code>, and it defaults to <code>'default'</code>. A change of scope starts from an empty allocation ledger.</p>
+<pre><code class="ts"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">collegedb</span><span class="hl-1">, </span><span class="hl-5">createWorkersKVProvider</span><span class="hl-1">, </span><span class="hl-5">ShardCoordinator</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-4">export</span><span class="hl-1"> { </span><span class="hl-5">ShardCoordinator</span><span class="hl-1"> };</span><br/><br/><span class="hl-4">export</span><span class="hl-1"> </span><span class="hl-4">default</span><span class="hl-1"> {</span><br/><span class="hl-1">	</span><span class="hl-6">async</span><span class="hl-1"> </span><span class="hl-0">fetch</span><span class="hl-1">(</span><span class="hl-5">request</span><span class="hl-1">: </span><span class="hl-8">Request</span><span class="hl-1">, </span><span class="hl-5">env</span><span class="hl-1">: </span><span class="hl-8">Env</span><span class="hl-1">): </span><span class="hl-8">Promise</span><span class="hl-1">&lt;</span><span class="hl-8">Response</span><span class="hl-1">&gt; {</span><br/><span class="hl-1">		</span><span class="hl-4">return</span><span class="hl-1"> </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">collegedb</span><span class="hl-1">(</span><br/><span class="hl-1">			{</span><br/><span class="hl-1">				</span><span class="hl-5">kv:</span><span class="hl-1"> </span><span class="hl-0">createWorkersKVProvider</span><span class="hl-1">(</span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-7">KV</span><span class="hl-1">),</span><br/><span class="hl-1">				</span><span class="hl-5">coordinator:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">,</span><br/><span class="hl-1">				</span><span class="hl-5">coordinatorScope:</span><span class="hl-1"> </span><span class="hl-2">&#39;default&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">				</span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;round-robin&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">				</span><span class="hl-5">shards:</span><span class="hl-1"> {</span><br/><span class="hl-1">					</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">[</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">],</span><br/><span class="hl-1">					</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-5">env</span><span class="hl-1">[</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">]</span><br/><span class="hl-1">				}</span><br/><span class="hl-1">			},</span><br/><span class="hl-1">			</span><span class="hl-6">async</span><span class="hl-1"> () </span><span class="hl-6">=&gt;</span><span class="hl-1"> {</span><br/><span class="hl-1">				</span><span class="hl-3">// application logic here</span><br/><span class="hl-1">				</span><span class="hl-4">return</span><span class="hl-1"> </span><span class="hl-6">new</span><span class="hl-1"> </span><span class="hl-0">Response</span><span class="hl-1">(</span><span class="hl-2">&#39;ok&#39;</span><span class="hl-1">);</span><br/><span class="hl-1">			}</span><br/><span class="hl-1">		);</span><br/><span class="hl-1">	}</span><br/><span class="hl-1">};</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The <code>Env</code> type is the one from <a href="cloudflare.html">Cloudflare</a>.</p>
+<h2 id="http-endpoints" class="tsd-anchor-link">HTTP Endpoints<a href="#http-endpoints" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Send requests with <code>coordinator.fetch</code>. The router reads only the method and the path, so the host in the URL does not matter. The examples use <code>http://coordinator</code>.</p>
+<pre><code class="ts"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">coordinator</span><span class="hl-1"> = </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">get</span><span class="hl-1">(</span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">idFromName</span><span class="hl-1">(</span><span class="hl-2">&#39;default&#39;</span><span class="hl-1">));</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">response</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">coordinator</span><span class="hl-1">.</span><span class="hl-0">fetch</span><span class="hl-1">(</span><span class="hl-2">&#39;http://coordinator/allocate&#39;</span><span class="hl-1">, {</span><br/><span class="hl-1">	</span><span class="hl-5">method:</span><span class="hl-1"> </span><span class="hl-2">&#39;POST&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">headers:</span><span class="hl-1"> { </span><span class="hl-2">&#39;Content-Type&#39;</span><span class="hl-5">:</span><span class="hl-1"> </span><span class="hl-2">&#39;application/json&#39;</span><span class="hl-1"> },</span><br/><span class="hl-1">	</span><span class="hl-5">body:</span><span class="hl-1"> </span><span class="hl-7">JSON</span><span class="hl-1">.</span><span class="hl-0">stringify</span><span class="hl-1">({ </span><span class="hl-5">primaryKey:</span><span class="hl-1"> </span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">, </span><span class="hl-5">strategy:</span><span class="hl-1"> </span><span class="hl-2">&#39;hash&#39;</span><span class="hl-1"> })</span><br/><span class="hl-1">});</span><br/><span class="hl-6">const</span><span class="hl-1"> { </span><span class="hl-7">shard</span><span class="hl-1"> } = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">response</span><span class="hl-1">.</span><span class="hl-0">json</span><span class="hl-1">();</span>
+</code><button type="button">Copy</button></pre>
+
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Method</th>
+<th>Request body</th>
+<th>Response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/shards</code></td>
+<td>GET</td>
+<td>None</td>
+<td><code>[&quot;db-east&quot;, &quot;db-west&quot;]</code></td>
+</tr>
+<tr>
+<td><code>/shards</code></td>
+<td>POST</td>
+<td><code>{&quot;shard&quot;: &quot;db-new&quot;}</code></td>
+<td><code>{&quot;success&quot;: true}</code>. Idempotent for a known shard.</td>
+</tr>
+<tr>
+<td><code>/shards</code></td>
+<td>DELETE</td>
+<td><code>{&quot;shard&quot;: &quot;db-old&quot;}</code></td>
+<td><code>{&quot;success&quot;: true}</code></td>
+</tr>
+<tr>
+<td><code>/stats</code></td>
+<td>GET</td>
+<td>None</td>
+<td><code>[{&quot;binding&quot;: &quot;db-east&quot;, &quot;count&quot;: 1542, &quot;lastUpdated&quot;: 1672531200000}]</code></td>
+</tr>
+<tr>
+<td><code>/stats</code></td>
+<td>POST</td>
+<td><code>{&quot;shard&quot;: &quot;db-east&quot;, &quot;count&quot;: 1600}</code></td>
+<td><code>{&quot;success&quot;: true}</code>. An unregistered shard is ignored.</td>
+</tr>
+<tr>
+<td><code>/allocate</code></td>
+<td>POST</td>
+<td><code>{&quot;primaryKey&quot;: &quot;user-123&quot;, &quot;strategy&quot;: &quot;hash&quot;}</code></td>
+<td><code>{&quot;shard&quot;: &quot;db-west&quot;}</code>. Adds <code>&quot;reused&quot;: true</code> when the key already has an eligible recorded shard.</td>
+</tr>
+<tr>
+<td><code>/forget</code></td>
+<td>POST</td>
+<td><code>{&quot;primaryKey&quot;: &quot;user-123&quot;}</code></td>
+<td><code>{&quot;success&quot;: true}</code></td>
+</tr>
+<tr>
+<td><code>/sequence</code></td>
+<td>POST</td>
+<td><code>{&quot;name&quot;: &quot;tickets&quot;, &quot;min&quot;: 42}</code></td>
+<td><code>{&quot;value&quot;: 42}</code>. The value is the larger of the stored counter plus one and <code>min</code>.</td>
+</tr>
+<tr>
+<td><code>/sequence</code></td>
+<td>POST</td>
+<td>Same, with <code>&quot;requireExisting&quot;: true</code></td>
+<td><code>{&quot;needsSeed&quot;: true}</code> when the sequence has no stored value yet</td>
+</tr>
+<tr>
+<td><code>/allocations</code></td>
+<td>GET</td>
+<td>None. Query: <code>after</code>, <code>limit</code> (default 100, maximum 1000)</td>
+<td><code>{&quot;allocations&quot;: [{&quot;primaryKey&quot;: &quot;user-123&quot;, &quot;shard&quot;: &quot;db-west&quot;, &quot;createdAt&quot;: 1729800000}], &quot;next&quot;: &quot;user-123&quot;}</code></td>
+</tr>
+<tr>
+<td><code>/allocations/prune</code></td>
+<td>POST</td>
+<td><code>{&quot;primaryKeys&quot;: [&quot;user-123&quot;]}</code>, at most 128 keys</td>
+<td><code>{&quot;pruned&quot;: 1}</code></td>
+</tr>
+<tr>
+<td><code>/retire-legacy</code></td>
+<td>POST</td>
+<td>None</td>
+<td><code>{&quot;success&quot;: true}</code>. See the upgrade section below.</td>
+</tr>
+<tr>
+<td><code>/flush</code></td>
+<td>POST</td>
+<td>None</td>
+<td><code>{&quot;success&quot;: true}</code>. Clears all state. Development only.</td>
+</tr>
+<tr>
+<td><code>/health</code></td>
+<td>GET</td>
+<td>None</td>
+<td><code>OK</code>, as plain text</td>
+</tr>
+</tbody>
+</table>
+<p><code>next</code> is the last key of a page when more rows follow, and <code>null</code> on the last page. <code>/allocations</code> and <code>/allocations/prune</code> finish any pending storage upgrade before they answer.</p>
+<p>Routes match on the method and the path together, so an unknown path and a known path with the wrong method both return <code>404</code> with the plain-text body <code>Not Found</code>. There is no <code>405</code>. A handler that throws returns <code>500</code> with the plain-text body <code>Internal Server Error</code>. That includes a body that is not valid JSON, since the handlers parse it without a guard.</p>
+<p><code>400</code> with a JSON <code>error</code> field covers a missing or invalid required field and nothing else:</p>
+<ol>
+<li><code>shard</code> on <code>POST /shards</code>, <code>DELETE /shards</code> and <code>POST /stats</code>.</li>
+<li><code>count</code> on <code>POST /stats</code>.</li>
+<li><code>primaryKey</code> on <code>POST /allocate</code> and <code>POST /forget</code>.</li>
+<li><code>name</code> on <code>POST /sequence</code>.</li>
+<li><code>primaryKeys</code> on <code>POST /allocations/prune</code>.</li>
+<li><code>POST /allocate</code> when no shard is eligible (<code>No shards available</code>).</li>
+</ol>
+<p><code>GET /allocations</code> never returns <code>400</code>. A <code>limit</code> that is not a number falls back to 100, and other values are clamped to 1 through 1000. A <code>strategy</code> value the coordinator does not recognize returns <code>200</code> with a hash pick, not <code>400</code>.</p>
+<p>Read a non-OK body as text, since the body is JSON only for the <code>400</code> case.</p>
+<h2 id="programmatic-methods" class="tsd-anchor-link">Programmatic Methods<a href="#programmatic-methods" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The methods below are called on the stub from <code>env.ShardCoordinator.get(...)</code>. The runtime constructs the class from the Durable Object state, so application code does not construct it.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Returns</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fetch(request)</code></td>
+<td><code>Promise&lt;Response&gt;</code></td>
+<td>Handles the endpoints above</td>
+</tr>
+<tr>
+<td><code>incrementShardCount(shard)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Adds one to the count of a registered shard. Does nothing for an unknown shard.</td>
+</tr>
+<tr>
+<td><code>decrementShardCount(shard)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Subtracts one, never below zero. Does nothing for an unknown shard.</td>
+</tr>
+<tr>
+<td><code>forgetAllocation(key)</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Drops the recorded allocation for a key. Since 1.3.0.</td>
+</tr>
+<tr>
+<td><code>retireLegacy()</code></td>
+<td><code>Promise&lt;void&gt;</code></td>
+<td>Finishes the storage upgrade and deletes the legacy keys. Since 1.4.0.</td>
+</tr>
+</tbody>
+</table>
+<p>The router never calls <code>incrementShardCount</code> or <code>decrementShardCount</code>. Your code calls them when keys are added or removed, and the counts from <a href="cloudflare.html">Shard statistics</a> are only as current as those calls.</p>
+<pre><code class="ts"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">coordinator</span><span class="hl-1"> = </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">get</span><span class="hl-1">(</span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">idFromName</span><span class="hl-1">(</span><span class="hl-2">&#39;default&#39;</span><span class="hl-1">));</span><br/><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">coordinator</span><span class="hl-1">.</span><span class="hl-0">incrementShardCount</span><span class="hl-1">(</span><span class="hl-2">&#39;db-east&#39;</span><span class="hl-1">);</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">coordinator</span><span class="hl-1">.</span><span class="hl-0">decrementShardCount</span><span class="hl-1">(</span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">);</span>
+</code><button type="button">Copy</button></pre>
+
+<h2 id="reconciling-allocations" class="tsd-anchor-link">Reconciling Allocations<a href="#reconciling-allocations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p><code>reconcileAllocations</code> compares the ledger with the routing that the KV mappings and the placement give each key. It runs against the same <code>coordinatorScope</code> as the router. Its options are <code>limit</code>, <code>verifyRecords</code> (the tables and key columns to probe on each routed shard), <code>repair</code>, which requires <code>verifyRecords</code>, and <code>pruneVerified</code>. Nothing is written unless <code>repair</code> or <code>pruneVerified</code> is set. <a href="shard-moves.html">Shard moves</a> defines each count in the report and the reasons a routed row is not proof of ownership.</p>
+<h2 id="how-allocation-works" class="tsd-anchor-link">How Allocation Works<a href="#how-allocation-works" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The diagram shows a write for a key with no KV mapping. The router asks the coordinator for a shard, saves the mapping, and then uses the shard.</p>
+<pre><code class="mermaid">sequenceDiagram
+	participant App
+	participant Router
+	participant Coordinator
+	App-&gt;&gt;Router: write for user-123
+	Router-&gt;&gt;Router: read KV mapping, none found
+	Router-&gt;&gt;Coordinator: POST /allocate
+	Coordinator-&gt;&gt;Coordinator: reuse recorded shard or pick one
+	Coordinator--&gt;&gt;Router: shard db-west
+	Router-&gt;&gt;Router: save KV mapping
+	Router--&gt;&gt;App: shard db-west
+</code><button type="button">Copy</button></pre>
+
+<p>A key with a KV mapping resolves in the router and never reaches the coordinator. A read of a key with no mapping also asks for an allocation. The router saves that result only when the <code>allocateOnRead</code> option is set. The coordinator records every decision in its ledger, including a read's decision. The KV mapping stays the record, and the ledger is advisory.</p>
+<p>Requests to one coordinator object run one at a time, and each handler finishes before the next starts. Two first touches of the same key therefore cannot both see it unallocated.</p>
+<h2 id="failure-handling" class="tsd-anchor-link">Failure Handling<a href="#failure-handling" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>When a coordinator is configured, the router asks it for every new key. If the request throws, the router logs a warning and picks the shard with the local strategy. If the coordinator answers with a non-OK status, the router picks locally without logging. The local pick uses the same strategy the coordinator received. Round-robin uses the router's per-isolate counter, and the coordinator's counter does not advance for those keys.</p>
+<p>A coordinator failure does not stop allocation, so it does not show up as an error in the request. Watch the <code>/health</code> endpoint separately. The <a href="cloudflare.html">Cloudflare</a> page has a health-check recipe that does this.</p>
+<h2 id="upgrading-from-13x" class="tsd-anchor-link">Upgrading From 1.3.x<a href="#upgrading-from-13x" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Objects written by 1.3.x keep their state under legacy storage keys. The current version copies that state into SQL on the first requests and does not need a separate migration step. The object moves through four phases.</p>
+<pre><code class="mermaid">stateDiagram-v2
+	state &quot;sql-only&quot; as sqlOnly
+	[*] --&gt; legacy
+	legacy --&gt; copying : first request
+	copying --&gt; dual : last page copied
+	dual --&gt; sqlOnly : POST /retire-legacy
+	sqlOnly --&gt; [*]
+</code><button type="button">Copy</button></pre>
+
+<p>A new object starts in <code>legacy</code> as well and moves through the same phases on its first requests. Each request that goes through the object advances the copy by one step. The first step copies the shard list, the statistics and the sequence counters. Each later step copies up to 200 allocation rows. Reads of keys not yet copied fall back to the legacy keys while the copy runs.</p>
+<p>While the object is in <code>dual</code>, every write lands in SQL and on the legacy keys, so a rollback to 1.3.x keeps the object readable. Writes the older version makes to the legacy keys are not copied back, and the newer version overwrites them when the object upgrades again.</p>
+<p><code>POST /retire-legacy</code> finishes any pending copy and then deletes the legacy keys. It can be called from any phase. Call it once no Worker running 1.3.x is still serving traffic. A deployment that never ran 1.3.x can call it right away, which stops the legacy writes. After the call, 1.3.x cannot read the object, and downgrading past it is not supported.</p>
+<pre><code class="ts"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-7">coordinator</span><span class="hl-1"> = </span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">get</span><span class="hl-1">(</span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-5">ShardCoordinator</span><span class="hl-1">.</span><span class="hl-0">idFromName</span><span class="hl-1">(</span><span class="hl-2">&#39;default&#39;</span><span class="hl-1">));</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">coordinator</span><span class="hl-1">.</span><span class="hl-0">fetch</span><span class="hl-1">(</span><span class="hl-2">&#39;http://coordinator/retire-legacy&#39;</span><span class="hl-1">, { </span><span class="hl-5">method:</span><span class="hl-1"> </span><span class="hl-2">&#39;POST&#39;</span><span class="hl-1"> });</span>
+</code><button type="button">Copy</button></pre>
+
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#coordinator"><span>Coordinator</span></a>
+<ul>
+<li><a href="#when-to-use-it"><span>When to <wbr/>Use <wbr/>It</span></a></li>
+<li><a href="#setup"><span>Setup</span></a></li>
+<li><a href="#http-endpoints"><span>HTTP <wbr/>Endpoints</span></a></li>
+<li><a href="#programmatic-methods"><span>Programmatic <wbr/>Methods</span></a></li>
+<li><a href="#reconciling-allocations"><span>Reconciling <wbr/>Allocations</span></a></li>
+<li><a href="#how-allocation-works"><span>How <wbr/>Allocation <wbr/>Works</span></a></li>
+<li><a href="#failure-handling"><span>Failure <wbr/>Handling</span></a></li>
+<li><a href="#upgrading-from-13x"><span>Upgrading <wbr/>From 1.3.x</span></a></li></ul></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="../modules.html">@earth-app/collegedb</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>
