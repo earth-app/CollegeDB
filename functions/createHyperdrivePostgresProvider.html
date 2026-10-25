@@ -26,6 +26,11 @@ per statement and forfeits named prepared statements.</p>
 created by one request and used by another. Either pass <code>scope</code> so the
 provider can key its client on the current request, or call
 <a href="../interfaces/HyperdriveProvider.html#dispose" class="tsd-kind-method">HyperdriveProvider.dispose</a> at the end of each request.</p>
+<p>The factory must return one connection, such as a <code>pg</code> <code>Client</code>. The provider
+has a <a href="../interfaces/SQLDatabase.html#runbatch" class="tsd-kind-method">SQLDatabase.runBatch</a> that runs its group in one transaction on
+that connection and declares <a href="../interfaces/HyperdriveProvider.html#atomicbatch" class="tsd-kind-property">SQLDatabase.atomicBatch</a>. A batch runs
+alone: a plain statement from the same request waits until it commits, so it
+cannot slip into the open transaction.</p>
 </div>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
@@ -51,7 +56,7 @@ provider can key its client on the current request, or call
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ef3cb7ecf43c26e8e28c642bde4036848ac082f1/src/providers.ts#L844">src/providers.ts:844</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4c7ed1ea9781c17a22e33ea4bb2c9bf93b3f70c6/src/providers.ts#L957">src/providers.ts:957</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

@@ -37,7 +37,7 @@ survives the per-request initialization the Workers examples use.</p>
 <h4 class="tsd-anchor-link" id="throws">Throws<a href="#throws" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If CollegeDB is not initialized</p>
 </div>
 <div class="tsd-tag-since">
-<h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.4.0</p>
+<h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.3.0</p>
 </div>
 <div class="tsd-tag-example">
 <h4 class="tsd-anchor-link" id="example">Example<a href="#example" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-8">mapper</span><span class="hl-1"> = </span><span class="hl-6">new</span><span class="hl-1"> </span><span class="hl-0">KVShardMapper</span><span class="hl-1">(</span><span class="hl-5">env</span><span class="hl-1">.</span><span class="hl-8">KV</span><span class="hl-1">, { </span><span class="hl-5">hashShardMappings:</span><span class="hl-1"> </span><span class="hl-6">true</span><span class="hl-1"> });</span><br/><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-5">mapper</span><span class="hl-1">.</span><span class="hl-0">updateShardMapping</span><span class="hl-1">(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">, </span><span class="hl-2">&#39;db-west&#39;</span><span class="hl-1">);</span><br/><br/><span class="hl-0">invalidateMappingCache</span><span class="hl-1">(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">); </span><span class="hl-3">// this process now reads the new shard</span>
@@ -45,7 +45,7 @@ survives the per-request initialization the Workers examples use.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ef3cb7ecf43c26e8e28c642bde4036848ac082f1/src/router.ts#L2018">src/router.ts:2018</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4c7ed1ea9781c17a22e33ea4bb2c9bf93b3f70c6/src/router.ts#L2920">src/router.ts:2920</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

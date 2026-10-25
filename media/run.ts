@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { Client as PostgresClient, Pool as PostgresPool } from 'pg';
 import { createClient as createRedisClient } from 'redis';
 import {
+	CollegeDBError,
 	all,
 	allAllShards,
 	allShard,
@@ -28,22 +29,35 @@ import {
 	createSQLiteProvider,
 	createSchemaAcrossShards,
 	createValkeyKVProvider,
+	deleteRow,
 	first,
 	flush,
 	getShardStats,
+	hrwShard,
 	initialize,
+	initializeAsync,
+	insertInto,
 	insertShard,
 	invalidateMappingCache,
 	nextId,
 	paginate,
+	pruneEpochs,
+	reassignShard,
 	resetConfig,
 	run,
 	runAllShards,
-	runShard
+	runShard,
+	updateRow,
+	upsert
 } from '../../src/index';
 import { KVShardMapper } from '../../src/kvmap';
+import { runGuardedWrite, setMigrationStepHook } from '../../src/migrations';
+import { createManifest, resetPlacementState } from '../../src/placement';
+import { buildGuardedInsert, buildInsert, buildJournalSchema, buildShardSidecarSchema } from '../../src/query';
 import { PhaseCollector } from '../../src/telemetry';
+import { buildManifestSchema, commitJournalManifest, loadJournalManifest, raiseFence, readFence } from '../../src/topology';
 import type {
+	BatchStatement,
 	CollegeDBConfig,
 	D1Region,
 	KVStorage,
@@ -59,7 +73,11 @@ const RESULTS_DIR = resolve(PROJECT_ROOT, 'sandbox', 'results');
 const TMP_DIR = resolve(PROJECT_ROOT, 'sandbox', 'tmp');
 const COMPOSE_SCRIPT = resolve(PROJECT_ROOT, 'scripts', 'sandbox', 'compose.sh');
 const WRANGLER_CONFIG = resolve(PROJECT_ROOT, 'sandbox', 'wrangler.jsonc');
+const WRANGLER_NO_COMPAT_CONFIG = resolve(PROJECT_ROOT, 'sandbox', 'wrangler.no-compat.jsonc');
 const WRANGLER_BIN = resolve(PROJECT_ROOT, 'node_modules', '.bin', 'wrangler');
+const NO_COMPAT_URL = 'http://127.0.0.1:8788';
+/** Overlapping pairs per arm of the async context probe */
+const ALS_PROBE_ITERATIONS = 200;
 
 const ALL_DATABASES = ['postgres', 'mysql', 'mariadb', 'sqlite'] as const;
 const ALL_KV = ['redis', 'valkey'] as const;
@@ -89,7 +107,14 @@ const SCENARIO_NAMES = [
 	'paginate',
 	'batch_write',
 	'cold_mapping_cache',
-	'concurrent_load'
+	'concurrent_load',
+	'journal_move',
+	'stale_route_write',
+	'kv_bulk_read',
+	'batch_rollback',
+	'topology_cas',
+	'als_overlap',
+	'als_no_compat'
 ] as const;
 const SHARDING_STRATEGIES = ['round-robin', 'random', 'hash', 'location'] as const;
 const STRATEGY_BENCHMARK_TARGET_REGIONS = ['wnam', 'enam', 'weur', 'apac', 'oc'] as const;
@@ -121,6 +146,10 @@ interface CLIOptions {
 	strategyStatements: number;
 	includeCloudflare: boolean;
 	cloudflareOnly: boolean;
+	/** Runs only these scenarios and skips the strategy matrix; null runs everything */
+	only: ScenarioName[] | null;
+	/** Iterations per write kind for stale_route_write */
+	raceIterations: number;
 }
 
 interface Combo {
@@ -416,6 +445,47 @@ const SCENARIO_CATALOG: Record<
 		title: 'Concurrent routed reads',
 		details: 'Issues routed reads concurrently rather than one at a time, which every other scenario does.',
 		workload: (plan) => `${plan.basic} iterations; 16 concurrent routed reads per iteration`
+	},
+	journal_move: {
+		title: 'Journaled key move',
+		details:
+			'Moves a key with the crash-safe journal, then runs tombstone-checked writes on the destination and a stale-route write the tombstone must refuse.',
+		workload: (plan) => `${plan.reassignment} iterations; move + guarded update, upsert and insert + stale-route refusals per iteration`
+	},
+	stale_route_write: {
+		title: 'Stale-route writes racing the cutover',
+		details:
+			'Races update, delete, insert and upsert writers against the source cutover on separate connections, and asserts every acknowledged write is on the one owner and no ghost row appears. A control arm with the key lock removed must report violations.',
+		workload: () => '--race-iterations per write kind; protocol arm plus control arm; Postgres, MySQL and MariaDB only'
+	},
+	kv_bulk_read: {
+		title: 'Bulk KV read',
+		details: 'Reads 100 keys (a tenth of them absent) in one getMany call and checks order and nulls against 100 single gets.',
+		workload: (plan) => `${plan.basic} iterations; 1 getMany over 100 keys per iteration`
+	},
+	batch_rollback: {
+		title: 'Failing batch rollback',
+		details: 'Runs a batch whose third statement repeats a primary key and checks that the two statements before it were rolled back.',
+		workload: (plan) => `${plan.reassignment} iterations; 1 failing 3-statement batch per iteration`
+	},
+	topology_cas: {
+		title: 'Topology tables on the real engine',
+		details:
+			'Creates the manifest, sidecar and journal tables twice, races manifest publishers on the compare-and-swap, races a stale-generation writer against the fence raise and the census, and runs pruneEpochs (dry run, then real) on three shards. Control arms (a swap with no revision check, a writer with no fence) must report violations.',
+		workload: () => '--race-iterations per race kind; protocol arm plus control arm'
+	},
+	als_overlap: {
+		title: 'Overlapping collegedb calls on workerd',
+		details:
+			'Overlaps collegedb callbacks with different shard sets on local workerd with nodejs_compat, awaiting KV, D1, a Durable Object and a timer, and checks each callback sees its own configuration and writes only to its own shards. createClient runs the same overlap. A control arm that calls initialize twice must show cross-talk.',
+		workload: () => `${ALS_PROBE_ITERATIONS} overlapping pairs per arm; scoped, createClient and control`
+	},
+	als_no_compat: {
+		title: 'Overlapping collegedb calls without nodejs_compat',
+		details:
+			'Runs a second Worker without nodejs_compat. The library must load with no async context, a callback with a different configuration must be refused with CONCURRENT_CONFIG while another runs, the same configuration may overlap, and createClient must keep two clusters apart. A control arm that calls initialize twice must show cross-talk.',
+		workload: () =>
+			`${ALS_PROBE_ITERATIONS} iterations of the refusal arm; ${ALS_PROBE_ITERATIONS} overlapping pairs for createClient and control`
 	}
 };
 
@@ -583,7 +653,9 @@ function parseArgs(args: string[]): CLIOptions {
 		bulkSize: 160,
 		strategyStatements: 100,
 		includeCloudflare: false,
-		cloudflareOnly: false
+		cloudflareOnly: false,
+		only: null,
+		raceIterations: 60
 	};
 
 	for (const arg of args) {
@@ -609,6 +681,19 @@ function parseArgs(args: string[]): CLIOptions {
 				10,
 				Number.parseInt(arg.slice('--strategy-statements='.length), 10) || defaults.strategyStatements
 			);
+		} else if (arg.startsWith('--only=')) {
+			const names = arg
+				.slice('--only='.length)
+				.split(',')
+				.map((name) => name.trim())
+				.filter(Boolean);
+			const unknown = names.filter((name) => !(SCENARIO_NAMES as readonly string[]).includes(name));
+			if (unknown.length > 0) {
+				throw new Error(`Unsupported --only scenario: ${unknown.join(', ')}`);
+			}
+			defaults.only = names as ScenarioName[];
+		} else if (arg.startsWith('--race-iterations=')) {
+			defaults.raceIterations = Math.max(2, Number.parseInt(arg.slice('--race-iterations='.length), 10) || defaults.raceIterations);
 		} else if (arg === '--include-cloudflare') {
 			defaults.includeCloudflare = true;
 		} else if (arg === '--cloudflare-only') {
@@ -728,60 +813,95 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 		await resetBenchData();
 
 		const plan = buildIterationPlan(options.iterations);
-		scenarios.basic_crud = await scenarioBasicCrud(plan.basic);
+		const selected = (name: ScenarioName) => !options.only || options.only.includes(name);
 
-		await resetBenchData();
-		scenarios.advanced_usage = await scenarioAdvancedUsage(plan.advanced, config);
+		if (!options.only) {
+			scenarios.basic_crud = await scenarioBasicCrud(plan.basic);
 
-		await resetBenchData();
-		scenarios.migration_mapping = await scenarioMigrationMapping(plan.migration, config, options.bulkSize);
+			await resetBenchData();
+			scenarios.advanced_usage = await scenarioAdvancedUsage(plan.advanced, config);
 
-		await resetBenchData();
-		scenarios.bulk_crud = await scenarioBulkCrud(plan.bulk, options.bulkSize);
+			await resetBenchData();
+			scenarios.migration_mapping = await scenarioMigrationMapping(plan.migration, config, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.auto_increment = await scenarioAutoIncrement(plan.autoIncrement, combo.db);
+			await resetBenchData();
+			scenarios.bulk_crud = await scenarioBulkCrud(plan.bulk, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.indexing = await scenarioIndexing(plan.indexing);
+			await resetBenchData();
+			scenarios.auto_increment = await scenarioAutoIncrement(plan.autoIncrement, combo.db);
 
-		await resetBenchData();
-		scenarios.metadata_fetch = await scenarioMetadataFetch(plan.metadata, combo.db);
+			await resetBenchData();
+			scenarios.indexing = await scenarioIndexing(plan.indexing);
 
-		scenarios.pragma_or_info = await scenarioPragmaOrInfo(plan.pragma, combo.db);
+			await resetBenchData();
+			scenarios.metadata_fetch = await scenarioMetadataFetch(plan.metadata, combo.db);
 
-		await resetBenchData();
-		scenarios.counting = await scenarioCounting(plan.counting, options.bulkSize);
+			scenarios.pragma_or_info = await scenarioPragmaOrInfo(plan.pragma, combo.db);
 
-		await resetBenchData();
-		scenarios.shard_fanout = await scenarioShardFanout(plan.fanout, options.bulkSize);
+			await resetBenchData();
+			scenarios.counting = await scenarioCounting(plan.counting, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.reassignment = await scenarioReassignment(plan.reassignment, config);
+			await resetBenchData();
+			scenarios.shard_fanout = await scenarioShardFanout(plan.fanout, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.mapping_miss = await scenarioMappingMiss(plan.basic);
+			await resetBenchData();
+			scenarios.reassignment = await scenarioReassignment(plan.reassignment, config);
 
-		await resetBenchData();
-		scenarios.next_id = await scenarioNextId(plan.basic);
+			await resetBenchData();
+			scenarios.mapping_miss = await scenarioMappingMiss(plan.basic);
 
-		await resetBenchData();
-		scenarios.paginate = await scenarioPaginate(plan.counting, options.bulkSize);
+			await resetBenchData();
+			scenarios.next_id = await scenarioNextId(plan.basic);
 
-		await resetBenchData();
-		scenarios.batch_write = await scenarioBatchWrite(plan.bulk, options.bulkSize);
+			await resetBenchData();
+			scenarios.paginate = await scenarioPaginate(plan.counting, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.cold_mapping_cache = await scenarioColdMappingCache(plan.basic, config);
+			await resetBenchData();
+			scenarios.batch_write = await scenarioBatchWrite(plan.bulk, options.bulkSize);
 
-		await resetBenchData();
-		scenarios.concurrent_load = await scenarioConcurrentLoad(plan.basic);
+			await resetBenchData();
+			scenarios.cold_mapping_cache = await scenarioColdMappingCache(plan.basic, config);
 
-		await resetBenchData();
-		phaseAttribution = await measurePhaseAttribution(config, Math.max(5, Math.floor(options.iterations / 2)));
+			await resetBenchData();
+			scenarios.concurrent_load = await scenarioConcurrentLoad(plan.basic);
+		}
 
-		await resetBenchData();
-		strategyBenchmark = await benchmarkStrategyBulkMatrix(combo.db, profile, options, kvRuntime.kv);
+		if (selected('journal_move')) {
+			await resetBenchData();
+			scenarios.journal_move = await scenarioJournalMove(combo.db, profile, kvRuntime.kv, plan.reassignment);
+			initialize(config);
+		}
+
+		if (selected('stale_route_write')) {
+			await resetBenchData();
+			scenarios.stale_route_write = await scenarioStaleRouteWrite(combo.db, profile, kvRuntime.kv, options.raceIterations);
+			initialize(config);
+		}
+
+		if (selected('kv_bulk_read')) {
+			scenarios.kv_bulk_read = await scenarioKvBulkRead(kvRuntime.kv, combo.kv, plan.basic);
+		}
+
+		if (selected('batch_rollback')) {
+			scenarios.batch_rollback = await scenarioBatchRollback(sqlRuntime.shards, plan.reassignment);
+		}
+
+		if (selected('topology_cas')) {
+			await resetBenchData();
+			scenarios.topology_cas = await scenarioTopologyCas(combo.db, profile, kvRuntime.kv, options.raceIterations);
+			initialize(config);
+		}
+
+		scenarios.als_overlap = createSkippedScenario('als_overlap', 'needs workerd; the cloudflare lane runs it');
+		scenarios.als_no_compat = createSkippedScenario('als_no_compat', 'needs workerd; the cloudflare lane runs it');
+
+		if (!options.only) {
+			await resetBenchData();
+			phaseAttribution = await measurePhaseAttribution(config, Math.max(5, Math.floor(options.iterations / 2)));
+
+			await resetBenchData();
+			strategyBenchmark = await benchmarkStrategyBulkMatrix(combo.db, profile, options, kvRuntime.kv);
+		}
 
 		const totalScenarios = Object.values(scenarios).length;
 		const failedScenarios = Object.values(scenarios).filter((scenario) => scenario.status === 'failed').length;
@@ -870,63 +990,96 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 		await assertOk(await fetch(cloudflareUrl('/init', profile), { method: 'POST' }), 'POST /init');
 
 		const plan = buildIterationPlan(Math.max(8, options.iterations));
+		const selected = (name: ScenarioName) => !options.only || options.only.includes(name);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.basic_crud = await scenarioCloudflareBasicCrud(Math.max(6, Math.floor(plan.basic / 2)), profile);
+		if (!options.only) {
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.basic_crud = await scenarioCloudflareBasicCrud(Math.max(6, Math.floor(plan.basic / 2)), profile);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.advanced_usage = await scenarioCloudflareAdvanced(Math.max(5, Math.floor(plan.advanced / 2)), profile);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.advanced_usage = await scenarioCloudflareAdvanced(Math.max(5, Math.floor(plan.advanced / 2)), profile);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.migration_mapping = await scenarioCloudflareMigration(
-			Math.max(4, Math.floor(plan.migration / 2)),
-			Math.max(12, Math.floor(options.bulkSize / 6)),
-			profile
-		);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.migration_mapping = await scenarioCloudflareMigration(
+				Math.max(4, Math.floor(plan.migration / 2)),
+				Math.max(12, Math.floor(options.bulkSize / 6)),
+				profile
+			);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.bulk_crud = await scenarioCloudflareBulk(
-			Math.max(3, Math.floor(plan.bulk / 2)),
-			Math.max(20, Math.floor(options.bulkSize / 4)),
-			profile
-		);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.bulk_crud = await scenarioCloudflareBulk(
+				Math.max(3, Math.floor(plan.bulk / 2)),
+				Math.max(20, Math.floor(options.bulkSize / 4)),
+				profile
+			);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.auto_increment = await scenarioCloudflareAutoIncrement(Math.max(4, Math.floor(plan.autoIncrement / 2)), profile);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.auto_increment = await scenarioCloudflareAutoIncrement(Math.max(4, Math.floor(plan.autoIncrement / 2)), profile);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.indexing = await scenarioCloudflareIndexing(
-			Math.max(4, Math.floor(plan.indexing / 2)),
-			Math.max(60, Math.floor(options.bulkSize * 0.75)),
-			profile
-		);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.indexing = await scenarioCloudflareIndexing(
+				Math.max(4, Math.floor(plan.indexing / 2)),
+				Math.max(60, Math.floor(options.bulkSize * 0.75)),
+				profile
+			);
 
-		scenarios.metadata_fetch = await scenarioCloudflareMetadata(Math.max(6, Math.floor(plan.metadata / 2)), profile);
-		scenarios.pragma_or_info = await scenarioCloudflarePragma(Math.max(6, Math.floor(plan.pragma / 2)), profile);
+			scenarios.metadata_fetch = await scenarioCloudflareMetadata(Math.max(6, Math.floor(plan.metadata / 2)), profile);
+			scenarios.pragma_or_info = await scenarioCloudflarePragma(Math.max(6, Math.floor(plan.pragma / 2)), profile);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.counting = await scenarioCloudflareCounting(
-			Math.max(6, Math.floor(plan.counting / 2)),
-			Math.max(30, Math.floor(options.bulkSize / 2)),
-			profile
-		);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.counting = await scenarioCloudflareCounting(
+				Math.max(6, Math.floor(plan.counting / 2)),
+				Math.max(30, Math.floor(options.bulkSize / 2)),
+				profile
+			);
 
-		scenarios.shard_fanout = await scenarioCloudflareFanout(Math.max(6, Math.floor(plan.fanout / 2)), profile);
+			scenarios.shard_fanout = await scenarioCloudflareFanout(Math.max(6, Math.floor(plan.fanout / 2)), profile);
 
-		// The only place the batch API runs against D1, which is the backend it
-		// exists for: D1 caps a Worker invocation at 1000 queries on the paid plan
-		// and 50 on the free one.
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.batch_write = await scenarioCloudflareBatchWrite(
-			Math.max(3, Math.floor(plan.bulk / 2)),
-			Math.max(40, Math.floor(options.bulkSize / 2)),
-			profile
-		);
+			// The only place the batch API runs against D1, which is the backend it
+			// exists for: D1 caps a Worker invocation at 1000 queries on the paid plan
+			// and 50 on the free one.
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.batch_write = await scenarioCloudflareBatchWrite(
+				Math.max(3, Math.floor(plan.bulk / 2)),
+				Math.max(40, Math.floor(options.bulkSize / 2)),
+				profile
+			);
 
-		await resetCloudflareBenchmarkData(profile);
-		scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
+			await resetCloudflareBenchmarkData(profile);
+			scenarios.reassignment = await scenarioCloudflareReassignment(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
+		}
 
-		strategyBenchmark = await benchmarkCloudflareStrategyBulkMatrix(options, profile);
+		if (selected('journal_move')) {
+			scenarios.journal_move = await scenarioCloudflareJournalMove(Math.max(4, Math.floor(plan.reassignment / 2)), profile);
+		}
+		if (selected('kv_bulk_read')) {
+			scenarios.kv_bulk_read = await scenarioCloudflareKvBulkRead(profile);
+		}
+		if (selected('batch_rollback')) {
+			scenarios.batch_rollback = await scenarioCloudflareBatchRollback(profile);
+		}
+		if (selected('als_overlap')) {
+			scenarios.als_overlap = await scenarioCloudflareAlsOverlap(profile);
+		}
+		if (selected('als_no_compat')) {
+			scenarios.als_no_compat = await scenarioCloudflareAlsNoCompat(profile);
+		}
+		if (selected('stale_route_write')) {
+			scenarios.stale_route_write = createSkippedScenario(
+				'stale_route_write',
+				'local D1 is one SQLite file behind workerd, so there is no second connection to race; the Docker lanes and the worker-thread race cover it'
+			);
+		}
+		if (selected('topology_cas')) {
+			scenarios.topology_cas = createSkippedScenario(
+				'topology_cas',
+				'local D1 is one SQLite file behind workerd, so the swap and the fence have no second connection to race; the Docker lanes cover them'
+			);
+		}
+
+		if (!options.only) {
+			strategyBenchmark = await benchmarkCloudflareStrategyBulkMatrix(options, profile);
+		}
 
 		const totalScenarios = Object.values(scenarios).length;
 		const failedScenarios = Object.values(scenarios).filter((scenario) => scenario.status === 'failed').length;
@@ -1834,6 +1987,1018 @@ async function scenarioReassignment(iterations: number, config: CollegeDBConfig)
 	});
 }
 
+// #region journal scenarios
+
+const RACE_TABLE = 'race_items';
+const RACE_SCHEMA = 'CREATE TABLE IF NOT EXISTS race_items (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255), qty BIGINT)';
+const LOCK_STATEMENT = /pg_advisory_xact_lock|collegedb_lock_stripes|SET TRANSACTION ISOLATION/;
+const RACE_WINDOWS = ['none', 'cutover', 'writer'] as const;
+const RACE_SEED = Number(process.env.COLLEGEDB_RACE_SEED ?? 20261024);
+
+type RaceKind = 'update' | 'delete' | 'insert' | 'upsert';
+type RaceWindow = (typeof RACE_WINDOWS)[number];
+
+interface RaceMode {
+	/** Which transaction is held open for a few milliseconds before it commits */
+	held: RaceWindow;
+	/** Strips the key lock from every batch, which is the protocol broken on purpose */
+	lockless: boolean;
+}
+
+interface JournalHarness {
+	close: () => Promise<void>;
+}
+
+interface RaceTally {
+	iterations: number;
+	moved: number;
+	aborted: number;
+	casMisses: number;
+	acked: number;
+	fenced: number;
+	duplicates: number;
+	zeroRows: number;
+	faults: number;
+	violations: string[];
+	orders: Record<string, number>;
+}
+
+function check(condition: unknown, message: string): asserts condition {
+	if (!condition) {
+		throw new Error(message);
+	}
+}
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = Math.imul(state ^ (state >>> 15), state | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+async function pause(ms: number): Promise<void> {
+	const end = performance.now() + ms;
+	while (performance.now() < end) {
+		await new Promise((done) => setImmediate(done));
+	}
+}
+
+/** Delegates to the real shard and rewrites the batches that matter to a race */
+function wrapRaceShard(inner: SQLDatabase, mode: RaceMode, dbFlavor: DatabaseFlavor): SQLDatabase {
+	const wrapped = Object.create(inner) as SQLDatabase;
+	if (!inner.runBatch) {
+		return wrapped;
+	}
+
+	const sleepSql = dbFlavor === 'postgres' ? 'SELECT pg_sleep(0.004)' : 'SELECT SLEEP(0.004)';
+	wrapped.runBatch = (async (statements: BatchStatement[]) => {
+		const kept = mode.lockless ? statements.filter((statement) => !LOCK_STATEMENT.test(statement.sql)) : statements;
+		const isCutover = kept.some((statement) => /^INSERT INTO\s+["`]?collegedb_retired/i.test(statement.sql));
+		// a fence raise is neither a writer nor a cutover, and holding it would only delay the commit the race looks for
+		const isRaise = kept.some((statement) => /^UPDATE\s+["`]?collegedb_topology/i.test(statement.sql));
+		const held = (mode.held === 'cutover' && isCutover) || (mode.held === 'writer' && !isCutover && !isRaise);
+		const results = await inner.runBatch!(held ? [...kept, { sql: sleepSql }] : kept);
+		const own = results.slice(0, kept.length);
+		return [...Array.from({ length: statements.length - kept.length }, () => own[0]!), ...own];
+	}) as SQLDatabase['runBatch'];
+
+	return wrapped;
+}
+
+async function openJournalHarness(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	kv: KVStorage,
+	mode: RaceMode
+): Promise<JournalHarness> {
+	const runtime = await createSQLRuntime(dbFlavor, createRunId(`journal_${dbFlavor}_${profile}`), profile, [
+		'shard-a',
+		'shard-b',
+		'shard-j'
+	]);
+	const shards = Object.fromEntries(Object.entries(runtime.shards).map(([name, db]) => [name, wrapRaceShard(db, mode, dbFlavor)]));
+
+	await initializeAsync({
+		kv,
+		shards,
+		strategy: 'hash',
+		journalShard: 'shard-j',
+		disableAutoMigration: true,
+		hashShardMappings: false,
+		mappingCacheTtlMs: 60_000
+	});
+	await createSchemaAcrossShards(shards, RACE_SCHEMA);
+
+	return {
+		close: async () => {
+			resetConfig();
+			await runtime.close();
+		}
+	};
+}
+
+function raceMapper(kv: KVStorage): KVShardMapper {
+	return new KVShardMapper(kv, { hashShardMappings: false });
+}
+
+async function seedRaceRow(mapper: KVShardMapper, key: string): Promise<void> {
+	await runShard('shard-a', `INSERT INTO ${RACE_TABLE} (id, name, qty) VALUES (?, ?, ?)`, [key, 'orig', 1]);
+	await mapper.setShardMapping(key, 'shard-a');
+	await invalidateMappingCache(key);
+}
+
+async function raceRows(binding: string, key: string): Promise<Array<{ id: string; name: string; qty: unknown }>> {
+	const result = await allShard<{ id: string; name: string; qty: unknown }>(
+		binding,
+		`SELECT id, name, qty FROM ${RACE_TABLE} WHERE id = ?`,
+		[key]
+	);
+	return result.results;
+}
+
+async function tombstoneCount(binding: string, key: string): Promise<number> {
+	const result = await allShard(binding, 'SELECT op_id FROM collegedb_retired WHERE primary_key = ?', [key]);
+	return result.results.length;
+}
+
+async function errorCode(work: Promise<unknown>): Promise<string> {
+	try {
+		await work;
+		return 'none';
+	} catch (error) {
+		return error instanceof CollegeDBError ? String(error.code) : `other:${error instanceof Error ? error.message : String(error)}`;
+	}
+}
+
+async function scenarioJournalMove(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	kv: KVStorage,
+	iterations: number
+): Promise<ScenarioStats> {
+	let harness: JournalHarness | null = null;
+
+	try {
+		harness = await openJournalHarness(dbFlavor, profile, kv, { held: 'none', lockless: false });
+		const mapper = raceMapper(kv);
+		const prefix = `jm_${Date.now()}`;
+		const mysqlFamily = dbFlavor === 'mysql' || dbFlavor === 'mariadb';
+
+		return await measureScenario('journal_move', iterations, async (i) => {
+			const key = `${prefix}_${i}`;
+			await seedRaceRow(mapper, key);
+			await reassignShard(key, 'shard-b', RACE_TABLE);
+
+			const onDestination = await raceRows('shard-b', key);
+			check(onDestination.length === 1 && onDestination[0]!.name === 'orig', 'moved row is not on the destination');
+			check((await raceRows('shard-a', key)).length === 0, 'source still holds the row');
+			check((await tombstoneCount('shard-a', key)) === 1, 'source has no tombstone');
+
+			const updated = await updateRow(key, RACE_TABLE, { name: 'after' }, { id: key });
+			check(updated.meta.changes === 1, `update after the move changed ${updated.meta.changes} rows`);
+
+			// MySQL and MariaDB count an upsert that changes an existing row as 2
+			const upserted = await upsert(key, RACE_TABLE, { id: key, name: 'upserted', qty: 2 }, 'id');
+			check(upserted.meta.changes === (mysqlFamily ? 2 : 1), `upsert over the moved row changed ${upserted.meta.changes} rows`);
+			const upsertedNew = `${key}_upsert`;
+			const upsertInserted = await upsert(upsertedNew, RACE_TABLE, { id: upsertedNew, name: 'fresh', qty: 4 }, 'id');
+			check(upsertInserted.meta.changes === 1, `upsert of a new key changed ${upsertInserted.meta.changes} rows`);
+
+			const fresh = `${key}_new`;
+			const inserted = await insertInto(fresh, RACE_TABLE, { id: fresh, name: 'new', qty: 9 });
+			check(inserted.meta.changes === 1, `guarded insert changed ${inserted.meta.changes} rows`);
+			const freshRow = await first<{ qty: unknown }>(fresh, `SELECT qty FROM ${RACE_TABLE} WHERE id = ?`, [fresh]);
+			check(Number(freshRow?.qty) === 9, 'guarded insert did not keep the 64-bit column value');
+
+			const readBack = await first<{ name: string }>(key, `SELECT name FROM ${RACE_TABLE} WHERE id = ?`, [key]);
+			check(readBack?.name === 'upserted', `read back ${readBack?.name}`);
+
+			// a caller still routing to the old shard must be refused
+			await mapper.setShardMapping(key, 'shard-a');
+			await invalidateMappingCache(key);
+			const staleUpdate = await errorCode(updateRow(key, RACE_TABLE, { name: 'stale' }, { id: key }));
+			const staleInsert = await errorCode(insertInto(key, RACE_TABLE, { id: key, name: 'ghost', qty: 1 }));
+			check(staleUpdate === 'MIGRATION_CUTOVER_PENDING', `stale update: ${staleUpdate}`);
+			check(staleInsert === 'MIGRATION_CUTOVER_PENDING', `stale insert: ${staleInsert}`);
+			check((await raceRows('shard-a', key)).length === 0, 'a stale write left a ghost on the source');
+
+			await mapper.setShardMapping(key, 'shard-b');
+			await invalidateMappingCache(key);
+		});
+	} catch (error) {
+		return {
+			name: 'journal_move',
+			status: 'failed',
+			iterations: 0,
+			samplesMs: [],
+			error: error instanceof Error ? error.message : String(error)
+		};
+	} finally {
+		if (harness) {
+			await safely(async () => harness?.close());
+		}
+	}
+}
+
+async function runRaceWriter(kind: RaceKind, key: string): Promise<{ acked: boolean; changes?: number; code?: string; message?: string }> {
+	try {
+		const result =
+			kind === 'update'
+				? await updateRow(key, RACE_TABLE, { name: 'W' }, { id: key })
+				: kind === 'delete'
+					? await deleteRow(key, RACE_TABLE, { id: key })
+					: kind === 'insert'
+						? await insertInto(key, RACE_TABLE, { id: key, name: 'I', qty: 5 })
+						: await upsert(key, RACE_TABLE, { id: key, name: 'U', qty: 3 }, 'id');
+		const changes = result.meta.changes;
+		return { acked: typeof changes === 'number' ? changes > 0 : true, changes };
+	} catch (error) {
+		return {
+			acked: false,
+			code: error instanceof CollegeDBError ? error.code : undefined,
+			// drizzle keeps the driver message in the cause
+			message: error instanceof Error ? `${error.message} ${(error.cause as Error | undefined)?.message ?? ''}` : String(error)
+		};
+	}
+}
+
+async function raceOnce(kind: RaceKind, key: string, mapper: KVShardMapper, random: () => number, tally: RaceTally): Promise<void> {
+	await seedRaceRow(mapper, key);
+
+	const pick = random();
+	const launchStep = pick < 0.35 ? 'verified' : pick < 0.9 ? 'cutover_pending' : 'cas';
+	const delayMs = random() ** 2 * 7;
+	tally.orders[`${launchStep}+${delayMs < 2 ? 'early' : delayMs < 5 ? 'mid' : 'late'}`] =
+		(tally.orders[`${launchStep}+${delayMs < 2 ? 'early' : delayMs < 5 ? 'mid' : 'late'}`] ?? 0) + 1;
+
+	let writer: Promise<Awaited<ReturnType<typeof runRaceWriter>>> | null = null;
+	setMigrationStepHook((step, info) => {
+		if (step === launchStep && info.key === key && !writer) {
+			writer = (async () => {
+				await pause(delayMs);
+				return await runRaceWriter(kind, key);
+			})();
+		}
+	});
+
+	let moveError: unknown = null;
+	try {
+		await reassignShard(key, 'shard-b', RACE_TABLE);
+	} catch (error) {
+		moveError = error;
+	} finally {
+		setMigrationStepHook(null);
+	}
+
+	const outcome = await (writer ?? runRaceWriter(kind, key));
+
+	const [rowsA, rowsB, tombA] = await Promise.all([raceRows('shard-a', key), raceRows('shard-b', key), tombstoneCount('shard-a', key)]);
+	const attempts = await allShard<{ attempts: unknown }>(
+		'shard-j',
+		'SELECT MAX(attempt) AS attempts FROM collegedb_migration_history WHERE primary_key = ?',
+		[key]
+	);
+	if (Number(attempts.results[0]?.attempts ?? 1) > 1) {
+		tally.casMisses++;
+	}
+
+	const fail = (message: string) => tally.violations.push(`${kind}/${launchStep}/${delayMs.toFixed(1)}ms/${key}: ${message}`);
+	const moved = moveError === null;
+	if (moved) {
+		tally.moved++;
+	} else if (moveError instanceof CollegeDBError && moveError.code === 'MIGRATION_ABORTED') {
+		tally.aborted++;
+	} else {
+		fail(`move failed: ${moveError instanceof Error ? moveError.message : String(moveError)}`);
+	}
+
+	if (outcome.acked) {
+		tally.acked++;
+	} else if (outcome.code === 'MIGRATION_CUTOVER_PENDING') {
+		tally.fenced++;
+	} else if (outcome.code === undefined && outcome.message === undefined) {
+		tally.zeroRows++;
+	} else if (kind === 'insert' && /duplicate|unique|1062|23505/i.test(outcome.message ?? '')) {
+		tally.duplicates++;
+	} else {
+		tally.faults++;
+		fail(`unexpected writer error: ${outcome.code ?? ''} ${outcome.message}`);
+	}
+
+	const owner = rowsB[0] ?? rowsA[0];
+	if (tombA > 0 && rowsA.length > 0) {
+		fail('ghost: a live row sits beside the tombstone');
+	}
+	if (rowsA.length > 0 && rowsB.length > 0) {
+		fail('two live copies');
+	}
+	if (moved && (tombA !== 1 || rowsA.length > 0)) {
+		fail(`moved but source holds ${rowsA.length} rows and ${tombA} tombstones`);
+	}
+	if (!moved && tombA > 0) {
+		fail('move did not complete but a tombstone exists');
+	}
+	if (!owner && !(kind === 'delete' && outcome.acked)) {
+		fail('row lost without an acknowledged delete');
+	}
+	if (outcome.changes === 0 && tombA === 0 && owner) {
+		fail('writer changed zero rows with no tombstone while the key exists');
+	}
+	if (kind === 'update' && outcome.acked && owner?.name !== 'W') {
+		fail(`acknowledged update is not on the owner (${owner?.name})`);
+	}
+	if (kind === 'upsert' && outcome.acked && owner?.name !== 'U') {
+		fail(`acknowledged upsert is not on the owner (${owner?.name})`);
+	}
+	if (kind === 'delete' && outcome.acked && owner) {
+		fail('acknowledged delete left a row');
+	}
+	if (kind === 'insert' && outcome.acked) {
+		fail('insert over an existing key was acknowledged');
+	}
+}
+
+async function runRaceArm(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	kv: KVStorage,
+	arm: 'protocol' | 'control',
+	kinds: RaceKind[],
+	perKind: number,
+	isolation: string | undefined
+): Promise<Record<RaceKind, RaceTally>> {
+	const mode: RaceMode = { held: 'none', lockless: arm === 'control' };
+	const previousIsolation = sandboxIsolation;
+	sandboxIsolation = isolation ?? previousIsolation;
+	let harness: JournalHarness;
+	try {
+		harness = await openJournalHarness(dbFlavor, profile, kv, mode);
+	} finally {
+		sandboxIsolation = previousIsolation;
+	}
+
+	try {
+		const mapper = raceMapper(kv);
+		const random = mulberry32(RACE_SEED + (arm === 'control' ? 1 : 0));
+		const prefix = `race_${arm}_${Date.now()}`;
+		const tallies = {} as Record<RaceKind, RaceTally>;
+
+		for (const kind of kinds) {
+			const tally: RaceTally = {
+				iterations: perKind,
+				moved: 0,
+				aborted: 0,
+				casMisses: 0,
+				acked: 0,
+				fenced: 0,
+				duplicates: 0,
+				zeroRows: 0,
+				faults: 0,
+				violations: [],
+				orders: {}
+			};
+			tallies[kind] = tally;
+
+			for (let i = 0; i < perKind; i++) {
+				mode.held = RACE_WINDOWS[i % RACE_WINDOWS.length]!;
+				await raceOnce(kind, `${prefix}_${kind}_${i}`, mapper, random, tally);
+			}
+		}
+
+		return tallies;
+	} finally {
+		await safely(async () => harness.close());
+	}
+}
+
+function describeTally(tally: RaceTally): string {
+	return `moved=${tally.moved} aborted=${tally.aborted} casMisses=${tally.casMisses} acked=${tally.acked} fenced=${tally.fenced} dup=${tally.duplicates} zero=${tally.zeroRows} faults=${tally.faults} violations=${tally.violations.length}`;
+}
+
+interface RaceArm {
+	label: string;
+	arm: 'protocol' | 'control';
+	/** Session isolation for the arm; undefined keeps the server default */
+	isolation?: string;
+	/** A control that must report violations for the run to prove anything */
+	required?: boolean;
+}
+
+/**
+ * MySQL and MariaDB default to REPEATABLE READ, where the `INSERT ... SELECT`
+ * guard reads current rows and the race does not show without the lock. Under
+ * READ COMMITTED it does, so that is the isolation the control must break at.
+ */
+function raceArmsFor(dbFlavor: DatabaseFlavor): RaceArm[] {
+	if (dbFlavor === 'postgres') {
+		return [
+			{ label: 'protocol', arm: 'protocol' },
+			{ label: 'control', arm: 'control', required: true }
+		];
+	}
+
+	return [
+		{ label: 'protocol@default', arm: 'protocol' },
+		{ label: 'protocol@read-committed', arm: 'protocol', isolation: 'READ COMMITTED' },
+		{ label: 'control@read-committed', arm: 'control', isolation: 'READ COMMITTED', required: true },
+		{ label: 'control@default', arm: 'control' }
+	];
+}
+
+async function scenarioStaleRouteWrite(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	kv: KVStorage,
+	perKind: number
+): Promise<ScenarioStats> {
+	if (dbFlavor === 'sqlite') {
+		return createSkippedScenario(
+			'stale_route_write',
+			'one connection per file means async writers interleave inside the cutover transaction; the worker-thread race in tests/migration-journal.spec.ts covers SQLite'
+		);
+	}
+
+	if (profile === 'per-statement-connection') {
+		return createSkippedScenario(
+			'stale_route_write',
+			'a Hyperdrive client is one connection and its gate runs a batch alone, so there is no second connection to race'
+		);
+	}
+
+	const kinds: RaceKind[] = ['update', 'delete', 'insert', 'upsert'];
+	const controlPerKind = Math.max(30, Math.ceil(perKind / 2));
+	const started = performance.now();
+
+	try {
+		const problems: string[] = [];
+		const lines: string[] = [];
+
+		for (const spec of raceArmsFor(dbFlavor)) {
+			const n = spec.arm === 'protocol' ? perKind : controlPerKind;
+			const tallies = await runRaceArm(dbFlavor, profile, kv, spec.arm, kinds, n, spec.isolation);
+
+			for (const kind of kinds) {
+				const tally = tallies[kind];
+				lines.push(`${spec.label} ${kind} n=${n}: ${describeTally(tally)}`);
+				console.log(`[Sandbox] stale_route_write ${dbFlavor}/${profile} ${spec.label} ${kind} n=${n}: ${describeTally(tally)}`);
+				if (spec.arm === 'protocol') {
+					console.log(`[Sandbox]   orders ${JSON.stringify(tally.orders)}`);
+					if (tally.violations.length > 0) {
+						problems.push(`${spec.label} ${kind}: ${tally.violations.length} violations, first: ${tally.violations[0]}`);
+					}
+				} else if (tally.violations.length > 0) {
+					console.log(`[Sandbox]   first violation: ${tally.violations[0]}`);
+				} else if (spec.required) {
+					problems.push(`${spec.label} ${kind}: the control arm reported no violation, so the checks are not shown able to see one`);
+				}
+			}
+		}
+
+		const elapsed = performance.now() - started;
+		return {
+			name: 'stale_route_write',
+			status: problems.length === 0 ? 'passed' : 'failed',
+			iterations: perKind * kinds.length,
+			samplesMs: [elapsed],
+			...calculateLatencyStats([elapsed]),
+			notes: lines.join(' | '),
+			error: problems.length === 0 ? undefined : problems.join('; ')
+		};
+	} catch (error) {
+		return {
+			name: 'stale_route_write',
+			status: 'failed',
+			iterations: 0,
+			samplesMs: [],
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+// #endregion
+
+// #region topology scenario
+
+const TOPO_TABLE = 'topo_items';
+const TOPO_SCHEMA = `CREATE TABLE IF NOT EXISTS ${TOPO_TABLE} (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255))`;
+const PLACEMENT_KV_KEYS = ['collegedb:placement:manifest', 'collegedb:placement:exceptions'];
+const FENCE_ORDERS = ['writer-first', 'fence-first', 'simultaneous', 'simultaneous'] as const;
+
+interface TopologyTally {
+	iterations: number;
+	landed: number;
+	rejected: number;
+	faults: number;
+	violations: string[];
+	orders: Record<string, number>;
+}
+
+const newTally = (iterations: number): TopologyTally => ({ iterations, landed: 0, rejected: 0, faults: 0, violations: [], orders: {} });
+
+const tallyLine = (tally: TopologyTally) =>
+	`landed=${tally.landed} rejected=${tally.rejected} faults=${tally.faults} violations=${tally.violations.length}`;
+
+async function runStatements(db: SQLDatabase, statements: string[]): Promise<void> {
+	for (const statement of statements) {
+		await db.prepare(statement).run();
+	}
+}
+
+/** Creates every topology table twice on one shard; the second pass proves the DDL is idempotent */
+async function createTopologyTables(db: SQLDatabase, journal: boolean): Promise<void> {
+	for (let pass = 0; pass < 2; pass++) {
+		await runStatements(db, buildShardSidecarSchema(db.dialect));
+		if (journal) {
+			await runStatements(db, buildJournalSchema(db.dialect));
+			await runStatements(db, buildManifestSchema(db.dialect));
+		}
+		await db.prepare(TOPO_SCHEMA).run();
+	}
+}
+
+/** Publishes the next epoch; every call adds one, so the epoch count counts the writes that survived */
+const nextEpoch = (current: ReturnType<typeof createManifest> | null) => {
+	const base = current ?? createManifest(['shard-a', 'shard-b'], 'hrw');
+	return { ...base, epochs: [{ n: base.epochs[0]!.n + 1, algorithm: 'hrw' as const, shards: ['shard-a', 'shard-b'] }, ...base.epochs] };
+};
+
+async function casRace(db: SQLDatabase, arm: 'protocol' | 'control', n: number, random: () => number): Promise<TopologyTally> {
+	const tally = newTally(n);
+	const prefix = `cas_${arm}_${Date.now()}`;
+
+	for (let i = 0; i < n; i++) {
+		const journal = { db, scope: `${prefix}_${i}` };
+		const racers = i % 2 === 0 ? 2 : 4;
+		const fail = (message: string) => tally.violations.push(`${arm}/${i}/${racers} racers: ${message}`);
+
+		try {
+			let revisions: number[] = [];
+
+			if (arm === 'protocol') {
+				const results = await Promise.all(
+					Array.from({ length: racers }, async () => {
+						await pause(random() * 2);
+						return await commitJournalManifest(journal, nextEpoch);
+					})
+				);
+				revisions = results.map((result) => result.revision).sort((a, b) => a - b);
+				if (results.some((result) => !result.changed)) {
+					fail('a publisher returned without writing');
+				}
+			} else {
+				// the same read-modify-write with the revision check removed
+				await commitJournalManifest(journal, (current) => current ?? createManifest(['shard-a', 'shard-b'], 'hrw'));
+				await Promise.all(
+					Array.from({ length: racers }, async () => {
+						const loaded = (await loadJournalManifest(journal))!;
+						await pause(random() * 3);
+						const next = nextEpoch(loaded.manifest);
+						await db
+							.prepare('UPDATE collegedb_manifest SET revision = revision + 1, generation = ?, body = ? WHERE scope = ?')
+							.bind(next.epochs[0]!.n, JSON.stringify(next), journal.scope)
+							.run();
+					})
+				);
+			}
+
+			const stored = (await loadJournalManifest(journal))!;
+			const numbers = stored.manifest.epochs.map((epoch) => epoch.n);
+			const expected = Array.from({ length: racers + 1 }, (_, k) => racers + 1 - k);
+
+			if (JSON.stringify(numbers) !== JSON.stringify(expected)) {
+				fail(`stored epochs ${numbers.join(',')}, expected ${expected.join(',')}`);
+			} else if (stored.revision !== (arm === 'protocol' ? racers : racers + 1) || stored.generation !== racers + 1) {
+				fail(`stored revision ${stored.revision} and generation ${stored.generation} after ${racers} publishes`);
+			} else if (arm === 'protocol' && JSON.stringify(revisions) !== JSON.stringify(Array.from({ length: racers }, (_, k) => k + 1))) {
+				fail(`publishers saw revisions ${revisions.join(',')}, not one winner per revision`);
+			} else {
+				tally.landed++;
+			}
+		} catch (error) {
+			tally.faults++;
+			fail(`error ${error instanceof CollegeDBError ? error.code : ''} ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	return tally;
+}
+
+/**
+ * A writer on an older generation against the fence raise and the census that
+ * follows it. A row that exists although the census read none for its key is a
+ * violation: `pruneEpochs` would count that key as absent.
+ */
+async function fenceRace(
+	shard: SQLDatabase,
+	arm: 'protocol' | 'control',
+	n: number,
+	random: () => number,
+	mode: RaceMode,
+	startAt: number
+): Promise<TopologyTally> {
+	const tally = newTally(n);
+	const prefix = `fence_${arm}_${Date.now()}`;
+
+	for (let i = 0; i < n; i++) {
+		const key = `${prefix}_${i}`;
+		const generation = startAt + i;
+		const order = FENCE_ORDERS[Math.floor(random() * FENCE_ORDERS.length)]!;
+		tally.orders[order] = (tally.orders[order] ?? 0) + 1;
+		mode.held = i % 3 === 2 ? 'writer' : 'none';
+
+		const guard = { scope: 'default', table: TOPO_TABLE, key, generation };
+		const values = { id: key, name: 'W' };
+		const query =
+			arm === 'control'
+				? buildInsert(TOPO_TABLE, values, { dialect: shard.dialect })
+				: buildGuardedInsert(TOPO_TABLE, values, guard, { dialect: shard.dialect });
+
+		const write = async () => {
+			try {
+				const result =
+					arm === 'control'
+						? await shard
+								.prepare(query.sql)
+								.bind(...query.bindings)
+								.run()
+						: await runGuardedWrite(shard, guard, query);
+				return { changes: result.meta.changes as number | undefined };
+			} catch (error) {
+				return { error: error instanceof Error ? error.message : String(error) };
+			}
+		};
+
+		let seen = -1;
+		const fence = async () => {
+			await raiseFence(shard, generation + 1);
+			const row = await shard.prepare(`SELECT COUNT(*) AS n FROM ${TOPO_TABLE} WHERE id = ?`).bind(key).first<{ n: unknown }>();
+			seen = Number(row?.n);
+		};
+
+		let outcome: { changes?: number; error?: string };
+		if (order === 'writer-first') {
+			outcome = await write();
+			await fence();
+		} else if (order === 'fence-first') {
+			await fence();
+			outcome = await write();
+		} else {
+			await pause(0);
+			const delay = random() * 4;
+			[outcome] = await Promise.all([write(), pause(delay).then(fence)]);
+		}
+
+		if (outcome.error !== undefined) {
+			tally.faults++;
+			tally.violations.push(`${arm}/${order}/${key}: writer error ${outcome.error}`);
+			continue;
+		}
+
+		const exists =
+			Number((await shard.prepare(`SELECT COUNT(*) AS n FROM ${TOPO_TABLE} WHERE id = ?`).bind(key).first<{ n: unknown }>())?.n) > 0;
+		const acked = (outcome.changes ?? 0) > 0;
+		if (acked) {
+			tally.landed++;
+		} else {
+			tally.rejected++;
+		}
+		if (exists && seen === 0) {
+			tally.violations.push(`${arm}/${order}/${key}: row landed after the census read none`);
+		}
+		if (acked !== exists) {
+			tally.violations.push(
+				`${arm}/${order}/${key}: writer reported ${outcome.changes} changes but the row ${exists ? 'exists' : 'is missing'}`
+			);
+		}
+	}
+
+	return tally;
+}
+
+interface FenceArm {
+	label: string;
+	/** `lockless` runs the protocol statements with every lock statement stripped, which is the lock broken on purpose */
+	arm: 'protocol' | 'lockless' | 'control';
+	isolation?: string;
+	/** A control that must report violations for the run to prove anything */
+	required?: boolean;
+}
+
+/** As in the stale-route race, MySQL and MariaDB only break without the lock under READ COMMITTED */
+function fenceArmsFor(dbFlavor: DatabaseFlavor): FenceArm[] {
+	if (dbFlavor === 'sqlite') {
+		return [
+			{ label: 'protocol', arm: 'protocol' },
+			{ label: 'control (no fence)', arm: 'control', required: true }
+		];
+	}
+
+	if (dbFlavor === 'postgres') {
+		return [
+			{ label: 'protocol', arm: 'protocol' },
+			{ label: 'control (no fence lock)', arm: 'lockless', required: true },
+			{ label: 'control (no fence)', arm: 'control', required: true }
+		];
+	}
+
+	return [
+		{ label: 'protocol@default', arm: 'protocol' },
+		{ label: 'protocol@read-committed', arm: 'protocol', isolation: 'READ COMMITTED' },
+		{ label: 'control (no fence lock)@read-committed', arm: 'lockless', isolation: 'READ COMMITTED', required: true },
+		{ label: 'control (no fence)@default', arm: 'control', required: true }
+	];
+}
+
+/** Runs one fence arm on a fresh one-shard database, so a raised fence never leaks into another arm */
+async function fenceArm(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	spec: FenceArm,
+	n: number,
+	random: () => number
+): Promise<TopologyTally> {
+	const previousIsolation = sandboxIsolation;
+	sandboxIsolation = spec.isolation ?? previousIsolation;
+	let runtime: SQLRuntime;
+	try {
+		runtime = await createSQLRuntime(dbFlavor, createRunId(`fence_${dbFlavor}_${profile}`), profile, ['shard-f']);
+	} finally {
+		sandboxIsolation = previousIsolation;
+	}
+
+	try {
+		const mode: RaceMode = { held: 'none', lockless: spec.arm === 'lockless' };
+		const inner = runtime.shards['shard-f']!;
+		await createTopologyTables(inner, false);
+		const shard = dbFlavor === 'sqlite' ? inner : wrapRaceShard(inner, mode, dbFlavor);
+		return await fenceRace(shard, spec.arm === 'control' ? 'control' : 'protocol', n, random, mode, 1);
+	} finally {
+		await safely(async () => runtime.close());
+	}
+}
+
+async function scenarioTopologyCas(
+	dbFlavor: DatabaseFlavor,
+	profile: AdapterProfile,
+	kv: KVStorage,
+	perKind: number
+): Promise<ScenarioStats> {
+	const started = performance.now();
+	// shard-f takes the fence races, whose raised fence would turn away the prune check's writers
+	const names = ['shard-a', 'shard-b', 'shard-j'];
+	const lines: string[] = [];
+	const problems: string[] = [];
+	let runtime: SQLRuntime | null = null;
+
+	const record = (label: string, tally: TopologyTally, required: 'zero' | 'some' | 'none') => {
+		const line = `${label} n=${tally.iterations}: ${tallyLine(tally)}`;
+		lines.push(line);
+		console.log(`[Sandbox] topology_cas ${dbFlavor}/${profile} ${line}`);
+		if (tally.violations.length > 0) {
+			console.log(`[Sandbox]   first violation: ${tally.violations[0]}`);
+		}
+		if (required === 'zero' && tally.violations.length > 0) {
+			problems.push(`${label}: ${tally.violations.length} violations, first: ${tally.violations[0]}`);
+		} else if (required === 'some' && tally.violations.length === 0) {
+			problems.push(`${label}: the control arm reported no violation, so the check is not shown able to see one`);
+		}
+	};
+
+	try {
+		runtime = await createSQLRuntime(dbFlavor, createRunId(`topology_${dbFlavor}_${profile}`), profile, names);
+		const raw = runtime.shards;
+		const journalDb = raw['shard-j']!;
+		for (const [name, db] of Object.entries(raw)) {
+			await createTopologyTables(db, name === 'shard-j');
+		}
+		lines.push('ddl created twice on every shard');
+
+		const random = mulberry32(RACE_SEED + 7);
+		record('cas protocol', await casRace(journalDb, 'protocol', perKind, random), 'zero');
+		record('cas control (no revision check)', await casRace(journalDb, 'control', Math.max(30, Math.ceil(perKind / 2)), random), 'some');
+
+		const controlN = Math.max(30, Math.ceil(perKind / 2));
+		for (const spec of fenceArmsFor(dbFlavor)) {
+			const n = spec.arm === 'protocol' ? perKind : controlN;
+			// a single-connection Hyperdrive client has nothing to race, so its controls cannot fire
+			const mustFire = spec.required && profile !== 'per-statement-connection';
+			record(
+				`fence ${spec.label}`,
+				await fenceArm(dbFlavor, profile, spec, n, random),
+				spec.arm === 'protocol' ? 'zero' : mustFire ? 'some' : 'none'
+			);
+		}
+
+		lines.push(await pruneEndToEnd(raw, kv));
+	} catch (error) {
+		problems.push(error instanceof Error ? error.message : String(error));
+	} finally {
+		resetConfig();
+		resetPlacementState();
+		await safely(async () => void (await Promise.all(PLACEMENT_KV_KEYS.map((key) => kv.delete(key)))));
+		if (runtime) {
+			await safely(async () => runtime?.close());
+		}
+	}
+
+	const elapsed = performance.now() - started;
+	return {
+		name: 'topology_cas',
+		status: problems.length === 0 ? 'passed' : 'failed',
+		iterations: perKind * 2,
+		samplesMs: [elapsed],
+		...calculateLatencyStats([elapsed]),
+		notes: lines.join(' | '),
+		error: problems.length === 0 ? undefined : problems.join('; ')
+	};
+}
+
+/** pruneEpochs on a real engine: dry run, a real run that must keep a needed epoch, then a real removal */
+async function pruneEndToEnd(shards: Record<string, SQLDatabase>, kv: KVStorage): Promise<string> {
+	const two = ['shard-a', 'shard-b'];
+	const three = ['shard-a', 'shard-b', 'shard-j'];
+	const boot = async (names: string[]) => {
+		resetConfig();
+		resetPlacementState();
+		await initializeAsync({
+			kv,
+			shards: Object.fromEntries(names.map((name) => [name, shards[name]!])),
+			strategy: 'hash',
+			placement: 'computed',
+			journalShard: 'shard-a',
+			disableAutoMigration: true,
+			hashShardMappings: false
+		});
+		await first('warm', `SELECT * FROM ${TOPO_TABLE} WHERE id = ?`, ['warm']);
+	};
+	const fences = async () => Promise.all(three.map((name) => readFence(shards[name]!)));
+
+	await Promise.all(PLACEMENT_KV_KEYS.map((key) => kv.delete(key)));
+	await boot(two);
+	const keys = Array.from({ length: 40 }, (_, i) => `prune_${Date.now()}_${i}`);
+	for (const key of keys) {
+		await insertInto(key, TOPO_TABLE, { id: key, name: key });
+	}
+
+	await boot(three);
+	const relocated = keys.filter((key) => hrwShard(key, three) !== hrwShard(key, two));
+	check(relocated.length > 0 && relocated.length < keys.length, `${relocated.length} of ${keys.length} keys relocated`);
+
+	const dry = await pruneEpochs({ tables: [TOPO_TABLE], dryRun: true });
+	check(dry.removed.length === 0 && dry.retained.join() === '2,1', `dry run removed ${dry.removed} and kept ${dry.retained}`);
+	check(
+		dry.dependents[1] === relocated.length && dry.scanned === keys.length,
+		`dry run counted ${JSON.stringify(dry.dependents)} over ${dry.scanned} rows`
+	);
+	check(
+		(await fences()).every((fence) => fence === 0),
+		'a dry run raised a fence'
+	);
+
+	const kept = await pruneEpochs({ tables: [TOPO_TABLE], pageSize: 7 });
+	check(kept.removed.length === 0 && kept.retained.join() === '2,1', `a needed epoch was removed: ${kept.removed}`);
+	check(
+		(await fences()).every((fence) => fence === 2),
+		`fences after the real run: ${await fences()}`
+	);
+
+	for (const key of keys) {
+		const row = await first<{ name: string }>(key, `SELECT name FROM ${TOPO_TABLE} WHERE id = ?`, [key]);
+		check(row?.name === key, `${key} did not resolve before the prune`);
+	}
+	const done = await pruneEpochs({ tables: [TOPO_TABLE], pageSize: 7 });
+	check(done.removed.join() === '1' && done.retained.join() === '2' && done.dependents[1] === 0, `prune report ${JSON.stringify(done)}`);
+
+	const stored = await loadJournalManifest({ db: shards['shard-a']!, scope: 'default' });
+	check(stored?.manifest.epochs.map((epoch) => epoch.n).join() === '2', `stored epochs ${stored?.manifest.epochs.map((epoch) => epoch.n)}`);
+
+	invalidateMappingCache();
+	for (const key of keys) {
+		const row = await first<{ name: string }>(key, `SELECT name FROM ${TOPO_TABLE} WHERE id = ?`, [key]);
+		check(row?.name === key, `${key} did not resolve after the prune`);
+	}
+
+	const stale = buildGuardedInsert(
+		TOPO_TABLE,
+		{ id: 'stale', name: 'S' },
+		{ scope: 'default', table: TOPO_TABLE, key: 'stale', generation: 1 },
+		{ dialect: shards['shard-a']!.dialect }
+	);
+	const staleResult = await runGuardedWrite(
+		shards['shard-a']!,
+		{ scope: 'default', table: TOPO_TABLE, key: 'stale', generation: 1 },
+		stale
+	);
+	check(staleResult.meta.changes === 0, `a generation 1 writer changed ${staleResult.meta.changes} rows after the fence`);
+
+	return `prune: ${keys.length} rows, ${relocated.length} relocated, dry run counted ${relocated.length} on epoch 1, epoch 1 removed, every key resolved before and after, stale writer fenced`;
+}
+
+// #endregion
+
+// #region kv and batch scenarios
+
+const BULK_READ_KEYS = 100;
+
+async function scenarioKvBulkRead(kv: KVStorage, kvFlavor: KVFlavor, iterations: number): Promise<ScenarioStats> {
+	const getMany = kv.getMany?.bind(kv);
+	if (!getMany || !kv.putMany) {
+		return createSkippedScenario('kv_bulk_read', `${kvFlavor} adapter has no getMany`);
+	}
+
+	const prefix = `kvbulk:${Date.now()}:`;
+	const keys = Array.from({ length: BULK_READ_KEYS }, (_, i) => `${prefix}${i}`);
+	const present = keys.filter((_, i) => i % 10 !== 0);
+
+	try {
+		await kv.putMany(present.map((key) => ({ key, value: JSON.stringify({ key }) })));
+
+		const verify = async () => {
+			const text = await getMany(keys, 'text');
+			check(text.length === BULK_READ_KEYS, `getMany returned ${text.length} values`);
+			for (const [i, value] of text.entries()) {
+				check(value === (i % 10 === 0 ? null : JSON.stringify({ key: keys[i] })), `getMany value ${i} is ${value}`);
+			}
+			const json = await getMany<{ key: string }>(keys, 'json');
+			check(json[1]?.key === keys[1] && json[0] === null, 'getMany json mode lost order or nulls');
+		};
+
+		const singles = await Promise.all(keys.map((key) => kv.get(key, 'text')));
+		check(
+			singles.every((value, i) => value === (i % 10 === 0 ? null : JSON.stringify({ key: keys[i] }))),
+			'single gets disagree with the seed'
+		);
+
+		const stats = await measureScenario('kv_bulk_read', iterations, async () => {
+			await verify();
+		});
+
+		const timedSingles: number[] = [];
+		for (let i = 0; i < 5; i++) {
+			timedSingles.push(await measureLatencySample(async () => void (await Promise.all(keys.map((key) => kv.get(key, 'text'))))));
+		}
+		const singlesP50 = [...timedSingles].sort((a, b) => a - b)[2]!;
+		return { ...stats, notes: `getMany p50 ${formatMs(stats.p50Ms)} against ${formatMs(singlesP50)} for ${BULK_READ_KEYS} parallel gets` };
+	} catch (error) {
+		return {
+			name: 'kv_bulk_read',
+			status: 'failed',
+			iterations: 0,
+			samplesMs: [],
+			error: error instanceof Error ? error.message : String(error)
+		};
+	} finally {
+		await safely(async () => {
+			for (const key of present) {
+				await kv.delete(key);
+			}
+		});
+	}
+}
+
+async function scenarioBatchRollback(shards: Record<string, SQLDatabase>, iterations: number): Promise<ScenarioStats> {
+	const db = shards['shard-a']!;
+	if (!db.runBatch) {
+		return createSkippedScenario('batch_rollback', 'this adapter runs a batch one statement at a time, with no transaction to roll back');
+	}
+
+	const insert = 'INSERT INTO probe_rollback (id, v) VALUES (?, ?)';
+	await db.prepare('CREATE TABLE IF NOT EXISTS probe_rollback (id VARCHAR(191) PRIMARY KEY, v BIGINT)').run();
+
+	try {
+		const stats = await measureScenario('batch_rollback', iterations, async (i) => {
+			await db.prepare('DELETE FROM probe_rollback').run();
+
+			// the third statement repeats the first key, so it fails after two good ones
+			let threw = false;
+			try {
+				await db.runBatch!([
+					{ sql: insert, bindings: [`a${i}`, 1] },
+					{ sql: insert, bindings: [`b${i}`, 2] },
+					{ sql: insert, bindings: [`a${i}`, 3] }
+				]);
+			} catch {
+				threw = true;
+			}
+			check(threw, 'a batch with a duplicate key did not fail');
+
+			const left = Number((await db.prepare('SELECT COUNT(*) AS n FROM probe_rollback').first<{ n: unknown }>())?.n);
+			// the declaration and the proof must agree, so an adapter cannot claim or hide the capability
+			check(left === 0 || db.atomicBatch !== true, `atomicBatch is declared but ${left} rows survived a failed batch`);
+			check(left !== 0 || db.atomicBatch === true, 'a failed batch rolled back whole but the adapter does not declare atomicBatch');
+		});
+
+		return { ...stats, notes: `atomicBatch ${db.atomicBatch === true ? 'declared and proven' : 'not declared'}` };
+	} finally {
+		await safely(async () => void (await db.prepare('DROP TABLE IF EXISTS probe_rollback').run()));
+	}
+}
+
+// #endregion
+
 function cloudflareUrl(path: string, profile: AdapterProfile): string {
 	const separator = path.includes('?') ? '&' : '?';
 	return `http://127.0.0.1:8787${path}${separator}profile=${encodeURIComponent(profile)}`;
@@ -2050,6 +3215,219 @@ async function scenarioCloudflareReassignment(iterations: number, profile: Adapt
 	});
 }
 
+/** Cloudflare lane results are local workerd D1 and KV, which prove correctness and say nothing about production D1 or KV */
+async function scenarioCloudflareJournalMove(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
+	if (profile !== 'native' && profile !== 'hyperdrive') {
+		return createSkippedScenario('journal_move', `the ${profile} profile has no transactional batch on every shard`);
+	}
+
+	return measureScenario('journal_move', iterations, async (i) => {
+		const response = await fetch(cloudflareUrl('/api/benchmark/journal-move', profile), {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ id: `cf-journal-${Date.now()}-${i}` }),
+			signal: AbortSignal.timeout(120_000)
+		});
+		const body = (await response.json()) as { success?: boolean; refusals?: string[]; error?: string };
+		if (!response.ok || !body.success) {
+			throw new Error(`${profile} journal move on local workerd failed: ${body.error ?? JSON.stringify(body)}`);
+		}
+	});
+}
+
+async function scenarioCloudflareKvBulkRead(profile: AdapterProfile): Promise<ScenarioStats> {
+	return measureScenario('kv_bulk_read', 3, async (i) => {
+		const response = await postCloudflareBenchmark('/api/benchmark/kv-bulk-read', { prefix: `cf-kv-${Date.now()}-${i}:` }, profile);
+		const body = (await response.json()) as { success?: boolean; single?: boolean; chunked?: boolean };
+		if (!body.success) {
+			throw new Error(`Workers KV getMany returned a wrong value (100 keys: ${body.single}, 250 keys: ${body.chunked})`);
+		}
+	});
+}
+
+async function scenarioCloudflareBatchRollback(profile: AdapterProfile): Promise<ScenarioStats> {
+	return measureScenario('batch_rollback', 3, async () => {
+		const response = await postCloudflareBenchmark('/api/probe/failing-batch', {}, profile);
+		const body = (await response.json()) as {
+			success?: boolean;
+			raw?: { threw: boolean; rowsAfter: number };
+			adapter?: { threw: boolean; rowsAfter: number };
+		};
+		if (!body.success) {
+			throw new Error(`local workerd D1 failing batch: ${JSON.stringify(body)}`);
+		}
+	});
+}
+
+interface AlsProbeReport {
+	asyncContextAvailable: boolean;
+	hasGetBuiltinModule: string;
+	callbacks?: number;
+	checkpoints?: number;
+	crossTalk?: number;
+	rejected?: number;
+	configMismatches?: number;
+	misplacedRows?: number;
+	missingRows?: number;
+	rejectedOk?: number;
+	rejectedWrong?: number;
+	sameConfigOk?: number;
+	sameConfigFailed?: number;
+	afterOk?: number;
+	afterFailed?: number;
+	refusedWrites?: number;
+	firstError?: string | null;
+}
+
+async function postAlsProbe(baseUrl: string, mode: string): Promise<AlsProbeReport> {
+	const response = await fetch(`${baseUrl}/api/probe/als`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ mode, iterations: ALS_PROBE_ITERATIONS }),
+		// a hung dev server fails the scenario instead of the whole lane
+		signal: AbortSignal.timeout(240_000)
+	});
+	await assertOk(response, `POST /api/probe/als (${mode})`);
+	return (await response.json()) as AlsProbeReport;
+}
+
+function alsArmSummary(label: string, report: AlsProbeReport): string {
+	return `${label}: ${report.callbacks} callbacks, ${report.checkpoints ?? 0} config reads, ${report.crossTalk} cross-talk`;
+}
+
+/** Local workerd with nodejs_compat; says nothing about production Workers */
+async function scenarioCloudflareAlsOverlap(profile: AdapterProfile): Promise<ScenarioStats> {
+	if (profile !== 'native') {
+		return createSkippedScenario(
+			'als_overlap',
+			'the probe builds its own configurations from the D1 bindings, so the native profile covers it'
+		);
+	}
+
+	try {
+		const base = 'http://127.0.0.1:8787';
+		const scoped = await postAlsProbe(base, 'scoped');
+		const client = await postAlsProbe(base, 'client');
+		const control = await postAlsProbe(base, 'unscoped');
+
+		check(scoped.hasGetBuiltinModule === 'function', `process.getBuiltinModule is ${scoped.hasGetBuiltinModule} under nodejs_compat`);
+		check(scoped.asyncContextAvailable, 'asyncContextAvailable() is false under nodejs_compat');
+		check(scoped.crossTalk === 0, `collegedb callbacks crossed over: ${JSON.stringify(scoped)}`);
+		check(client.crossTalk === 0, `createClient clusters crossed over: ${JSON.stringify(client)}`);
+		check(
+			(control.crossTalk ?? 0) > 0,
+			'the control arm (initialize twice) showed no cross-talk, so this probe cannot detect the defect it checks for'
+		);
+
+		return {
+			name: 'als_overlap',
+			status: 'passed',
+			iterations: ALS_PROBE_ITERATIONS,
+			samplesMs: [],
+			notes: `asyncContextAvailable=true; ${alsArmSummary('scoped', scoped)}; ${alsArmSummary('createClient', client)}; control (initialize twice) ${control.crossTalk} cross-talk in ${control.callbacks} callbacks`
+		};
+	} catch (error) {
+		return {
+			name: 'als_overlap',
+			status: 'failed',
+			iterations: ALS_PROBE_ITERATIONS,
+			samplesMs: [],
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+/**
+ * Runs the same probe on a second Worker built without nodejs_compat. It has
+ * its own entry because the sandbox Worker imports `pg`, which cannot bundle
+ * without the flag, and its own state directory so two dev servers never share
+ * a SQLite file.
+ */
+async function scenarioCloudflareAlsNoCompat(profile: AdapterProfile): Promise<ScenarioStats> {
+	if (profile !== 'native') {
+		return createSkippedScenario(
+			'als_no_compat',
+			'the probe builds its own configurations from the D1 bindings, so the native profile covers it'
+		);
+	}
+
+	const proc = Bun.spawn(
+		[
+			WRANGLER_BIN,
+			'dev',
+			'--config',
+			WRANGLER_NO_COMPAT_CONFIG,
+			'--port',
+			'8788',
+			'--inspector-port',
+			'9330',
+			'--ip',
+			'127.0.0.1',
+			'--local',
+			'--persist-to',
+			resolve(TMP_DIR, 'als-no-compat-state'),
+			'--log-level',
+			'error'
+		],
+		{ cwd: PROJECT_ROOT, stdout: 'pipe', stderr: 'pipe' }
+	);
+	const stdoutPromise = new Response(proc.stdout).text();
+	const stderrPromise = new Response(proc.stderr).text();
+
+	try {
+		await waitForHttp(`${NO_COMPAT_URL}/health`, 90_000);
+
+		const refusal = await postAlsProbe(NO_COMPAT_URL, 'reject');
+		const client = await postAlsProbe(NO_COMPAT_URL, 'client');
+		const control = await postAlsProbe(NO_COMPAT_URL, 'unscoped');
+		const n = ALS_PROBE_ITERATIONS;
+
+		check(!refusal.asyncContextAvailable, 'asyncContextAvailable() is true without nodejs_compat');
+		check(
+			refusal.refusedWrites === 0 && refusal.misplacedRows === 0 && refusal.missingRows === 0,
+			`refusal arm wrote rows wrongly: ${JSON.stringify(refusal)}`
+		);
+		check(
+			refusal.rejectedOk === n && refusal.rejectedWrong === 0,
+			`a different configuration was not refused with CONCURRENT_CONFIG ${refusal.rejectedWrong} of ${n} times: ${refusal.firstError}`
+		);
+		check(
+			refusal.sameConfigOk === n && refusal.sameConfigFailed === 0,
+			`the same configuration did not overlap cleanly: ${refusal.firstError}`
+		);
+		check(
+			refusal.afterOk === n && refusal.afterFailed === 0,
+			`the claim did not clear after the callbacks finished: ${refusal.firstError}`
+		);
+		check(client.crossTalk === 0, `createClient clusters crossed over without nodejs_compat: ${JSON.stringify(client)}`);
+		check(
+			(control.crossTalk ?? 0) > 0,
+			'the control arm (initialize twice) showed no cross-talk, so this probe cannot detect the defect it checks for'
+		);
+
+		return {
+			name: 'als_no_compat',
+			status: 'passed',
+			iterations: n,
+			samplesMs: [],
+			notes: `asyncContextAvailable=false; ${n} different-config overlaps refused with CONCURRENT_CONFIG, ${refusal.sameConfigOk} same-config overlaps ran, ${refusal.afterOk} callbacks ran after the claim cleared; ${alsArmSummary('createClient', client)}; control (initialize twice) ${control.crossTalk} cross-talk in ${control.callbacks} callbacks`
+		};
+	} catch (error) {
+		await terminateProcess(proc);
+		const stderr = await readCapturedOutput(stderrPromise);
+		const stdout = await readCapturedOutput(stdoutPromise);
+		return {
+			name: 'als_no_compat',
+			status: 'failed',
+			iterations: ALS_PROBE_ITERATIONS,
+			samplesMs: [],
+			error: `${error instanceof Error ? error.message : String(error)} ${trimForReport(stderr || stdout, 1500)}`.trim()
+		};
+	} finally {
+		await terminateProcess(proc);
+	}
+}
+
 async function resetCloudflareBenchmarkData(profile: AdapterProfile): Promise<void> {
 	await assertOk(await fetch(cloudflareUrl('/api/benchmark/reset', profile), { method: 'POST' }), 'POST /api/benchmark/reset');
 }
@@ -2058,7 +3436,9 @@ async function postCloudflareBenchmark(path: string, payload: Record<string, unk
 	const response = await fetch(cloudflareUrl(path, profile), {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(payload)
+		body: JSON.stringify(payload),
+		// a hung dev server fails the scenario instead of the whole lane
+		signal: AbortSignal.timeout(120_000)
 	});
 	await assertOk(response, `POST ${path}`);
 	return response;
@@ -2079,6 +3459,11 @@ const PORTS = {
 	redis: Number(process.env.COLLEGEDB_REDIS_PORT ?? 6379),
 	valkey: Number(process.env.COLLEGEDB_VALKEY_PORT ?? 6380)
 } as const;
+
+/** Session isolation level for the Postgres and MySQL pools, for example `READ COMMITTED`; unset keeps the server default */
+let sandboxIsolation = /^[A-Z ]+$/.test(process.env.COLLEGEDB_SANDBOX_ISOLATION ?? '')
+	? process.env.COLLEGEDB_SANDBOX_ISOLATION
+	: undefined;
 
 async function createKVRuntime(kvFlavor: KVFlavor, profile: AdapterProfile): Promise<KVRuntime> {
 	const url = kvFlavor === 'valkey' ? `redis://127.0.0.1:${PORTS.valkey}` : `redis://127.0.0.1:${PORTS.redis}`;
@@ -2130,6 +3515,13 @@ async function createSQLRuntime(
 	}
 }
 
+/** A Hyperdrive provider keeps its client open until disposed, and a dropped database kills that connection under it */
+async function disposeHyperdriveShards(shards: Record<string, SQLDatabase>): Promise<void> {
+	for (const shard of Object.values(shards)) {
+		await (shard as { dispose?: () => Promise<void> }).dispose?.();
+	}
+}
+
 async function createPostgresRuntime(runId: string, profile: AdapterProfile, shardBindings: string[]): Promise<SQLRuntime> {
 	await waitForPostgres();
 
@@ -2164,6 +3556,10 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 			database: dbName,
 			max: 10
 		});
+		const isolation = sandboxIsolation;
+		if (isolation) {
+			pool.on('connect', (client) => void client.query(`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${isolation}`));
+		}
 		await pool.query('SELECT 1');
 		poolsByBinding.set(binding, pool);
 	}
@@ -2214,6 +3610,7 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 	return {
 		shards,
 		close: async () => {
+			await disposeHyperdriveShards(shards);
 			for (const pool of poolsByBinding.values()) {
 				await pool.end();
 			}
@@ -2266,6 +3663,10 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 			database: dbName,
 			connectionLimit: 10
 		});
+		const isolation = sandboxIsolation;
+		if (isolation) {
+			pool.on('connection', (connection) => void connection.query(`SET SESSION TRANSACTION ISOLATION LEVEL ${isolation}`));
+		}
 		await pool.query('SELECT 1');
 		poolsByBinding.set(binding, pool);
 	}
@@ -2281,16 +3682,20 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 				return createMySQLProvider(drizzleDb, drizzleSql);
 			}
 			case 'per-statement-connection':
-				return createHyperdriveMySQLProvider({ connectionString }, (conn) => ({
-					execute: async (sql: string, bindings: any[] = []) => {
-						const connection = await mysql.createConnection(conn);
-						try {
-							return await connection.execute(sql, bindings);
-						} finally {
-							await connection.end();
+				return createHyperdriveMySQLProvider({ connectionString }, (conn) => {
+					// one connection per client, opened on first use, which is what a Hyperdrive client is
+					let connection: Promise<mysql.Connection> | null = null;
+					const open = () => (connection ??= mysql.createConnection(conn));
+					return {
+						execute: async (sql: string, bindings: any[] = []) => await (await open()).execute(sql, bindings),
+						query: async (sql: string, bindings: any[] = []) => await (await open()).query(sql, bindings),
+						end: async () => {
+							if (connection) {
+								await (await connection).end();
+							}
 						}
-					}
-				}));
+					};
+				});
 		}
 	};
 
@@ -2307,6 +3712,7 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 	return {
 		shards,
 		close: async () => {
+			await disposeHyperdriveShards(shards);
 			for (const pool of poolsByBinding.values()) {
 				await pool.end();
 			}
@@ -2787,8 +4193,25 @@ const SCENARIO_OPS_PER_ITERATION: Record<ScenarioName, (bulkSize: number) => num
 	pragma_or_info: () => 1,
 	counting: () => 1,
 	shard_fanout: () => 1,
-	reassignment: () => 3
+	reassignment: () => 3,
+	journal_move: () => 6,
+	stale_route_write: () => 2,
+	kv_bulk_read: () => 100,
+	batch_rollback: () => 3,
+	topology_cas: () => 2,
+	als_overlap: () => 1,
+	als_no_compat: () => 1
 };
+
+/** Scenarios that check correctness; their latency stays out of the averages */
+const CORRECTNESS_SCENARIOS: ReadonlySet<ScenarioName> = new Set<ScenarioName>([
+	'journal_move',
+	'stale_route_write',
+	'batch_rollback',
+	'topology_cas',
+	'als_overlap',
+	'als_no_compat'
+]);
 
 /**
  * Mean latency per routed operation across every scenario that passed.
@@ -2798,7 +4221,7 @@ function computePerOpAverage(scenarios: Record<ScenarioName, ScenarioStats>, bul
 
 	for (const name of SCENARIO_NAMES) {
 		const scenario = scenarios[name];
-		if (scenario.status !== 'passed' || scenario.avgMs === undefined) {
+		if (CORRECTNESS_SCENARIOS.has(name) || scenario.status !== 'passed' || scenario.avgMs === undefined) {
 			continue;
 		}
 
@@ -2814,7 +4237,9 @@ function computePerOpAverage(scenarios: Record<ScenarioName, ScenarioStats>, bul
 }
 
 function computeOverallAverage(scenarios: Record<ScenarioName, ScenarioStats>): number | undefined {
-	const passing = Object.values(scenarios).filter((scenario) => scenario.status === 'passed' && typeof scenario.avgMs === 'number');
+	const passing = Object.values(scenarios).filter(
+		(scenario) => !CORRECTNESS_SCENARIOS.has(scenario.name) && scenario.status === 'passed' && typeof scenario.avgMs === 'number'
+	);
 	if (passing.length === 0) {
 		return undefined;
 	}
@@ -3355,7 +4780,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 			const label = scenarioLabel(scenarioName);
 			if (scenario.status === 'passed') {
 				lines.push(
-					`- ${scenario.name} (${label}): avg=${formatMs(scenario.avgMs)}, p50=${formatMs(scenario.p50Ms)}, p95=${formatMs(scenario.p95Ms)}, min=${formatMs(scenario.minMs)}, max=${formatMs(scenario.maxMs)}, n=${scenario.iterations}`
+					`- ${scenario.name} (${label}): avg=${formatMs(scenario.avgMs)}, p50=${formatMs(scenario.p50Ms)}, p95=${formatMs(scenario.p95Ms)}, min=${formatMs(scenario.minMs)}, max=${formatMs(scenario.maxMs)}, n=${scenario.iterations}${scenario.notes ? `; ${scenario.notes}` : ''}`
 				);
 			} else if (scenario.status === 'failed') {
 				lines.push(`- ${scenario.name} (${label}): FAILED (${scenario.error ?? 'unknown error'})`);
@@ -3419,7 +4844,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 			const label = scenarioLabel(scenarioName);
 			if (scenario.status === 'passed') {
 				lines.push(
-					`- ${scenario.name} (${label}): avg=${formatMs(scenario.avgMs)}, p50=${formatMs(scenario.p50Ms)}, p95=${formatMs(scenario.p95Ms)}, min=${formatMs(scenario.minMs)}, max=${formatMs(scenario.maxMs)}, n=${scenario.iterations}`
+					`- ${scenario.name} (${label}): avg=${formatMs(scenario.avgMs)}, p50=${formatMs(scenario.p50Ms)}, p95=${formatMs(scenario.p95Ms)}, min=${formatMs(scenario.minMs)}, max=${formatMs(scenario.maxMs)}, n=${scenario.iterations}${scenario.notes ? `; ${scenario.notes}` : ''}`
 				);
 			} else if (scenario.status === 'failed') {
 				lines.push(`- ${scenario.name} (${label}): FAILED (${scenario.error ?? 'unknown error'})`);

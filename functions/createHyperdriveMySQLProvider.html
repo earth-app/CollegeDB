@@ -19,6 +19,9 @@
 <p>The client is created once per request and reused for every statement in that
 request. See <a href="createHyperdrivePostgresProvider.html" class="tsd-kind-function">createHyperdrivePostgresProvider</a> for why per-statement
 clients are the wrong unit and why a module-scoped client is not the fix.</p>
+<p>The factory must return one connection, such as a <code>mysql2</code> connection, with
+<code>query</code> for transaction control. Batches work as they do for
+<a href="createHyperdrivePostgresProvider.html" class="tsd-kind-function">createHyperdrivePostgresProvider</a>.</p>
 </div>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
@@ -39,7 +42,7 @@ clients are the wrong unit and why a module-scoped client is not the fix.</p>
 <h4 class="tsd-anchor-link" id="since">Since<a href="#since" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>1.0.0</p>
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ef3cb7ecf43c26e8e28c642bde4036848ac082f1/src/providers.ts#L892">src/providers.ts:892</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4c7ed1ea9781c17a22e33ea4bb2c9bf93b3f70c6/src/providers.ts#L1026">src/providers.ts:1026</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

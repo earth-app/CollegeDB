@@ -15,10 +15,14 @@
 <li class="">
 <div class="tsd-signature tsd-anchor-link" id="buildupsert"><span class="tsd-kind-call-signature">buildUpsert</span><span class="tsd-signature-symbol">(</span><br/>    <span class="tsd-kind-parameter">table</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">values</span><span class="tsd-signature-symbol">:</span> <a href="../types/ColumnValues.html" class="tsd-signature-type tsd-kind-type-alias">ColumnValues</a><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">conflictColumns</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-kind-parameter">options</span><span class="tsd-signature-symbol">?:</span> <a href="../interfaces/BuildUpsertOptions.html" class="tsd-signature-type tsd-kind-interface">BuildUpsertOptions</a><span class="tsd-signature-symbol">,</span><br/><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/BuiltQuery.html" class="tsd-signature-type tsd-kind-interface">BuiltQuery</a><a href="#buildupsert" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></div>
 <div class="tsd-description">
-<div class="tsd-comment tsd-typography"><p>Builds an &quot;upsert&quot; using the SQLite/PostgreSQL <code>ON CONFLICT ... DO UPDATE</code>
-form. On conflict for <code>conflictColumns</code>, the listed <code>update</code> columns (or all
+<div class="tsd-comment tsd-typography"><p>Builds an &quot;upsert&quot;. SQLite and PostgreSQL get <code>ON CONFLICT ... DO UPDATE</code>:
+on conflict for <code>conflictColumns</code>, the listed <code>update</code> columns (or all
 non-conflict columns by default) are overwritten with the incoming values
-via the <code>excluded</code> pseudo-row.</p>
+via the <code>excluded</code> pseudo-row. MySQL and MariaDB get
+<code>ON DUPLICATE KEY UPDATE col = VALUES(col)</code>, which reacts to a conflict on any
+unique key of the table, so <code>conflictColumns</code> should name the primary key or
+the unique key you mean. MySQL and MariaDB report 2 affected rows when the
+update changed the row, 1 for an insert, and 0 when nothing changed.</p>
 </div>
 <div class="tsd-parameters">
 <h4 class="tsd-parameters-title">Parameters</h4>
@@ -47,7 +51,7 @@ via the <code>excluded</code> pseudo-row.</p>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ef3cb7ecf43c26e8e28c642bde4036848ac082f1/src/query.ts#L334">src/query.ts:334</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4c7ed1ea9781c17a22e33ea4bb2c9bf93b3f70c6/src/query.ts#L379">src/query.ts:379</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
