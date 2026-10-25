@@ -100,6 +100,12 @@ async function seededD1(id: string, ids: string[]) {
 	return fake;
 }
 
+// meta.duration is wall-clock ms; drop it and keep every other field
+function untimed(result: QueryResult) {
+	const { duration: _ms, ...meta } = result.meta;
+	return { ...result, meta };
+}
+
 function setup(shards: Record<string, SQLDatabase>, extra: Partial<CollegeDBConfig> = {}) {
 	resetConfig();
 	initialize({
@@ -454,7 +460,13 @@ describe('read consistency', () => {
 				many: await all('k1', SELECT_ONE, ['k1'], {})
 			};
 
-			expect(empty).toEqual(bare);
+			const comparable = (r: typeof bare) => ({
+				shard: untimed(r.shard),
+				fan: r.fan.map(untimed),
+				one: r.one,
+				many: untimed(r.many)
+			});
+			expect(comparable(empty)).toEqual(comparable(bare));
 			expect(a.sessions).toHaveLength(0);
 			expect(b.sessions).toHaveLength(0);
 		});
