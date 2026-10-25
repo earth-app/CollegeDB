@@ -765,19 +765,34 @@ export function buildShardSidecarSchema(dialect?: SQLDialect): string[] {
 export const HISTORY_KEY_INDEX = 'collegedb_history_by_key';
 
 /**
+ * One index a table needs. {@link ensureIndex} creates it, because MySQL has no
+ * `CREATE INDEX IF NOT EXISTS`.
+ * @since 1.4.0
+ */
+export interface IndexSpec {
+	table: string;
+	name: string;
+	columns: string[];
+}
+
+/** The index {@link ensureJournalSchema} creates on the history table. @since 1.4.0 */
+export const HISTORY_INDEX: IndexSpec = {
+	table: 'collegedb_migration_history',
+	name: HISTORY_KEY_INDEX,
+	columns: ['scope', 'primary_key', 'table_name']
+};
+
+/**
  * The statements for the journal shard: the active claim table, the append-only
- * history with its key index, the durable placement exception set, the
- * verification record and the recovery lease.
- *
- * MySQL has no `CREATE INDEX IF NOT EXISTS`, so there the index is part of the
- * history table definition and a history table created without it keeps none.
+ * history, the durable placement exception set, the verification record and the
+ * recovery lease. The history key index is not here; {@link ensureIndex} adds it
+ * to a new and an existing table alike.
  * @since 1.4.0
  */
 export function buildJournalSchema(dialect?: SQLDialect): string[] {
 	const key = dialect === 'mysql' ? 'VARCHAR(190)' : 'TEXT';
 	const long = dialect === 'mysql' ? 'LONGTEXT' : 'TEXT';
 	const int = dialect === 'sqlite' || dialect === undefined ? 'INTEGER' : 'BIGINT';
-	const historyKeys = '(scope, primary_key, table_name)';
 
 	return [
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_active (scope ${key} NOT NULL, table_name ${key} NOT NULL, ` +
@@ -785,8 +800,7 @@ export function buildJournalSchema(dialect?: SQLDialect): string[] {
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_history (op_id ${key} NOT NULL, state ${key} NOT NULL, attempt ${int} NOT NULL, ` +
 			`scope ${key} NOT NULL, table_name ${key} NOT NULL, primary_key ${key} NOT NULL, source ${key} NOT NULL, ` +
 			`destination ${key} NOT NULL, generation ${int} NOT NULL, placement_epoch ${int}, digest ${key}, detail ${long}, ` +
-			`at ${int} NOT NULL, PRIMARY KEY (op_id, state, attempt)${dialect === 'mysql' ? `, INDEX ${HISTORY_KEY_INDEX} ${historyKeys}` : ''})`,
-		...(dialect === 'mysql' ? [] : [`CREATE INDEX IF NOT EXISTS ${HISTORY_KEY_INDEX} ON collegedb_migration_history ${historyKeys}`]),
+			`at ${int} NOT NULL, PRIMARY KEY (op_id, state, attempt))`,
 		`CREATE TABLE IF NOT EXISTS collegedb_placement_exceptions (scope ${key} NOT NULL, hashed_key ${key} NOT NULL, ` +
 			`added_at ${int} NOT NULL, PRIMARY KEY (scope, hashed_key))`,
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_verification (scope ${key} NOT NULL, completed_at ${int} NOT NULL, ` +

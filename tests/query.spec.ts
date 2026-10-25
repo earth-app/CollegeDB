@@ -8,8 +8,10 @@ import {
 	quoteIdentifier,
 	validateIdentifier
 } from '../src/index';
+import { ensureIndex, ensureJournalSchema } from '../src/migrations';
 import {
 	FENCE_STRIPE,
+	HISTORY_INDEX,
 	LOCK_STRIPES,
 	buildCutoverStatements,
 	buildFenceLock,
@@ -26,6 +28,7 @@ import {
 	isProvenJournalDialect,
 	nullSafeEquals
 } from '../src/query';
+import type { PreparedStatement, QueryResult, SQLDatabase, SQLDialect } from '../src/types';
 
 describe('SQL builders', () => {
 	describe('buildInsert', () => {
@@ -445,20 +448,19 @@ describe('Journal statement builders', () => {
 			expect(postgres.sql.endsWith('= ? ON CONFLICT DO NOTHING')).toBe(true);
 		});
 
-		it('defines the lease table and the history key index on every dialect', () => {
+		it('defines the lease table on every dialect and leaves the history key index to ensureIndex', () => {
 			for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
 				const schema = buildJournalSchema(dialect).join('\n');
 				expect(schema).toContain('CREATE TABLE IF NOT EXISTS collegedb_recovery_lease');
 				expect(schema).toContain('PRIMARY KEY (scope))');
+				expect(schema).not.toMatch(/INDEX/);
 			}
 
-			// MySQL has no CREATE INDEX IF NOT EXISTS, so the index is part of the table
-			expect(buildJournalSchema('sqlite')).toContain(
-				'CREATE INDEX IF NOT EXISTS collegedb_history_by_key ON collegedb_migration_history (scope, primary_key, table_name)'
-			);
-			expect(buildJournalSchema('postgres').join('\n')).toContain('CREATE INDEX IF NOT EXISTS collegedb_history_by_key');
-			expect(buildJournalSchema('mysql').join('\n')).not.toContain('CREATE INDEX');
-			expect(buildJournalSchema('mysql').join('\n')).toContain(', INDEX collegedb_history_by_key (scope, primary_key, table_name))');
+			expect(HISTORY_INDEX).toEqual({
+				table: 'collegedb_migration_history',
+				name: 'collegedb_history_by_key',
+				columns: ['scope', 'primary_key', 'table_name']
+			});
 		});
 	});
 
@@ -530,6 +532,136 @@ describe('Journal statement builders', () => {
 		expect(mysql).toContain('LONGTEXT');
 		expect(mysql).not.toContain('TEXT NOT NULL');
 		expect(buildJournalSchema('postgres').join('\n')).toContain('BIGINT');
+	});
+
+	describe('ensureIndex', () => {
+		interface Seen {
+			sql: string;
+			bindings: unknown[];
+		}
+
+		/** A database that records every statement, answers the index lookup, and can fail one `CREATE INDEX`. */
+		function recordingDb(dialect: SQLDialect, options: { indexed?: boolean; createError?: unknown } = {}) {
+			const seen: Seen[] = [];
+			const statement = (sql: string, bindings: unknown[]): PreparedStatement => ({
+				bind: (...next: unknown[]) => statement(sql, next),
+				run: async () => {
+					seen.push({ sql, bindings });
+					if (options.createError !== undefined && /^CREATE INDEX/.test(sql)) {
+						throw options.createError;
+					}
+					return { success: true, results: [], meta: { duration: 0 } } as QueryResult<any>;
+				},
+				all: async () => ({ success: true, results: [], meta: { duration: 0 } }) as QueryResult<any>,
+				first: async <T>() => {
+					seen.push({ sql, bindings });
+					return (/information_schema/.test(sql) && options.indexed ? { present: 1 } : null) as T | null;
+				}
+			});
+			const db: SQLDatabase = { dialect, prepare: (sql: string) => statement(sql, []) };
+			return {
+				db,
+				seen,
+				lookups: () => seen.filter((entry) => /information_schema/.test(entry.sql)),
+				creates: () => seen.filter((entry) => /CREATE INDEX/.test(entry.sql))
+			};
+		}
+
+		const CREATE = 'CREATE INDEX collegedb_history_by_key ON collegedb_migration_history (scope, primary_key, table_name)';
+
+		it('looks the index up by schema, table and name on MySQL, then creates it when it is missing', async () => {
+			const { db, seen } = recordingDb('mysql');
+
+			await ensureIndex(db, HISTORY_INDEX);
+
+			expect(seen).toHaveLength(2);
+			expect(seen[0]!.sql).toContain(
+				'FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?'
+			);
+			expect(seen[0]!.bindings).toEqual(['collegedb_migration_history', 'collegedb_history_by_key']);
+			expect(seen[1]).toEqual({ sql: CREATE, bindings: [] });
+		});
+
+		it('creates nothing on MySQL when the index exists', async () => {
+			const { db, creates, lookups } = recordingDb('mysql', { indexed: true });
+
+			await ensureIndex(db, HISTORY_INDEX);
+			await ensureIndex(db, HISTORY_INDEX);
+
+			expect(lookups()).toHaveLength(2);
+			expect(creates()).toEqual([]);
+		});
+
+		it('counts a duplicate key name from a concurrent creator as success, bare or wrapped', async () => {
+			for (const createError of [
+				Object.assign(new Error("Duplicate key name 'collegedb_history_by_key'"), { errno: 1061, code: 'ER_DUP_KEYNAME' }),
+				Object.assign(new Error('x'), { code: 'ER_DUP_KEYNAME' }),
+				Object.assign(new Error('x'), { errno: 1061 }),
+				new Error('Failed query', { cause: { errno: 1061, code: 'ER_DUP_KEYNAME' } })
+			]) {
+				const { db, creates } = recordingDb('mysql', { createError });
+				await expect(ensureIndex(db, HISTORY_INDEX)).resolves.toBeUndefined();
+				expect(creates()).toHaveLength(1);
+			}
+		});
+
+		it('propagates any other error from the create, and from the lookup', async () => {
+			for (const createError of [
+				Object.assign(new Error('CREATE command denied'), { errno: 1142, code: 'ER_TABLEACCESS_DENIED_ERROR' }),
+				new Error('connection lost'),
+				'plain string'
+			]) {
+				const { db } = recordingDb('mysql', { createError });
+				await expect(ensureIndex(db, HISTORY_INDEX)).rejects.toBe(createError);
+			}
+
+			const lookupError = new Error('lookup failed');
+			const { db } = recordingDb('mysql');
+			db.prepare = () => ({ bind: () => ({ first: async () => Promise.reject(lookupError) }) }) as unknown as PreparedStatement;
+			await expect(ensureIndex(db, HISTORY_INDEX)).rejects.toBe(lookupError);
+		});
+
+		it('uses CREATE INDEX IF NOT EXISTS on SQLite and Postgres, with no lookup', async () => {
+			for (const dialect of ['sqlite', 'postgres'] as const) {
+				const { db, seen } = recordingDb(dialect);
+				await ensureIndex(db, HISTORY_INDEX);
+				expect(seen).toEqual([{ sql: CREATE.replace('CREATE INDEX', 'CREATE INDEX IF NOT EXISTS'), bindings: [] }]);
+			}
+		});
+
+		it('rejects an unsafe name before it reaches the database', async () => {
+			const { db, seen } = recordingDb('mysql');
+
+			await expect(ensureIndex(db, { ...HISTORY_INDEX, name: 'x ON t (a); DROP TABLE t; --' })).rejects.toThrow('Invalid SQL identifier');
+			await expect(ensureIndex(db, { ...HISTORY_INDEX, columns: ['scope; DROP'] })).rejects.toThrow('Invalid SQL identifier');
+			expect(seen).toEqual([]);
+		});
+
+		it('adds the history index to an existing MySQL journal once per shard on its next journal call', async () => {
+			const { db, creates, lookups } = recordingDb('mysql');
+			const shards = { j: db };
+
+			await ensureJournalSchema(shards, 'j');
+			await ensureJournalSchema(shards, 'j');
+			await Promise.all([ensureJournalSchema(shards, 'j'), ensureJournalSchema(shards, 'j')]);
+
+			expect(lookups()).toHaveLength(1);
+			expect(creates()).toEqual([{ sql: CREATE, bindings: [] }]);
+
+			const other = recordingDb('mysql', { indexed: true });
+			await ensureJournalSchema({ j: other.db }, 'j');
+			expect(other.lookups()).toHaveLength(1);
+			expect(other.creates()).toEqual([]);
+		});
+
+		it('does not remember a failed attempt, so the next journal call retries the index', async () => {
+			const denied = new Error('CREATE command denied');
+			const { db, creates } = recordingDb('mysql', { createError: denied });
+
+			await expect(ensureJournalSchema({ j: db }, 'j')).rejects.toBe(denied);
+			await expect(ensureJournalSchema({ j: db }, 'j')).rejects.toBe(denied);
+			expect(creates()).toHaveLength(2);
+		});
 	});
 
 	it('proves the journal on SQLite, Postgres and MySQL, which includes MariaDB', () => {

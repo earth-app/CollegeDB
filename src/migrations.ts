@@ -34,6 +34,7 @@
 import { CollegeDBError } from './errors';
 import type { KVShardMapper } from './kvmap';
 import {
+	HISTORY_INDEX,
 	LEASE_TABLE,
 	PROVEN_JOURNAL_DIALECTS,
 	RETIRED_TABLE,
@@ -52,6 +53,7 @@ import {
 	validateIdentifier,
 	type BuiltQuery,
 	type CutoverSpec,
+	type IndexSpec,
 	type LeaseFence,
 	type TombstoneGuard
 } from './query';
@@ -377,7 +379,7 @@ export async function migrateRecord(
 	// the bare table name as a SQL string. That branch silently failed because
 	// `<tableName>` is not valid SQL, leaving target shards without the table
 	// they were supposed to receive. Schema preparation now belongs to the
-	// caller — if the table is missing on the target the INSERT below will
+	// caller; if the table is missing on the target the INSERT below will
 	// surface the real SQL error from the underlying engine.
 
 	if (Object.keys(sourceRecord).length === 0) {
@@ -1340,16 +1342,19 @@ async function readRow(db: SQLDatabase, table: string, pkColumn: string, key: st
 	return row ?? null;
 }
 
-async function insertSnapshot(db: SQLDatabase, table: string, encoded: EncodedRow): Promise<void> {
+function snapshotInsert(db: SQLDatabase, table: string, encoded: EncodedRow): BuiltQuery {
 	const dialect = db.dialect;
 	const columns = bindable(encoded, dialect);
-	await db
-		.prepare(
+	return {
+		sql:
 			`INSERT INTO ${quoteIdentifier(table, dialect)} (${columns.map(([name]) => quoteIdentifier(name, dialect)).join(', ')}) ` +
-				`VALUES (${columns.map(() => '?').join(', ')})`
-		)
-		.bind(...columns.map(([, value]) => value))
-		.run();
+			`VALUES (${columns.map(() => '?').join(', ')})`,
+		bindings: columns.map(([, value]) => value)
+	};
+}
+
+async function insertSnapshot(db: SQLDatabase, table: string, encoded: EncodedRow): Promise<void> {
+	await runOn(db, snapshotInsert(db, table, encoded));
 }
 
 async function deleteRowByKey(db: SQLDatabase, table: string, pkColumn: string, encoded: EncodedRow): Promise<void> {
@@ -1494,7 +1499,18 @@ export interface VerifyReport {
 	ghosts: Array<{ shard: string; table: string; key: string; opId: string; equalsArchive: boolean }>;
 	/** Tombstones whose operation the journal has no record of */
 	strandedArchives: Array<{ shard: string; table: string; key: string; opId: string }>;
-	/** Ghosts removed and operations resumed when `repair` was set */
+	/**
+	 * Live rows on the destination of an aborted operation that equal a row the
+	 * operation journaled, left by an executor that stalled past its lease
+	 */
+	strandedCopies: Array<{ shard: string; table: string; key: string; opId: string }>;
+	/**
+	 * Tombstones whose operation the journal ended as aborted, left by an executor
+	 * that stalled past its lease. `restorable` is true when the archive still
+	 * holds the row and nothing else owns the key
+	 */
+	staleCutovers: Array<{ shard: string; table: string; key: string; opId: string; restorable: boolean }>;
+	/** Ghosts, stranded copies and stale cutovers repaired, and operations resumed, when `repair` was set */
 	repaired: string[];
 	/** True when nothing remains to report */
 	clean: boolean;
@@ -1569,15 +1585,169 @@ interface OpRecord extends Header {
 const tableMemo = new WeakMap<SQLDatabase, Promise<void>>();
 const journalMemo = new WeakMap<SQLDatabase, Promise<void>>();
 
-async function ensureOnce(memo: WeakMap<SQLDatabase, Promise<void>>, db: SQLDatabase, statements: string[]): Promise<void> {
+async function ensureOnce(
+	memo: WeakMap<SQLDatabase, Promise<void>>,
+	db: SQLDatabase,
+	statements: string[],
+	indexes: IndexSpec[] = []
+): Promise<void> {
 	let pending = memo.get(db);
 	if (!pending) {
-		pending = createSchema(db, statements.join(';\n'));
+		pending = (async () => {
+			for (const statement of statements) {
+				await createCatalogStatement(db, statement);
+			}
+			for (const index of indexes) {
+				await ensureIndex(db, index);
+			}
+		})();
 		memo.set(db, pending);
 		// a failed attempt is not remembered, so the next call retries
 		pending.catch(() => memo.delete(db));
 	}
 	await pending;
+}
+
+/** Longest cause chain the walks below follow. @private */
+const MAX_CAUSE_DEPTH = 8;
+
+/**
+ * The error, then the errors it wraps, outermost first. Stops at a cycle or
+ * after {@link MAX_CAUSE_DEPTH} links.
+ * @private
+ */
+export function errorChain(error: unknown): unknown[] {
+	const chain: unknown[] = [];
+	let link: unknown = error;
+	while (link !== undefined && link !== null && chain.length < MAX_CAUSE_DEPTH && !chain.includes(link)) {
+		chain.push(link);
+		link = (link as { cause?: unknown }).cause;
+	}
+	return chain;
+}
+
+/** Postgres catalog constraints that two sessions creating one name at once collide on. @private */
+const POSTGRES_CATALOG_CONSTRAINTS: ReadonlySet<unknown> = new Set(['pg_class_relname_nsp_index', 'pg_type_typname_nsp_index']);
+
+/** A table or index that a `CREATE ... IF NOT EXISTS` statement names. @private */
+interface CatalogObject {
+	kind: 'table' | 'index';
+	name: string;
+}
+
+/** The object a `CREATE TABLE IF NOT EXISTS` or `CREATE INDEX IF NOT EXISTS` statement names. @private */
+function catalogObjectOf(statement: string): CatalogObject | undefined {
+	const match = /^CREATE (TABLE|INDEX) IF NOT EXISTS (\w+)/.exec(statement);
+	return match ? { kind: match[1] === 'TABLE' ? 'table' : 'index', name: match[2]! } : undefined;
+}
+
+/**
+ * Whether a failed Postgres create lost a race to a concurrent creator, and the
+ * object now exists. `IF NOT EXISTS` checks the name without a lock, so both
+ * sessions can pass the check and the loser fails on a catalog index. Any other
+ * failure, or an object that is still absent, is not a race.
+ * @private
+ */
+async function lostCatalogRace(db: SQLDatabase, error: unknown, object: CatalogObject | undefined): Promise<boolean> {
+	if (db.dialect !== 'postgres' || !object) {
+		return false;
+	}
+	const raced = errorChain(error).some((link) => {
+		const { code, constraint } = link as { code?: unknown; constraint?: unknown };
+		return code === '42P07' || (code === '23505' && POSTGRES_CATALOG_CONSTRAINTS.has(constraint));
+	});
+	if (!raced) {
+		return false;
+	}
+	const [catalog, column] = object.kind === 'table' ? ['pg_tables', 'tablename'] : ['pg_indexes', 'indexname'];
+	const row = await db
+		.prepare(`SELECT 1 AS present FROM ${catalog} WHERE schemaname = current_schema() AND ${column} = ?`)
+		.bind(object.name)
+		.first();
+	return Boolean(row);
+}
+
+/**
+ * Runs one statement of {@link buildShardSidecarSchema} or {@link buildJournalSchema}.
+ * A lost catalog race counts as success. Any other failure is wrapped the way
+ * {@link createSchema} wraps it.
+ * @private
+ */
+async function createCatalogStatement(db: SQLDatabase, statement: string): Promise<void> {
+	try {
+		await db.prepare(statement).run();
+	} catch (error) {
+		if (await lostCatalogRace(db, error, catalogObjectOf(statement))) {
+			return;
+		}
+		console.error('Failed to execute schema statement:', statement, error);
+		throw new CollegeDBError(`Schema migration failed: ${error}`, 'SCHEMA_MIGRATION_FAILED');
+	}
+}
+
+/** MySQL and MariaDB error number for a key name that already exists (`ER_DUP_KEYNAME`). @private */
+const MYSQL_DUPLICATE_KEY_NAME = 1061;
+
+function isDuplicateKeyName(error: unknown): boolean {
+	for (const candidate of [error, (error as { cause?: unknown } | null)?.cause]) {
+		const { errno, code } = (candidate ?? {}) as { errno?: unknown; code?: unknown };
+		if (errno === MYSQL_DUPLICATE_KEY_NAME || code === 'ER_DUP_KEYNAME') {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Creates an index unless the table already has one with that name, on any
+ * dialect and any number of times.
+ *
+ * SQLite and Postgres run `CREATE INDEX IF NOT EXISTS`. MySQL and MariaDB report
+ * the same `mysql` dialect and neither accepts that form on MySQL proper, so
+ * they look the name up in `information_schema.statistics` for the current
+ * database first. Two processes that both find it missing race to create it; the
+ * loser gets `ER_DUP_KEYNAME` (1061), which counts as success. Postgres reports
+ * the same race as a catalog unique violation, which counts as success once the
+ * index exists. Any other error propagates.
+ *
+ * @param db - The shard that holds the table
+ * @param index - Table, index name and columns
+ * @since 1.4.0
+ */
+export async function ensureIndex(db: SQLDatabase, index: IndexSpec): Promise<void> {
+	validateIdentifier(index.table);
+	validateIdentifier(index.name);
+	index.columns.forEach((column) => validateIdentifier(column));
+	const on = `${index.name} ON ${index.table} (${index.columns.join(', ')})`;
+
+	if (db.dialect !== 'mysql') {
+		try {
+			await db.prepare(`CREATE INDEX IF NOT EXISTS ${on}`).run();
+		} catch (error) {
+			if (!(await lostCatalogRace(db, error, { kind: 'index', name: index.name }))) {
+				throw error;
+			}
+		}
+		return;
+	}
+
+	const present = await db
+		.prepare(
+			'SELECT 1 AS present FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1'
+		)
+		.bind(index.table, index.name)
+		.first();
+	if (present) {
+		return;
+	}
+
+	try {
+		await db.prepare(`CREATE INDEX ${on}`).run();
+	} catch (error) {
+		if (!isDuplicateKeyName(error)) {
+			throw error;
+		}
+	}
 }
 
 /**
@@ -1600,7 +1770,7 @@ export async function ensureJournalSchema(shards: Record<string, SQLDatabase>, j
 	}
 
 	await Promise.all(Object.values(shards).map((db) => (db && isProvenJournalDialect(db.dialect) ? ensureShardTables(db) : undefined)));
-	await ensureOnce(journalMemo, journal, buildJournalSchema(journal.dialect));
+	await ensureOnce(journalMemo, journal, buildJournalSchema(journal.dialect), [HISTORY_INDEX]);
 }
 
 function shardDb(env: MigrationEnv, binding: string): SQLDatabase {
@@ -2481,6 +2651,8 @@ async function recoverUnderLease(env: MigrationEnv, options: { olderThanMs?: num
 			if (error instanceof CollegeDBError && error.code === 'RECOVERY_FENCED') {
 				throw error;
 			}
+			// a stale step can fail on the new holder's work; that failure is not this executor's to report
+			await assertLease(env);
 			report.failed.push({
 				opId: claim.op_id,
 				key: claim.primary_key,
@@ -2558,18 +2730,133 @@ async function listTombstones(db: SQLDatabase, scope: string) {
 	).results;
 }
 
+type Tombstone = Awaited<ReturnType<typeof listTombstones>>[number];
+
+/**
+ * Handles a tombstone whose operation the journal ended as aborted, which only an
+ * executor that stalled past its lease leaves: its cutover ran after the new
+ * holder aborted. The row is restorable when the archive still holds it, the
+ * operation is the newest on the key, and neither shard holds a different row.
+ * @private
+ */
+async function checkStaleCutover(
+	env: MigrationEnv,
+	report: VerifyReport,
+	repair: boolean,
+	shard: string,
+	db: SQLDatabase,
+	tomb: Tombstone,
+	live: Record<string, unknown> | null,
+	op: OpRecord
+): Promise<void> {
+	const archived = tomb.payload;
+	const sourceFree = live === null || (archived !== null && encodeRow(live).payload === archived);
+
+	let destinationFree = false;
+	const destination = env.shards[op.destination];
+	if (destination) {
+		try {
+			destinationFree = (await readRow(destination, tomb.table_name, tomb.pk_column, tomb.primary_key)) === null;
+		} catch {
+			destinationFree = false;
+		}
+	}
+
+	const newest = (await nextGeneration(env, op.table, op.key)) - 1 === op.generation;
+	const restorable = archived !== null && sourceFree && destinationFree && newest;
+	const where = `${shard}:${tomb.table_name}:${tomb.primary_key}`;
+
+	if (!repair || !restorable) {
+		report.staleCutovers.push({ shard, table: tomb.table_name, key: tomb.primary_key, opId: tomb.op_id, restorable });
+		return;
+	}
+
+	assertAtomicBatch(db, `Shard ${shard}`, 'the archive cannot be restored atomically');
+	const restore: BuiltQuery[] = [
+		...buildWriteLock({ scope: env.scope, table: tomb.table_name, key: tomb.primary_key }, db.dialect),
+		{
+			sql: `DELETE FROM ${RETIRED_TABLE} WHERE scope = ? AND table_name = ? AND primary_key = ? AND op_id = ?`,
+			bindings: [env.scope, tomb.table_name, tomb.primary_key, tomb.op_id]
+		}
+	];
+	if (live === null) {
+		restore.push(snapshotInsert(db, tomb.table_name, { columns: JSON.parse(archived).columns, payload: archived }));
+	}
+	await db.runBatch!(restore);
+	report.repaired.push(where);
+}
+
+/**
+ * Finds live rows on the destination of an aborted operation that equal a row the
+ * operation journaled. The operation must be the newest on its key, so no later
+ * move can have made that destination the owner. With `repair` the row is
+ * removed, which is the proof {@link discardDestinationCopy} uses.
+ * @private
+ */
+async function checkStrandedCopies(env: MigrationEnv, report: VerifyReport, repair: boolean): Promise<void> {
+	const journal = journalDb(env);
+	const aborted = await journalCall(
+		async () =>
+			(
+				await journal
+					.prepare(`SELECT DISTINCT op_id FROM ${HISTORY} WHERE scope = ? AND state = 'aborted'`)
+					.bind(env.scope)
+					.all<{ op_id: string }>()
+			).results
+	);
+	const handled = new Set([...report.ghosts.map((g) => `${g.shard}:${g.table}:${g.key}`), ...report.repaired]);
+
+	for (const { op_id } of aborted) {
+		const op = await loadOp(env, op_id);
+		const destination = op ? env.shards[op.destination] : undefined;
+		if (!op || op.state !== 'aborted' || !destination || !isProvenJournalDialect(destination.dialect)) {
+			continue;
+		}
+		if ((await nextGeneration(env, op.table, op.key)) - 1 !== op.generation) {
+			continue;
+		}
+
+		let live: Record<string, unknown> | null = null;
+		try {
+			live = await readRow(destination, op.table, op.options.pkColumn, op.key);
+		} catch {
+			continue;
+		}
+		if (!live) {
+			continue;
+		}
+
+		const encoded = encodeRow(live);
+		const where = `${op.destination}:${op.table}:${op.key}`;
+		if (handled.has(where) || !op.digests.has(await sha256Hex(encoded.payload))) {
+			continue;
+		}
+
+		if (repair) {
+			await deleteRowByKey(destination, op.table, op.options.pkColumn, encoded);
+			report.repaired.push(where);
+		} else {
+			report.strandedCopies.push({ shard: op.destination, table: op.table, key: op.key, opId: op.opId });
+		}
+	}
+}
+
 /**
  * Checks the journal against the shards without changing anything.
  *
  * Reports unfinished operations, live rows on a shard that also holds a
- * tombstone for the key (ghosts), and tombstones the journal does not know. With
- * `repair`, unfinished operations are resumed and a ghost is removed only when
- * it equals the archived payload; any other ghost is reported and kept. The
- * result of the pass is recorded, which is what {@link purgeRetired} waits for.
- * Repair runs {@link recoverMigrations}, so it takes the same lease.
+ * tombstone for the key (ghosts), and tombstones the journal does not know. It
+ * also reports what an executor that stalled past its recovery lease can leave
+ * after the new holder aborted a move: a copy on the destination, or an archive
+ * and a deleted source row. With `repair`, unfinished operations are resumed, a
+ * ghost is removed only when it equals the archived payload (any other ghost is
+ * reported and kept), a stranded copy is removed when it equals a row the
+ * operation journaled, and a stale cutover is undone by restoring the archived
+ * row. The result of the pass is recorded, which is what {@link purgeRetired}
+ * waits for. Repair runs {@link recoverMigrations}, so it takes the same lease.
  *
  * @param env - Journal and shards
- * @param options - `repair` to resume operations and remove ghosts equal to the archive
+ * @param options - `repair` to resume operations and fix what the report lists, where the journal proves it
  * @returns What was found and what was repaired
  * @throws {CollegeDBError} With `repair`: `RECOVERY_IN_PROGRESS` when another recovery holds the lease, `RECOVERY_FENCED` when this one lost it
  * @since 1.4.0
@@ -2577,7 +2864,15 @@ async function listTombstones(db: SQLDatabase, scope: string) {
 export async function verifyMigrations(env: MigrationEnv, options: { repair?: boolean } = {}): Promise<VerifyReport> {
 	await ensureJournalSchema(env.shards, env.journalBinding);
 	const journal = journalDb(env);
-	const report: VerifyReport = { danglingOps: [], ghosts: [], strandedArchives: [], repaired: [], clean: true };
+	const report: VerifyReport = {
+		danglingOps: [],
+		ghosts: [],
+		strandedArchives: [],
+		strandedCopies: [],
+		staleCutovers: [],
+		repaired: [],
+		clean: true
+	};
 
 	if (options.repair) {
 		await recoverMigrations(env);
@@ -2598,10 +2893,8 @@ export async function verifyMigrations(env: MigrationEnv, options: { repair?: bo
 		await ensureShardTables(db);
 
 		for (const tomb of await listTombstones(db, env.scope)) {
-			const known = await journalCall(() =>
-				journal.prepare(`SELECT op_id FROM ${HISTORY} WHERE op_id = ? LIMIT 1`).bind(tomb.op_id).first()
-			);
-			if (!known) {
+			const op = await loadOp(env, tomb.op_id);
+			if (!op) {
 				report.strandedArchives.push({ shard, table: tomb.table_name, key: tomb.primary_key, opId: tomb.op_id });
 			}
 
@@ -2609,6 +2902,11 @@ export async function verifyMigrations(env: MigrationEnv, options: { repair?: bo
 			try {
 				live = await readRow(db, tomb.table_name, tomb.pk_column, tomb.primary_key);
 			} catch {
+				continue;
+			}
+
+			if (op?.state === 'aborted' && op.source === shard) {
+				await checkStaleCutover(env, report, options.repair === true, shard, db, tomb, live, op);
 				continue;
 			}
 			if (!live) {
@@ -2626,7 +2924,14 @@ export async function verifyMigrations(env: MigrationEnv, options: { repair?: bo
 		}
 	}
 
-	report.clean = report.danglingOps.length === 0 && report.ghosts.length === 0 && report.strandedArchives.length === 0;
+	await checkStrandedCopies(env, report, options.repair === true);
+
+	report.clean =
+		report.danglingOps.length === 0 &&
+		report.ghosts.length === 0 &&
+		report.strandedArchives.length === 0 &&
+		report.strandedCopies.length === 0 &&
+		report.staleCutovers.length === 0;
 
 	await journalCall(async () => {
 		await journal.prepare('DELETE FROM collegedb_migration_verification WHERE scope = ?').bind(env.scope).run();

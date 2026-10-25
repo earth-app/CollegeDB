@@ -23,8 +23,9 @@ import {
 	upsert,
 	verifyMigrations
 } from '../src/index';
-import { ensureJournalSchema, runGuardedWrite, setMigrationStepHook } from '../src/migrations';
+import { ensureIndex, ensureJournalSchema, runGuardedWrite, setMigrationStepHook } from '../src/migrations';
 import { addPlacementException, createManifest, resetPlacementState } from '../src/placement';
+import { HISTORY_INDEX, buildJournalSchema } from '../src/query';
 import { raiseFence, readFence } from '../src/topology';
 import type { BatchStatement, KVStorage, SQLDatabase, SQLDialect } from '../src/types';
 import { restoreClock, setClock } from './helpers/clock';
@@ -1597,6 +1598,20 @@ describe('Recovery lease', () => {
 		expect(indexes.map((index) => index.name)).toContain('collegedb_history_by_key');
 	});
 
+	it('adds the history index to a journal table that an earlier build created without it', async () => {
+		const raw = openNodeSqlite();
+		for (const statement of buildJournalSchema('sqlite')) {
+			raw.exec(statement);
+		}
+		const indexNames = () =>
+			(raw.prepare('PRAGMA index_list(collegedb_migration_history)').all() as Array<{ name: string }>).map((i) => i.name);
+		expect(indexNames()).not.toContain('collegedb_history_by_key');
+
+		await ensureJournalSchema({ j: createNodeSqliteProvider(raw) }, 'j');
+
+		expect(indexNames()).toContain('collegedb_history_by_key');
+	});
+
 	it('takes the lease for verifyMigrations repair, and not for a plain verify or a live move', async () => {
 		await recoverMigrations();
 		world.raw[JOURNAL]!.prepare('UPDATE collegedb_recovery_lease SET holder = ?, generation = ?, expires_at = ?').run(
@@ -1612,6 +1627,245 @@ describe('Recovery lease', () => {
 
 		expect(leaseRows()).toMatchObject([{ holder: 'other', generation: 7 }]);
 		await expectOneOwner();
+	});
+
+	describe('Recovery lease window', () => {
+		const DESTINATION_INSERT = /db-b run INSERT INTO "items"/;
+		const SOURCE_CUTOVER = /db-a batch of/;
+
+		/**
+		 * Holds executor A right after its lease check, before the shard statement, runs
+		 * `meanwhile` (the second holder), then lets A's statement through.
+		 */
+		async function stallAfterCheck(pauseAt: RegExp, meanwhile: () => Promise<void>) {
+			const pause = world.plan.pauseOn(pauseAt);
+			const stale = recoverMigrations().then(
+				(report) => ({ report }),
+				(error: unknown) => ({ error })
+			);
+			await pause.reached;
+			expect(leaseRows()).toMatchObject([{ generation: 1 }]);
+
+			jumpClock(61_000);
+			await meanwhile();
+			expect(leaseRows()).toMatchObject([{ generation: 2 }]);
+
+			const before = historyRows();
+			const mark = world.plan.log.length;
+			pause.resume();
+			const outcome = await stale;
+			return { outcome, before, tail: world.plan.log.slice(mark) };
+		}
+
+		function expectFenced(outcome: Awaited<ReturnType<typeof stallAfterCheck>>['outcome']): void {
+			expect('report' in outcome ? `returned ${JSON.stringify(outcome.report)}` : undefined).toBeUndefined();
+			const error = (outcome as { error: unknown }).error as CollegeDBError;
+			expect(error).toBeInstanceOf(CollegeDBError);
+			expect(error.code).toBe('RECOVERY_FENCED');
+		}
+
+		const total = async () => (await countAllShards('items')).total;
+
+		it('fences a copy that lands after the new holder finished the move, and leaves nothing behind', async () => {
+			await leaveMoveAt('prepared');
+
+			const { outcome, before, tail } = await stallAfterCheck(DESTINATION_INSERT, async () => {
+				expect((await recoverMigrations()).committed).toHaveLength(1);
+			});
+
+			// the held statement ran, hit the new holder's row, and nothing else of the stale executor's landed
+			expect(tail.filter((entry) => DESTINATION_INSERT.test(entry))).toHaveLength(1);
+			expectFenced(outcome);
+			expect(historyRows()).toEqual(before);
+			expect(await getMigrationStatus('k')).toMatchObject({ state: 'retired', active: false, destination: TARGET });
+			expect(rowsOn(world, SOURCE, 'k')).toHaveLength(0);
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'Ada' }]);
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(1);
+			expect(tombstones(world, TARGET, 'k')).toHaveLength(0);
+			expect(await mappingOf(world.kv, 'k')).toBe(TARGET);
+			expect(activeClaims(world)).toBe(0);
+			expect(await total()).toBe(1);
+			expect(await first<{ name: string }>('k', 'SELECT * FROM items WHERE id = ?', ['k'])).toMatchObject({ name: 'Ada' });
+			await expect(verifyMigrations()).resolves.toMatchObject({ clean: true, strandedCopies: [], staleCutovers: [] });
+		});
+
+		const aborts = {
+			'the source row was deleted': async () => {
+				world.raw[SOURCE]!.prepare('DELETE FROM items WHERE id = ?').run('k');
+				expect((await recoverMigrations()).aborted).toMatchObject([{ reason: 'SOURCE_ROW_MISSING' }]);
+				return { source: 0, total: 1 };
+			},
+			'the source row kept changing until the cutover gave up': async () => {
+				let writes = 0;
+				setMigrationStepHook(async (step) => {
+					if (step === 'cutover_pending') {
+						await updateRow('k', 'items', { qty: 100 + ++writes }, { id: 'k' });
+					}
+				});
+				const report = await recoverMigrations();
+				setMigrationStepHook(null);
+				expect(report.aborted).toMatchObject([{ reason: 'CAS_MISS' }]);
+				return { source: 1, total: 2 };
+			}
+		};
+
+		for (const [why, abort] of Object.entries(aborts)) {
+			it(`finds and removes the destination copy a stale executor lands after the new holder aborted, because ${why}`, async () => {
+				await leaveMoveAt('prepared');
+
+				let expected!: Awaited<ReturnType<(typeof aborts)[keyof typeof aborts]>>;
+				const { outcome, before } = await stallAfterCheck(DESTINATION_INSERT, async () => {
+					expected = await abort();
+				});
+
+				expectFenced(outcome);
+				expect(historyRows()).toEqual(before);
+				expect(await getMigrationStatus('k')).toMatchObject({ state: 'aborted', active: false });
+				expect(rowsOn(world, SOURCE, 'k')).toHaveLength(expected.source);
+				expect(await mappingOf(world.kv, 'k')).toBe(SOURCE);
+				expect(activeClaims(world)).toBe(0);
+
+				// the stale copy is live on the destination, which a count sees
+				expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'Ada' }]);
+				expect(await total()).toBe(expected.total);
+
+				const report = await verifyMigrations();
+				expect(report).toMatchObject({
+					clean: false,
+					strandedCopies: [{ shard: TARGET, table: 'items', key: 'k' }],
+					staleCutovers: [],
+					ghosts: []
+				});
+				expect(rowsOn(world, TARGET, 'k')).toHaveLength(1);
+
+				const repaired = await verifyMigrations({ repair: true });
+				expect(repaired.repaired).toEqual([`${TARGET}:items:k`]);
+				expect(rowsOn(world, TARGET, 'k')).toHaveLength(0);
+				expect(rowsOn(world, SOURCE, 'k')).toHaveLength(expected.source);
+				expect(tombstones(world, SOURCE, 'k')).toHaveLength(0);
+				expect(await total()).toBe(expected.source);
+				await expect(verifyMigrations()).resolves.toMatchObject({ clean: true });
+			});
+		}
+
+		it('fences a cutover that lands after the new holder committed, and it matches no row', async () => {
+			await leaveMoveAt('cutover_pending');
+
+			const { outcome, before, tail } = await stallAfterCheck(SOURCE_CUTOVER, async () => {
+				expect((await recoverMigrations()).committed).toHaveLength(1);
+			});
+
+			expect(tail.filter((entry) => SOURCE_CUTOVER.test(entry))).toHaveLength(1);
+			expectFenced(outcome);
+			expect(historyRows()).toEqual(before);
+			expect(await getMigrationStatus('k')).toMatchObject({ state: 'retired', active: false, destination: TARGET });
+			expect(rowsOn(world, SOURCE, 'k')).toHaveLength(0);
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'Ada' }]);
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(1);
+			expect(await mappingOf(world.kv, 'k')).toBe(TARGET);
+			expect(activeClaims(world)).toBe(0);
+			expect(await total()).toBe(1);
+			expect(await first<{ name: string }>('k', 'SELECT * FROM items WHERE id = ?', ['k'])).toMatchObject({ name: 'Ada' });
+			await expect(verifyMigrations()).resolves.toMatchObject({ clean: true, strandedCopies: [], staleCutovers: [] });
+		});
+
+		/** The source row changes and returns to the snapshot while A holds its cutover, and B aborts in between. */
+		async function staleCutover() {
+			await leaveMoveAt('cutover_pending');
+			const put = (name: string) => world.raw[SOURCE]!.prepare('UPDATE items SET name = ? WHERE id = ?').run(name, 'k');
+
+			return await stallAfterCheck(SOURCE_CUTOVER, async () => {
+				put('Grace');
+				expect((await recoverMigrations()).aborted).toMatchObject([{ reason: 'SOURCE_CHANGED' }]);
+				put('Ada');
+			});
+		}
+
+		it('finds and restores the row a stale cutover archived after the source changed and returned to the snapshot', async () => {
+			const { outcome, before, tail } = await staleCutover();
+
+			// the held cutover found a row equal to its snapshot, archived it and deleted it
+			expect(tail.filter((entry) => SOURCE_CUTOVER.test(entry))).toHaveLength(1);
+			expectFenced(outcome);
+			expect(historyRows()).toEqual(before);
+			expect(await getMigrationStatus('k')).toMatchObject({ state: 'aborted', active: false });
+			expect(rowsOn(world, SOURCE, 'k')).toHaveLength(0);
+			expect(rowsOn(world, TARGET, 'k')).toHaveLength(0);
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(1);
+			expect(await mappingOf(world.kv, 'k')).toBe(SOURCE);
+			expect(await total()).toBe(0);
+			expect(await first('k', 'SELECT * FROM items WHERE id = ?', ['k'])).toBeNull();
+
+			const report = await verifyMigrations();
+			expect(report).toMatchObject({
+				clean: false,
+				strandedCopies: [],
+				staleCutovers: [{ shard: SOURCE, table: 'items', key: 'k', restorable: true }]
+			});
+			expect(rowsOn(world, SOURCE, 'k')).toHaveLength(0);
+
+			const repaired = await verifyMigrations({ repair: true });
+			expect(repaired.repaired).toEqual([`${SOURCE}:items:k`]);
+			expect(rowsOn(world, SOURCE, 'k')).toMatchObject([{ id: 'k', name: 'Ada', qty: 1 }]);
+			expect(rowsOn(world, TARGET, 'k')).toHaveLength(0);
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(0);
+			expect(await first<{ name: string }>('k', 'SELECT * FROM items WHERE id = ?', ['k'])).toMatchObject({ name: 'Ada' });
+			expect(await total()).toBe(1);
+			await expect(verifyMigrations()).resolves.toMatchObject({ clean: true });
+		});
+
+		it('reports a stale cutover and leaves it alone when the destination holds a row or the archive is gone', async () => {
+			await staleCutover();
+			world.raw[TARGET]!.prepare("INSERT INTO items (id, name) VALUES ('k', 'elsewhere')").run();
+
+			const report = await verifyMigrations({ repair: true });
+			expect(report).toMatchObject({ clean: false, repaired: [], staleCutovers: [{ key: 'k', restorable: false }] });
+			expect(rowsOn(world, SOURCE, 'k')).toHaveLength(0);
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(1);
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'elsewhere' }]);
+
+			world.raw[TARGET]!.prepare("DELETE FROM items WHERE id = 'k'").run();
+			world.raw[SOURCE]!.prepare('UPDATE collegedb_retired SET payload = NULL, purged_at = 1').run();
+			await expect(verifyMigrations({ repair: true })).resolves.toMatchObject({ repaired: [], staleCutovers: [{ restorable: false }] });
+			expect(tombstones(world, SOURCE, 'k')).toHaveLength(1);
+		});
+
+		it('leaves a destination row alone when it differs from every row the aborted move journaled', async () => {
+			await leaveMoveAt('prepared');
+			world.raw[SOURCE]!.prepare('DELETE FROM items WHERE id = ?').run('k');
+			expect((await recoverMigrations()).aborted).toMatchObject([{ reason: 'SOURCE_ROW_MISSING' }]);
+			world.raw[TARGET]!.prepare("INSERT INTO items (id, name) VALUES ('k', 'not the snapshot')").run();
+
+			await expect(verifyMigrations({ repair: true })).resolves.toMatchObject({ clean: true, repaired: [], strandedCopies: [] });
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'not the snapshot' }]);
+		});
+
+		it('leaves the destination row of a later committed move alone, though it equals what an aborted move journaled', async () => {
+			await leaveMoveAt('prepared');
+			world.raw[SOURCE]!.prepare('DELETE FROM items WHERE id = ?').run('k');
+			expect((await recoverMigrations()).aborted).toHaveLength(1);
+
+			world.raw[SOURCE]!.prepare("INSERT INTO items (id, name, qty) VALUES ('k', 'Ada', 1)").run();
+			await reassignShard('k', TARGET, 'items');
+			expect(await getMigrationStatus('k')).toMatchObject({ state: 'retired', generation: 2 });
+
+			await expect(verifyMigrations({ repair: true })).resolves.toMatchObject({ clean: true, repaired: [], strandedCopies: [] });
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'Ada' }]);
+		});
+
+		it('residual: a stale copy brings back a row deleted from the destination after the new holder committed, and verify cannot tell', async () => {
+			await leaveMoveAt('prepared');
+			const { outcome, before } = await stallAfterCheck(DESTINATION_INSERT, async () => {
+				await recoverMigrations();
+				expect(await deleteRow('k', 'items', { id: 'k' })).toMatchObject({ success: true });
+			});
+
+			expectFenced(outcome);
+			expect(historyRows()).toEqual(before);
+			expect(rowsOn(world, TARGET, 'k')).toMatchObject([{ name: 'Ada' }]);
+			expect(await total()).toBe(1);
+			await expect(verifyMigrations()).resolves.toMatchObject({ clean: true });
+		});
 	});
 });
 
@@ -1696,6 +1950,111 @@ describe('Retention, verification and purge', () => {
 		expect(rowsOn(world, SOURCE, 'k')).toMatchObject([{ name: 'Ada' }]);
 		expect(await getMigrationStatus('k')).toMatchObject({ generation: 2, source: TARGET, destination: SOURCE });
 		expect(statesOf(world, 'k').filter((entry) => entry.startsWith('retired'))).toHaveLength(2);
+	});
+});
+
+// #endregion
+
+// #region catalog races on create
+// a create matching `when` loses a race; the winner's object is visible only when `winnerCommits`
+function fakePostgres(race?: { when: RegExp; error: unknown; winnerCommits: boolean }) {
+	const log: string[] = [];
+	const objects = new Set<string>();
+	const database = {
+		dialect: 'postgres',
+		prepare(sql: string) {
+			const args: unknown[] = [];
+			const statement = {
+				bind(...bindings: unknown[]) {
+					args.push(...bindings);
+					return statement;
+				},
+				async run() {
+					log.push(sql);
+					const name = /IF NOT EXISTS (\w+)/.exec(sql)?.[1];
+					if (name && !objects.has(name) && race?.when.test(sql)) {
+						if (race.winnerCommits) {
+							objects.add(name);
+						}
+						throw race.error;
+					}
+					if (name) {
+						objects.add(name);
+					}
+					return { success: true, results: [], meta: { duration: 0 } };
+				},
+				async first() {
+					log.push(sql);
+					return objects.has(String(args[0])) ? { present: 1 } : null;
+				}
+			};
+			return statement;
+		}
+	} as unknown as SQLDatabase;
+	return { database, log, objects };
+}
+
+function pgError(code: string, constraint?: string): Error {
+	return Object.assign(new Error(`postgres ${code}`), { code, constraint });
+}
+
+describe('Concurrent creates on Postgres', () => {
+	const INDEX_RACE = /^CREATE INDEX IF NOT EXISTS collegedb_history_by_key/;
+	const TABLE_RACE = /^CREATE TABLE IF NOT EXISTS collegedb_migration_active/;
+	const CATALOG_CLASH = pgError('23505', 'pg_class_relname_nsp_index');
+
+	it.each([
+		['a unique violation on the catalog name, object committed by the winner', CATALOG_CLASH, true, true],
+		['duplicate_table, object committed by the winner', pgError('42P07'), true, true],
+		[
+			'a unique violation wrapped by Drizzle, object committed by the winner',
+			Object.assign(new Error('Failed query'), { cause: CATALOG_CLASH }),
+			true,
+			true
+		],
+		['a unique violation on the catalog name, object absent after the check', CATALOG_CLASH, false, false],
+		['a unique violation on another constraint, object committed by the winner', pgError('23505', 'collegedb_history_pkey'), true, false],
+		['permission denied, object committed by the winner', pgError('42501'), true, false]
+	])('ensureIndex: %s', async (_label, error, winnerCommits, swallowed) => {
+		const { database, log } = fakePostgres({ when: INDEX_RACE, error, winnerCommits });
+
+		const work = ensureIndex(database, HISTORY_INDEX);
+		if (swallowed) {
+			await expect(work).resolves.toBeUndefined();
+			expect(log.some((sql) => /FROM pg_indexes/.test(sql))).toBe(true);
+		} else {
+			await expect(work).rejects.toBe(error);
+		}
+	});
+
+	it('ensureJournalSchema creates every journal table when a concurrent creator wins the race', async () => {
+		const { database, objects } = fakePostgres({
+			when: TABLE_RACE,
+			error: pgError('23505', 'pg_type_typname_nsp_index'),
+			winnerCommits: true
+		});
+
+		await ensureJournalSchema({ j: database }, 'j');
+
+		expect([...objects]).toEqual(
+			expect.arrayContaining(['collegedb_migration_active', 'collegedb_migration_history', 'collegedb_history_by_key'])
+		);
+	});
+
+	it('ensureJournalSchema fails with SCHEMA_MIGRATION_FAILED when the raced table is absent after the check', async () => {
+		const { database } = fakePostgres({
+			when: TABLE_RACE,
+			error: pgError('23505', 'pg_type_typname_nsp_index'),
+			winnerCommits: false
+		});
+
+		expect(await codeOf(ensureJournalSchema({ j: database }, 'j'))).toBe('SCHEMA_MIGRATION_FAILED');
+	});
+
+	it('ensureJournalSchema fails with SCHEMA_MIGRATION_FAILED for another error on a journal table', async () => {
+		const { database } = fakePostgres({ when: TABLE_RACE, error: pgError('42501'), winnerCommits: true });
+
+		expect(await codeOf(ensureJournalSchema({ j: database }, 'j'))).toBe('SCHEMA_MIGRATION_FAILED');
 	});
 });
 
