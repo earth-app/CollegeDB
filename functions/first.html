@@ -47,13 +47,17 @@ primary key, ensuring consistent data access.</p>
 <div class="tsd-tag-throws">
 <h4 class="tsd-anchor-link" id="throws">Throws<a href="#throws" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p>If query fails or routing fails</p>
 </div>
+<div class="tsd-tag-throws">
+<h4 class="tsd-anchor-link" id="throws-1">Throws<a href="#throws-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><p><code>MIGRATION_LOOKUP_UNAVAILABLE</code> when a tombstone lookup fails or names an unknown shard;
+<code>MIGRATION_CHAIN_EXCEEDED</code> on a move cycle or a chain past four hops. Both return not found with <code>bestEffort</code>.</p>
+</div>
 <div class="tsd-tag-example">
 <h4 class="tsd-anchor-link" id="example">Example<a href="#example" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="typescript"><span class="hl-6">type</span><span class="hl-1"> </span><span class="hl-7">User</span><span class="hl-1"> = {</span><br/><span class="hl-1">  </span><span class="hl-5">id</span><span class="hl-1">: </span><span class="hl-7">string</span><span class="hl-1">;</span><br/><span class="hl-1">  </span><span class="hl-5">name</span><span class="hl-1">: </span><span class="hl-7">string</span><span class="hl-1">;</span><br/><span class="hl-1">  </span><span class="hl-5">email</span><span class="hl-1">: </span><span class="hl-7">string</span><span class="hl-1">;</span><br/><span class="hl-1">};</span><br/><span class="hl-3">// Get a specific user</span><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-8">userResult</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">first</span><span class="hl-1">&lt;</span><span class="hl-7">User</span><span class="hl-1">&gt;(</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">  </span><span class="hl-2">&#39;SELECT * FROM users WHERE id = ?&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">  [</span><span class="hl-2">&#39;user-123&#39;</span><span class="hl-1">]</span><br/><span class="hl-1">);</span><br/><br/><span class="hl-4">if</span><span class="hl-1"> (</span><span class="hl-5">userResult</span><span class="hl-1">) {</span><br/><span class="hl-1">  </span><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-2">`Found user: </span><span class="hl-6">${</span><span class="hl-5">userResult</span><span class="hl-10">.</span><span class="hl-5">name</span><span class="hl-6">}</span><span class="hl-2">`</span><span class="hl-1">);</span><br/><span class="hl-1">}</span>
 </code><button type="button">Copy</button></pre>
 
 </div></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/4c7ed1ea9781c17a22e33ea4bb2c9bf93b3f70c6/src/router.ts#L2757">src/router.ts:2757</a></li></ul></aside></div></li></ul></section></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/f5c84eb13614cdb020ae9fd8ec42c8b49af78b40/src/router.ts#L2846">src/router.ts:2846</a></li></ul></aside></div></li></ul></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

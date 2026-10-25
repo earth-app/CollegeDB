@@ -562,7 +562,18 @@ acknowledged.</p>
 <p>A crash after the cutover leaves the key readable and refuses its writes with
 <code>MIGRATION_CUTOVER_PENDING</code> until <code>recoverMigrations()</code> runs. <code>getMigrationStatus(key, table)</code> returns
 the latest recorded state of a key's move. A read that finds nothing on a shard holding a tombstone
-for the key follows the tombstone's <code>moved_to</code> shard, up to four hops.</p>
+for the key follows the tombstone's <code>moved_to</code> shard, up to four hops. A failed tombstone lookup, a
+chain past four hops, a cycle, or a tombstone that names an unconfigured shard throws
+<code>MIGRATION_LOOKUP_UNAVAILABLE</code> or <code>MIGRATION_CHAIN_EXCEEDED</code> instead of returning not found. Pass
+<code>bestEffort: true</code> in the read options to keep the not-found result.</p>
+<p>One recovery runs per journal scope at a time, across isolates. <code>recoverMigrations()</code> first takes a
+lease row in the journal. A second call while the lease is live throws <code>RECOVERY_IN_PROGRESS</code>, which
+is the normal result for a scheduler that calls on every tick. A lease lasts 60 seconds without
+renewal, so the first call after a crashed recovery takes it over at a higher fencing generation. A
+recovery that loses its lease stops with <code>RECOVERY_FENCED</code> and makes no further writes. A live move
+does not take the lease; <code>verifyMigrations({ repair: true })</code> does. The full contract, the window the
+fence does not cover, and a Workers <code>scheduled()</code> example are in <code>docs/migration-protocol.md</code> under
+Recovery lease.</p>
 <p>Crash recovery is not a backup or a restore. Archived source rows are kept for seven days by default
 (<code>retire: { afterMs }</code> changes this), and <code>purgeRetired()</code> clears their payloads once the retention
 deadline has passed and a clean verification pass has run after the move. Tombstones remain, so stale
@@ -580,7 +591,7 @@ overwrites the destination row.</p>
 <ul>
 <li>The journal covers statements that CollegeDB routes. Raw SQL and raw <code>run()</code> or <code>all()</code> statements
 bypass it.</li>
-<li>Each move covers one table row. A key's rows in other tables need one move per table.</li>
+<li>Each move covers one table row. The key mapping is per key, not per table, so a <code>reassignShard</code> on one table strands the key's rows in the other tables. Relocating an organization's related rows across tables is an application procedure built from one move per table.</li>
 <li>Nothing is atomic across shards. The journal makes an interrupted move recoverable, and nothing else.</li>
 <li>Production D1 batch rollback has not been tested. The D1 declaration rests on local workerd runs.</li>
 </ul>
@@ -1574,6 +1585,10 @@ ANALYZE;
 <td>The coordinator returned an error while reconcile listed or pruned allocations</td>
 </tr>
 <tr>
+<td><code>RECONCILE_VERIFY_REQUIRED</code></td>
+<td><code>reconcileAllocations</code> got <code>repair</code> without <code>verifyRecords</code>. Not retryable; add <code>verifyRecords</code></td>
+</tr>
+<tr>
 <td><code>JOURNAL_NOT_CONFIGURED</code></td>
 <td>A move, <code>recoverMigrations</code>, or a non-dry <code>rebalance</code> runs on a multi-shard config without <code>journalShard</code></td>
 </tr>
@@ -1600,6 +1615,22 @@ ANALYZE;
 <tr>
 <td><code>MIGRATION_CUTOVER_PENDING</code></td>
 <td>A write cannot tell which shard owns the key during a move. Retryable</td>
+</tr>
+<tr>
+<td><code>MIGRATION_LOOKUP_UNAVAILABLE</code></td>
+<td>Tombstone lookup failed (retryable) or names an unknown shard (not). <code>bestEffort</code> reads not found</td>
+</tr>
+<tr>
+<td><code>MIGRATION_CHAIN_EXCEEDED</code></td>
+<td>Move chain loops or runs past four tombstone hops. Not retryable. <code>bestEffort</code> reads not found</td>
+</tr>
+<tr>
+<td><code>RECOVERY_IN_PROGRESS</code></td>
+<td>Another recovery holds the lease for this scope. Retryable; a scheduler can treat it as success</td>
+</tr>
+<tr>
+<td><code>RECOVERY_FENCED</code></td>
+<td>This recovery lost its lease mid-run and made no further writes. Not retryable; the next call recovers</td>
 </tr>
 <tr>
 <td><code>MIGRATION_SOURCE_TOMBSTONED</code></td>
@@ -2371,14 +2402,15 @@ ids come from <code>nextId()</code></li>
 </code><button type="button">Copy</button></pre>
 
 <h4 id="reconciling-allocations" class="tsd-anchor-link">Reconciling Allocations<a href="#reconciling-allocations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h4>
-<p><code>reconcileAllocations</code> compares the coordinator's allocation ledger with the shard each key lives on. The KV mapping is the record, and the ledger is advisory. Call it after <code>initialize</code>. It throws <code>COORDINATOR_NOT_CONFIGURED</code> when the config has no <code>coordinator</code>.</p>
+<p><code>reconcileAllocations</code> compares the coordinator's allocation ledger with routing metadata: the KV mapping, or the computed owner for a key with no mapping. The KV mapping is the record, and the ledger is advisory. Call it after <code>initialize</code>. It throws <code>COORDINATOR_NOT_CONFIGURED</code> when the config has no <code>coordinator</code>.</p>
+<p>Routing agreement does not show that a row exists. Pass <code>verifyRecords</code> with the tables to check, and each key's primary key is probed on the shard routing points at (the ledger shard when a key has no mapping). <code>pkColumn</code> names the key column of a table and defaults to <code>id</code>. Without <code>verifyRecords</code>, no shard is queried and every examined row counts as <code>recordUnchecked</code>. With it, each row lands in one count: <code>recordVerified</code> when a listed table holds the key, <code>recordMissing</code> (with <code>recordMissingCount</code> for the total) when none does, and <code>recordUnchecked</code> when the probe could not run, because the shard is not configured, the table list is empty, or the query threw. A row on the routed shard is not proof that it is the authoritative copy. A shard that holds a tombstone can keep a retained row, and for moved keys the journal is the authority.</p>
 <p>The run is observational by default and writes nothing unless a flag is set:</p>
 <ul>
-<li><code>repair: true</code> writes a KV mapping for each key that has none, using the ledger shard when it is configured.</li>
-<li><code>pruneVerified: true</code> removes ledger rows whose shard matches their KV mapping. Rows that match only the computed placement stay.</li>
+<li><code>repair: true</code> writes a KV mapping for each key with no KV mapping and no computed owner, using the ledger shard, and only when the probe finds the key's row there. It requires <code>verifyRecords</code>; without it the call throws <code>RECONCILE_VERIFY_REQUIRED</code>.</li>
+<li><code>pruneVerified: true</code> removes ledger rows that agree with routing and have an explicit KV mapping. With <code>verifyRecords</code>, the row must also be verified. Rows that match only the computed placement stay.</li>
 </ul>
 <p>Disagreements are reported and never resolved. Key lists in the report hold at most 1,000 entries, and the counts are exact.</p>
-<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">reconcileAllocations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-8">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">reconcileAllocations</span><span class="hl-1">({ </span><span class="hl-5">limit:</span><span class="hl-1"> </span><span class="hl-9">100</span><span class="hl-1"> });</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">examined</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">agreed</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">missingMappingCount</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">disagreeingCount</span><span class="hl-1">);</span>
+<pre><code class="typescript"><span class="hl-4">import</span><span class="hl-1"> { </span><span class="hl-5">reconcileAllocations</span><span class="hl-1"> } </span><span class="hl-4">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@earth-app/collegedb&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-6">const</span><span class="hl-1"> </span><span class="hl-8">report</span><span class="hl-1"> = </span><span class="hl-4">await</span><span class="hl-1"> </span><span class="hl-0">reconcileAllocations</span><span class="hl-1">({</span><br/><span class="hl-1">	</span><span class="hl-5">limit:</span><span class="hl-1"> </span><span class="hl-9">100</span><span class="hl-1">,</span><br/><span class="hl-1">	</span><span class="hl-5">verifyRecords:</span><span class="hl-1"> { </span><span class="hl-5">tables:</span><span class="hl-1"> [{ </span><span class="hl-5">table:</span><span class="hl-1"> </span><span class="hl-2">&#39;users&#39;</span><span class="hl-1"> }] }</span><br/><span class="hl-1">});</span><br/><span class="hl-5">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">examined</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">routingAgreed</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">recordMissingCount</span><span class="hl-1">, </span><span class="hl-5">report</span><span class="hl-1">.</span><span class="hl-5">disagreeingCount</span><span class="hl-1">);</span>
 </code><button type="button">Copy</button></pre>
 
 <h4 id="advanced-monitoring-setup" class="tsd-anchor-link">Advanced Monitoring Setup<a href="#advanced-monitoring-setup" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h4>
