@@ -25,6 +25,26 @@ export class FaultPlan {
 	private failAt: number | null = null;
 	private failMode: 'before' | 'after' = 'before';
 	private dead = false;
+	private pauses: Array<{ match: RegExp; reached: () => void; gate: Promise<void> }> = [];
+	private crashes: RegExp[] = [];
+
+	/**
+	 * Holds the next operation whose label matches, before it runs, until `resume`
+	 * is called. `reached` settles once the operation is held. The pause fires once.
+	 */
+	pauseOn(match: RegExp): { reached: Promise<void>; resume: () => void } {
+		let reachedFn!: () => void;
+		let resume!: () => void;
+		const reached = new Promise<void>((done) => (reachedFn = done));
+		const gate = new Promise<void>((done) => (resume = done));
+		this.pauses.push({ match, reached: reachedFn, gate });
+		return { reached, resume };
+	}
+
+	/** Kills the process at the next operation whose label matches, without running it. */
+	crashOn(match: RegExp): void {
+		this.crashes.push(match);
+	}
 
 	/** Fails the nth operation from now. */
 	arm(n: number, mode: 'before' | 'after' = 'before'): void {
@@ -56,6 +76,20 @@ export class FaultPlan {
 	async guard<T>(label: string, work: () => Promise<T>): Promise<T> {
 		if (this.dead) {
 			throw new InjectedFault(`process is down (${label})`);
+		}
+
+		const pauseAt = this.pauses.findIndex((pause) => pause.match.test(label));
+		if (pauseAt >= 0) {
+			const [pause] = this.pauses.splice(pauseAt, 1);
+			pause!.reached();
+			await pause!.gate;
+		}
+
+		const crashAt = this.crashes.findIndex((match) => match.test(label));
+		if (crashAt >= 0) {
+			this.crashes.splice(crashAt, 1);
+			this.dead = true;
+			throw new InjectedFault(`crash before: ${label}`);
 		}
 
 		const n = ++this.count;

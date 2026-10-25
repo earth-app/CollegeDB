@@ -17,6 +17,10 @@ import {
 	buildGuardedUpsert,
 	buildInsertIgnore,
 	buildJournalSchema,
+	buildLeaseAcquire,
+	buildLeaseFence,
+	buildLeaseRelease,
+	buildLeaseRenew,
 	buildShardSidecarSchema,
 	buildWriteLock,
 	isProvenJournalDialect,
@@ -386,6 +390,76 @@ describe('Journal statement builders', () => {
 		expect(buildInsertIgnore('t', { a: 1 }, 'sqlite').sql).toBe('INSERT OR IGNORE INTO "t" ("a") VALUES (?)');
 		expect(buildInsertIgnore('t', { a: 1 }, 'mysql').sql).toBe('INSERT IGNORE INTO `t` (`a`) VALUES (?)');
 		expect(buildInsertIgnore('t', { a: 1 }, 'postgres').sql).toBe('INSERT INTO "t" ("a") VALUES (?) ON CONFLICT DO NOTHING');
+	});
+
+	describe('recovery lease statements', () => {
+		const fence = { scope: 'default', generation: 3 };
+
+		it('takes the lease with one upsert whose update only applies to an expired row', () => {
+			const sqlite = buildLeaseAcquire('default', 'h1', 1000, 60_000, 'sqlite');
+
+			expect(sqlite.sql).toBe(
+				'INSERT INTO "collegedb_recovery_lease" ("scope", "holder", "generation", "expires_at") VALUES (?, ?, 1, ?) ' +
+					'ON CONFLICT ("scope") DO UPDATE SET "holder" = EXCLUDED."holder", ' +
+					'"generation" = "collegedb_recovery_lease"."generation" + 1, "expires_at" = EXCLUDED."expires_at" ' +
+					'WHERE "collegedb_recovery_lease"."expires_at" <= ?'
+			);
+			expect(sqlite.bindings).toEqual(['default', 'h1', 61_000, 1000]);
+			expect(buildLeaseAcquire('default', 'h1', 1000, 60_000, 'postgres')).toEqual(sqlite);
+		});
+
+		it('spells the takeover with IF() on MySQL and MariaDB, which have no conditional upsert', () => {
+			const { sql, bindings } = buildLeaseAcquire('default', 'h1', 1000, 60_000, 'mysql');
+
+			expect(sql).toContain('ON DUPLICATE KEY UPDATE `holder` = IF(`expires_at` <= ?, VALUES(`holder`), `holder`)');
+			expect(sql).toContain('`generation` = IF(`expires_at` <= ?, `generation` + 1, `generation`)');
+			// expires_at is assigned last, so the first two assignments still read its old value
+			expect(sql.endsWith('`expires_at` = IF(`expires_at` <= ?, VALUES(`expires_at`), `expires_at`)')).toBe(true);
+			expect(bindings).toEqual(['default', 'h1', 61_000, 1000, 1000, 1000]);
+		});
+
+		it('renews and releases only the generation the caller holds, and release zeroes the expiry', () => {
+			expect(buildLeaseRenew(fence, 9000, 'sqlite')).toEqual({
+				sql: 'UPDATE "collegedb_recovery_lease" SET "expires_at" = ? WHERE "scope" = ? AND "generation" = ?',
+				bindings: [9000, 'default', 3]
+			});
+			expect(buildLeaseRelease(fence, 'mysql')).toEqual({
+				sql: 'UPDATE `collegedb_recovery_lease` SET `expires_at` = ? WHERE `scope` = ? AND `generation` = ?',
+				bindings: [0, 'default', 3]
+			});
+		});
+
+		it('fences a journal insert in the statement itself, per dialect', () => {
+			expect(buildLeaseFence(fence).sql).toBe('(SELECT "generation" FROM "collegedb_recovery_lease" WHERE "scope" = ?) = ?');
+
+			const sqlite = buildInsertIgnore('t', { a: 1 }, 'sqlite', fence);
+			expect(sqlite.sql).toBe(
+				'INSERT OR IGNORE INTO "t" ("a") SELECT ? WHERE (SELECT "generation" FROM "collegedb_recovery_lease" WHERE "scope" = ?) = ?'
+			);
+			expect(sqlite.bindings).toEqual([1, 'default', 3]);
+
+			const mysql = buildInsertIgnore('t', { a: 1 }, 'mysql', fence);
+			expect(mysql.sql.startsWith('INSERT IGNORE INTO `t` (`a`) SELECT ? FROM DUAL WHERE (SELECT')).toBe(true);
+
+			const postgres = buildInsertIgnore('t', { a: 1 }, 'postgres', fence);
+			expect(postgres.sql.endsWith('= ? ON CONFLICT DO NOTHING')).toBe(true);
+		});
+
+		it('defines the lease table and the history key index on every dialect', () => {
+			for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
+				const schema = buildJournalSchema(dialect).join('\n');
+				expect(schema).toContain('CREATE TABLE IF NOT EXISTS collegedb_recovery_lease');
+				expect(schema).toContain('PRIMARY KEY (scope))');
+			}
+
+			// MySQL has no CREATE INDEX IF NOT EXISTS, so the index is part of the table
+			expect(buildJournalSchema('sqlite')).toContain(
+				'CREATE INDEX IF NOT EXISTS collegedb_history_by_key ON collegedb_migration_history (scope, primary_key, table_name)'
+			);
+			expect(buildJournalSchema('postgres').join('\n')).toContain('CREATE INDEX IF NOT EXISTS collegedb_history_by_key');
+			expect(buildJournalSchema('mysql').join('\n')).not.toContain('CREATE INDEX');
+			expect(buildJournalSchema('mysql').join('\n')).toContain(', INDEX collegedb_history_by_key (scope, primary_key, table_name))');
+		});
 	});
 
 	describe('buildCutoverStatements', () => {

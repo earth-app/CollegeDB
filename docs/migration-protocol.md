@@ -34,7 +34,8 @@ Tables
 On the journal shard:
 
 - `collegedb_migration_active(scope, table_name, primary_key, op_id, claimed_at)`, primary key `(scope, table_name, primary_key)`. A move claims its key by insert. A second claim fails, so two moves of one key cannot run. The row is deleted at a terminal state.
-- `collegedb_migration_history(op_id, state, attempt, scope, table_name, primary_key, source, destination, generation, placement_epoch, digest, detail, at)`, primary key `(op_id, state, attempt)`. Append only. The current state of an operation is the highest state it has reached.
+- `collegedb_migration_history(op_id, state, attempt, scope, table_name, primary_key, source, destination, generation, placement_epoch, digest, detail, at)`, primary key `(op_id, state, attempt)`. Append only. The current state of an operation is the highest state it has reached. The index `collegedb_history_by_key` on `(scope, primary_key, table_name)` serves `getMigrationStatus` and the generation lookup of a new move. On SQLite and Postgres it is created with `CREATE INDEX IF NOT EXISTS`. MySQL has no such form, so it is part of the table definition there, and a history table created by a build without it keeps none.
+- `collegedb_recovery_lease(scope, holder, generation, expires_at)`, primary key `scope`. The row that serializes recovery. See Recovery lease.
 - `collegedb_placement_exceptions(scope, hashed_key, added_at)`. The durable record of keys placed off their computed shard. The KV set is a derived copy.
 - `collegedb_migration_verification(scope, completed_at, clean)`. The last completed verification pass.
 
@@ -108,11 +109,61 @@ Every rule is covered by a crash test that injects a failure before or after the
 
 A claim with no journal history, left by a crash between the claim and the first record, is released only after 60 seconds, so recovery does not release the claim of a move that is starting. `recoverMigrations({ olderThanMs })` also leaves alone any operation that changed more recently than that.
 
-Recovery and a live move may drive the same operation at once. Every step is safe to run twice, and an abort is refused once the operation's archive row exists, which is the physical proof that the cutover ran. Tests run recovery inside a live move after each step. Two recoveries at once are UNPROVEN: they can race on the destination insert and on which snapshot digest gets journaled for an attempt. Run one.
+Recovery and a live move may drive the same operation at once. Every step is safe to run twice, and an abort is refused once the operation's archive row exists, which is the physical proof that the cutover ran. Tests run recovery inside a live move after each step. A live move does not take the recovery lease below.
 
-Nothing runs recovery on its own. A crash after the cutover leaves the key readable but refuses its writes with `MIGRATION_CUTOVER_PENDING` until `recoverMigrations()` runs, so schedule it, and run it after any deploy that may have interrupted a move. A claim left by a crash also blocks a second move of that key with `MIGRATION_IN_PROGRESS`.
+Nothing starts recovery on its own. A crash after the cutover leaves the key readable but refuses its writes with `MIGRATION_CUTOVER_PENDING` until `recoverMigrations()` runs, so schedule it, and run it after any deploy that may have interrupted a move. A claim left by a crash also blocks a second move of that key with `MIGRATION_IN_PROGRESS`.
 
 `rebalance` needs a journal for the same reason. A dry run only reports and does not.
+
+Recovery lease
+--------------
+
+One recovery runs per journal scope. `recoverMigrations()` first takes a row in `collegedb_recovery_lease` with one compare-and-swap statement: insert when the scope has no row, or update when `expires_at` is at or before the caller's clock. Each takeover adds one to `generation`. The caller then reads the row back and compares the holder, because drivers differ on whether they report an update that changed nothing. If another holder has a live lease, the call throws `RECOVERY_IN_PROGRESS` before it touches any operation. The error is retryable and a scheduler should treat it as a normal outcome, since another recovery is doing the work.
+The lease lasts 60 seconds. The holder renews it before each operation, with a statement conditional on its generation, so a long pass keeps it. A normal finish sets `expires_at` to 0 and keeps the row, so the generation never goes backward. A holder that crashes leaves the lease to run out, and the next caller after expiry takes it at generation plus one. `verifyMigrations({ repair: true })` runs recovery, so it takes the lease the same way and throws the same errors.
+
+Expiry compares the clocks of the isolates. Skew between them only shortens or lengthens the wait before a takeover. It never decides who may write, because the generation does.
+
+Fencing. A holder that is paused or slow can lose its lease while it still runs. Every journal write the recovery executor makes (state rows, claim release, renewal) carries the condition "the lease row of this scope still holds my generation" inside the statement, so a stale executor's write matches no row. A write that reports no change is ambiguous (a fenced miss, an ignored duplicate, a claim already gone), so the executor reads the lease then. If the generation moved, it stops, makes no further shard writes, and throws `RECOVERY_FENCED`. That error is not retryable by that executor: the new holder owns the work, and the next scheduled call starts a fresh recovery. Before each cross-shard step (the destination copy or its removal, the cleanup of old tombstones, the source cutover, the publish of derived state) the executor also reads the generation and stops if it changed.
+
+The remaining window. A journal write and a shard write live in different databases, so the check before a shard step cannot be atomic with the step. An executor that is paused after its check and resumes after a takeover can still run that one step. The protocol absorbs it:
+
+- Every step can run twice, and the new holder reads the shards before it acts.
+- The cutover is a compare-and-swap on the source row. If the new holder already cut over, the source row is gone and the stale cutover matches nothing.
+- An abort is refused once the archive row exists.
+
+What it can leave behind is a destination copy of a snapshot the journal recorded, after the new holder aborted the move. The source stays the owner and routing ignores the copy, and a later move of that key meets it under the destination conflict rules. A stale cutover after an abort needs the source row to change and then return to the exact snapshot, which nothing here defends against. Both are UNPROVEN: the tests pause an executor before the check, not between the check and the step.
+
+A scheduler on Workers runs recovery from `scheduled()` and treats `RECOVERY_IN_PROGRESS` as success:
+
+```ts
+import { CollegeDBError, initialize, recoverMigrations } from '@earth-app/collegedb';
+
+export default {
+	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+		initialize({
+			kv: env.KV,
+			shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+			strategy: 'hash',
+			journalShard: 'db-east',
+			waitUntil: (promise) => ctx.waitUntil(promise)
+		});
+
+		try {
+			const report = await recoverMigrations();
+			if (report.failed.length > 0) {
+				console.error('moves needing attention', report.failed);
+			}
+		} catch (error) {
+			if (error instanceof CollegeDBError && error.code === 'RECOVERY_IN_PROGRESS') {
+				return;
+			}
+			throw error;
+		}
+	}
+};
+```
+
+A `RECOVERY_FENCED` throw is also safe to let through: the Worker run fails, the lease belongs to someone else, and the next tick recovers normally.
 
 Retention
 ---------
@@ -203,6 +254,12 @@ The table lists what the suite runs. Anything not listed is UNPROVEN.
 | Manifest compare-and-swap, the fence race with a control arm, `pruneEpochs` dry run then real, and the DDL twice, on Postgres, MySQL, MariaDB and SQLite             | sandbox scenario `topology_cas`                              |
 | Upsert on MySQL and MariaDB over a moved key and racing the cutover                                                                                                  | sandbox scenarios `journal_move`, `stale_route_write`        |
 | The single-connection gate on SQLite, `pg.Client` and `mysql2`: plain statements wait behind an open batch and batches run one at a time                             | `tests/providers.spec.ts`, `Single-connection batch gate`    |
+| Two recoveries started together: one runs, the other throws `RECOVERY_IN_PROGRESS`, for a move left at `prepared`, `cutover_pending` and `committed`                 | `tests/migration-journal.spec.ts`, `Recovery lease`          |
+| A stale executor throws `RECOVERY_FENCED`, writes no journal row, and writes no destination row (the second test makes no write at all) after a takeover             | same describe                                                |
+| A crashed holder blocks recovery until expiry, a later call takes over at generation plus one, and the generation rises across acquire, release, acquire             | same describe                                                |
+| `verifyMigrations({ repair: true })` takes the lease; a plain verify and a live move do not                                                                          | same describe                                                |
+| The lease table and history index created twice over one SQLite database                                                                                             | same describe                                                |
+| Lease acquire, renew, release and fenced insert statements per dialect, and the history index DDL per dialect                                                        | `tests/query.spec.ts`, `recovery lease statements`           |
 
 What the runs measured
 ----------------------
@@ -243,3 +300,6 @@ Values with no portable encoding, such as a JSON object column returned as an ob
 - Writes keyed on a column other than the table's key column after a topology change. The probe checks the key column only.
 - Concurrent writers to one key during a topology change. The probe and the write are not atomic.
 - Manifest and KV refresh across isolates with real KV and D1.
+- The recovery lease on Postgres, MySQL and MariaDB. A one-off probe ran the acquire, renew, fenced insert, takeover after expiry and the DDL twice against Postgres 18, MySQL and MariaDB, with 40 concurrent pairs and 40 concurrent quads of `recoverMigrations()` on each, and found no violation. It is not part of any suite. Nothing has run the lease on D1.
+- A recovery executor paused between its lease check and the shard step it guards. See Recovery lease.
+- A MySQL history table created before the key index existed. It keeps no index and `getMigrationStatus` scans it.

@@ -34,12 +34,17 @@
 import { CollegeDBError } from './errors';
 import type { KVShardMapper } from './kvmap';
 import {
+	LEASE_TABLE,
 	PROVEN_JOURNAL_DIALECTS,
 	RETIRED_TABLE,
 	buildCutoverStatements,
 	buildFenceLock,
 	buildInsertIgnore,
 	buildJournalSchema,
+	buildLeaseAcquire,
+	buildLeaseFence,
+	buildLeaseRelease,
+	buildLeaseRenew,
 	buildShardSidecarSchema,
 	buildWriteLock,
 	isProvenJournalDialect,
@@ -47,6 +52,7 @@ import {
 	validateIdentifier,
 	type BuiltQuery,
 	type CutoverSpec,
+	type LeaseFence,
 	type TombstoneGuard
 } from './query';
 import type { CollegeDBConfig, QueryResult, SQLDatabase, SQLDialect, ShardingStrategy } from './types';
@@ -1420,6 +1426,13 @@ export interface MigrationEnv {
 	placementEpoch?: () => number | null;
 	/** Clock, for tests */
 	now?: () => number;
+	/**
+	 * The recovery lease generation this executor holds. Set by
+	 * {@link recoverMigrations} on its own copy of the environment; a live move
+	 * leaves it unset and writes unfenced.
+	 * @internal
+	 */
+	fence?: LeaseFence;
 }
 
 /** A committed move, as handed to {@link MigrationEnv.publish}. @since 1.4.0 */
@@ -1499,6 +1512,9 @@ const MAX_RECOPY = 3;
 
 /** How long a claim with no journal history is left alone before recovery releases it. */
 const ORPHAN_CLAIM_GRACE_MS = 60_000;
+
+/** How long a recovery lease lasts without a renewal. Takeover after expiry bumps the generation. */
+const RECOVERY_LEASE_MS = 60_000;
 
 const HISTORY = 'collegedb_migration_history';
 const ACTIVE = 'collegedb_migration_active';
@@ -1623,6 +1639,45 @@ const runOn = (db: SQLDatabase, query: { sql: string; bindings: any[] }) =>
 		.bind(...query.bindings)
 		.run();
 
+/**
+ * Stops an executor whose recovery lease another holder took. A no-op for a live
+ * move, which holds no lease.
+ * @private
+ */
+async function assertLease(env: MigrationEnv): Promise<void> {
+	const fence = env.fence;
+	if (!fence) {
+		return;
+	}
+
+	const journal = journalDb(env);
+	const row = await journalCall(() =>
+		journal.prepare(`SELECT generation FROM ${LEASE_TABLE} WHERE scope = ?`).bind(fence.scope).first<{ generation: number }>()
+	);
+	if (Number(row?.generation) !== fence.generation) {
+		throw new CollegeDBError(
+			`Recovery lease generation ${fence.generation} for scope ${fence.scope} was taken over (now ${row ? Number(row.generation) : 'gone'}). ` +
+				'This executor made no further writes; the new holder owns the work.',
+			'RECOVERY_FENCED'
+		);
+	}
+}
+
+/**
+ * Runs one journal write. An executor that holds a lease carries the fence in the
+ * statement itself, so a stale one matches no row. A zero or unreported row count
+ * is ambiguous (a fenced miss, an ignored duplicate, a claim already gone), so the
+ * lease is read to tell them apart.
+ * @private
+ */
+async function journalWrite(env: MigrationEnv, query: BuiltQuery): Promise<void> {
+	const journal = journalDb(env);
+	const result = await journalCall(() => runOn(journal, query));
+	if (env.fence && (result.meta?.changes ?? 0) < 1) {
+		await assertLease(env);
+	}
+}
+
 function assertProven(env: MigrationEnv, bindings: string[]): void {
 	for (const binding of new Set([env.journalBinding, ...bindings])) {
 		const dialect = shardDb(env, binding).dialect;
@@ -1682,9 +1737,10 @@ async function record(
 			detail: extra.detail === undefined ? null : JSON.stringify(extra.detail),
 			at: nowOf(env)
 		},
-		journal.dialect
+		journal.dialect,
+		env.fence
 	);
-	await journalCall(() => runOn(journal, query));
+	await journalWrite(env, query);
 }
 
 async function claimKey(env: MigrationEnv, table: string, key: string, opId: string): Promise<void> {
@@ -1714,12 +1770,11 @@ async function claimKey(env: MigrationEnv, table: string, key: string, opId: str
 
 async function releaseClaim(env: MigrationEnv, h: Pick<Header, 'scope' | 'table' | 'key' | 'opId'>): Promise<void> {
 	const journal = journalDb(env);
-	await journalCall(() =>
-		journal
-			.prepare(`DELETE FROM ${ACTIVE} WHERE scope = ? AND table_name = ? AND primary_key = ? AND op_id = ?`)
-			.bind(h.scope, h.table, h.key, h.opId)
-			.run()
-	);
+	const fence = env.fence ? buildLeaseFence(env.fence, journal.dialect) : { sql: '', bindings: [] };
+	await journalWrite(env, {
+		sql: `DELETE FROM ${ACTIVE} WHERE scope = ? AND table_name = ? AND primary_key = ? AND op_id = ?${fence.sql ? ` AND ${fence.sql}` : ''}`,
+		bindings: [h.scope, h.table, h.key, h.opId, ...fence.bindings]
+	});
 }
 
 function orderOf(state: MigrationState, attempt: number): number {
@@ -1919,6 +1974,7 @@ async function discardDestinationCopy(env: MigrationEnv, h: Header): Promise<voi
 	}
 
 	const { delete: del } = buildCutoverStatements(cutoverSpec(env, h, encoded, 1, destination.dialect));
+	await assertLease(env);
 	await runOn(destination, del);
 }
 
@@ -1995,6 +2051,7 @@ async function attemptCopy(env: MigrationEnv, h: Header, attempt: number, first:
 	await hook('prepared', h);
 
 	const existing = await readRow(destination, h.table, h.options.pkColumn, h.key);
+	await assertLease(env);
 	if (existing) {
 		const existingEncoded = encodeRow(existing);
 		if (existingEncoded.payload !== encoded.payload) {
@@ -2040,6 +2097,7 @@ async function runCutover(env: MigrationEnv, h: Header, attempt: number, encoded
 	assertAtomicBatch(source, `Shard ${h.source}`, CUTOVER_NEEDS_ATOMIC);
 
 	const statements = buildCutoverStatements(cutoverSpec(env, h, encoded, nowOf(env), source.dialect));
+	await assertLease(env);
 	await source.runBatch!([
 		...buildWriteLock({ scope: env.scope, table: h.table, key: h.key }, source.dialect),
 		{ sql: statements.archive.sql, bindings: statements.archive.bindings },
@@ -2074,11 +2132,13 @@ async function finalize(env: MigrationEnv, h: Header, from: 'committed' | 'publi
 		await hook('committed', h);
 
 		const destination = shardDb(env, h.destination);
+		await assertLease(env);
 		await destination
 			.prepare(`DELETE FROM ${RETIRED_TABLE} WHERE scope = ? AND table_name = ? AND primary_key = ? AND op_id <> ?`)
 			.bind(env.scope, h.table, h.key, h.opId)
 			.run();
 
+		await assertLease(env);
 		try {
 			await env.publish({
 				opId: h.opId,
@@ -2308,19 +2368,72 @@ async function resume(env: MigrationEnv, op: OpRecord): Promise<MoveResult | nul
  * rest continue. If the journal itself cannot be read, nothing proceeds and the
  * call throws.
  *
- * Recovery and a live move can both drive one operation: each step is safe to
- * run twice, and an abort is refused once the cutover has run. Two recoveries at
- * once are not proven; run one. Pass `olderThanMs` to leave alone operations that
- * changed more recently, so a timer does not race a move that is still going.
+ * One recovery runs per scope at a time. It takes a lease row in the journal
+ * first, with a compare-and-swap that bumps a generation, and every journal write
+ * it makes after that carries the generation in the statement. A second call
+ * while the lease is live throws `RECOVERY_IN_PROGRESS`, which a scheduler can
+ * treat as success. A holder that crashed is taken over after the lease expires
+ * (60 seconds without a renewal). An executor whose lease was taken over stops at
+ * its next journal write or cross-shard step and throws `RECOVERY_FENCED`.
+ *
+ * A live move does not take the lease. Recovery and a live move can both drive one
+ * operation: each step is safe to run twice, and an abort is refused once the
+ * cutover has run. Pass `olderThanMs` to leave alone operations that changed more
+ * recently, so a timer does not race a move that is still going.
  *
  * @param env - Journal, shards and the publish hook
  * @param options - `olderThanMs` skips operations touched more recently than that
  * @returns What happened to each active claim
- * @throws {CollegeDBError} `JOURNAL_UNAVAILABLE` when the active list cannot be read
+ * @throws {CollegeDBError} `RECOVERY_IN_PROGRESS` when another recovery holds the lease; `RECOVERY_FENCED` when this one lost it mid-run; `JOURNAL_UNAVAILABLE` when the journal cannot be read
  * @since 1.4.0
  */
 export async function recoverMigrations(env: MigrationEnv, options: { olderThanMs?: number } = {}): Promise<RecoveryReport> {
 	await ensureJournalSchema(env.shards, env.journalBinding);
+	const fence = await acquireLease(env);
+
+	let fenced = false;
+	try {
+		return await recoverUnderLease({ ...env, fence }, options);
+	} catch (error) {
+		fenced = error instanceof CollegeDBError && error.code === 'RECOVERY_FENCED';
+		throw error;
+	} finally {
+		// best effort: a failed release only leaves the lease to expire; a fenced executor writes nothing more
+		if (!fenced) {
+			const journal = journalDb(env);
+			await runOn(journal, buildLeaseRelease(fence, journal.dialect)).catch(() => undefined);
+		}
+	}
+}
+
+/**
+ * Takes the recovery lease of the scope, or throws `RECOVERY_IN_PROGRESS`. The
+ * holder is a fresh id per call, so the read after the swap tells whether this
+ * call won it.
+ * @private
+ */
+async function acquireLease(env: MigrationEnv): Promise<LeaseFence> {
+	const journal = journalDb(env);
+	const holder = crypto.randomUUID();
+
+	return await journalCall(async () => {
+		await runOn(journal, buildLeaseAcquire(env.scope, holder, nowOf(env), RECOVERY_LEASE_MS, journal.dialect));
+		const row = await journal
+			.prepare(`SELECT holder, generation FROM ${LEASE_TABLE} WHERE scope = ?`)
+			.bind(env.scope)
+			.first<{ holder: string; generation: number }>();
+
+		if (row?.holder !== holder) {
+			throw new CollegeDBError(
+				`Another recovery holds the lease for scope ${env.scope}; it will finish or its lease will expire, so retry later`,
+				'RECOVERY_IN_PROGRESS'
+			);
+		}
+		return { scope: env.scope, generation: Number(row.generation) };
+	});
+}
+
+async function recoverUnderLease(env: MigrationEnv, options: { olderThanMs?: number }): Promise<RecoveryReport> {
 	const journal = journalDb(env);
 	const claims = await journalCall(
 		async () =>
@@ -2336,6 +2449,8 @@ export async function recoverMigrations(env: MigrationEnv, options: { olderThanM
 	const quietFor = options.olderThanMs ?? 0;
 
 	for (const claim of claims) {
+		await journalWrite(env, buildLeaseRenew(env.fence!, nowOf(env) + RECOVERY_LEASE_MS, journal.dialect));
+
 		try {
 			const op = await loadOp(env, claim.op_id);
 			if (!op) {
@@ -2363,6 +2478,9 @@ export async function recoverMigrations(env: MigrationEnv, options: { olderThanM
 				report.aborted.push({ opId: op.opId, key: op.key, reason: result.reason ?? 'ABORTED' });
 			}
 		} catch (error) {
+			if (error instanceof CollegeDBError && error.code === 'RECOVERY_FENCED') {
+				throw error;
+			}
 			report.failed.push({
 				opId: claim.op_id,
 				key: claim.primary_key,
@@ -2448,10 +2566,12 @@ async function listTombstones(db: SQLDatabase, scope: string) {
  * `repair`, unfinished operations are resumed and a ghost is removed only when
  * it equals the archived payload; any other ghost is reported and kept. The
  * result of the pass is recorded, which is what {@link purgeRetired} waits for.
+ * Repair runs {@link recoverMigrations}, so it takes the same lease.
  *
  * @param env - Journal and shards
  * @param options - `repair` to resume operations and remove ghosts equal to the archive
  * @returns What was found and what was repaired
+ * @throws {CollegeDBError} With `repair`: `RECOVERY_IN_PROGRESS` when another recovery holds the lease, `RECOVERY_FENCED` when this one lost it
  * @since 1.4.0
  */
 export async function verifyMigrations(env: MigrationEnv, options: { repair?: boolean } = {}): Promise<VerifyReport> {

@@ -360,6 +360,7 @@ describe('Router utility helpers', () => {
 				'collegedb_migration_history',
 				'collegedb_migration_verification',
 				'collegedb_placement_exceptions',
+				'collegedb_recovery_lease',
 				'collegedb_retired',
 				'collegedb_topology'
 			]);

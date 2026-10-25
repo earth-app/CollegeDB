@@ -23,10 +23,11 @@ import {
 	upsert,
 	verifyMigrations
 } from '../src/index';
-import { runGuardedWrite, setMigrationStepHook } from '../src/migrations';
+import { ensureJournalSchema, runGuardedWrite, setMigrationStepHook } from '../src/migrations';
 import { addPlacementException, createManifest, resetPlacementState } from '../src/placement';
 import { raiseFence, readFence } from '../src/topology';
 import type { BatchStatement, KVStorage, SQLDatabase, SQLDialect } from '../src/types';
+import { restoreClock, setClock } from './helpers/clock';
 import {
 	createNodeSqliteClient,
 	createNodeSqliteProvider,
@@ -138,8 +139,7 @@ async function seed(world: World, key: string, row: Record<string, unknown> = {}
 
 /** Moves the clock past the time recovery leaves a claim with no history alone. */
 function pastOrphanGrace(): void {
-	vi.useFakeTimers({ toFake: ['Date'] });
-	vi.setSystemTime(Date.now() + 61_000);
+	setClock(Date.now() + 61_000);
 }
 
 async function codeOf(work: Promise<unknown>): Promise<string | undefined> {
@@ -153,7 +153,7 @@ async function codeOf(work: Promise<unknown>): Promise<string | undefined> {
 
 afterEach(() => {
 	setMigrationStepHook(null);
-	vi.useRealTimers();
+	restoreClock();
 	resetConfig();
 });
 
@@ -644,8 +644,7 @@ describe('A journaled move', () => {
 	});
 
 	it('records the retention deadline, seven days by default and now for immediate', async () => {
-		vi.useFakeTimers({ toFake: ['Date'] });
-		vi.setSystemTime(1_000_000);
+		setClock(1_000_000);
 		await seed(world, 'a', {});
 		await seed(world, 'b', {});
 
@@ -1414,6 +1413,210 @@ describe('Recovery running while a move is still going', () => {
 
 // #endregion
 
+// #region recovery lease
+
+describe('Recovery lease', () => {
+	const HISTORY_INSERT = /db-j run INSERT OR IGNORE INTO "collegedb_migration_histo/;
+	let world: World;
+
+	beforeEach(async () => {
+		resetConfig();
+		resetPlacementState();
+		world = makeWorld();
+		await start(world);
+		await seed(world, 'k', { name: 'Ada' });
+	});
+
+	/** Stops a live move right after the given step, as a crash would. */
+	async function leaveMoveAt(step: 'prepared' | 'cutover_pending' | 'committed'): Promise<void> {
+		setMigrationStepHook((at) => {
+			if (at === step) {
+				throw new Error(`crash after ${step}`);
+			}
+		});
+		await reassignShard('k', TARGET, 'items').catch(() => undefined);
+		setMigrationStepHook(null);
+		expect(await getMigrationStatus('k')).toMatchObject({ state: step, active: true });
+	}
+
+	function leaseRows(): Array<{ scope: string; holder: string; generation: number; expires_at: number }> {
+		return world.raw[JOURNAL]!.prepare('SELECT * FROM collegedb_recovery_lease').all() as any;
+	}
+
+	function historyRows(): unknown[] {
+		return world.raw[JOURNAL]!.prepare(
+			'SELECT op_id, state, attempt FROM collegedb_migration_history ORDER BY op_id, state, attempt'
+		).all();
+	}
+
+	function jumpClock(ms: number): void {
+		setClock(Date.now() + ms);
+	}
+
+	async function expectOneOwner(): Promise<void> {
+		const holders = [SOURCE, TARGET].filter((shard) => rowsOn(world, shard, 'k').length > 0);
+		expect(holders).toHaveLength(1);
+		expect(rowsOn(world, holders[0]!, 'k')).toMatchObject([{ name: 'Ada' }]);
+		expect(tombstones(world, holders[0]!, 'k')).toHaveLength(0);
+		expect(await mappingOf(world.kv, 'k')).toBe(holders[0]);
+		expect(activeClaims(world)).toBe(0);
+	}
+
+	for (const step of ['prepared', 'cutover_pending', 'committed'] as const) {
+		it(`lets one of two simultaneous recoveries run a move left at ${step}, and the other is refused`, async () => {
+			await leaveMoveAt(step);
+
+			const results = await Promise.allSettled([recoverMigrations(), recoverMigrations()]);
+			const ran = results.filter(
+				(result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof recoverMigrations>>> => result.status === 'fulfilled'
+			);
+			const refused = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+
+			expect(ran).toHaveLength(1);
+			expect(refused).toHaveLength(1);
+			expect(refused[0]!.reason).toBeInstanceOf(CollegeDBError);
+			expect(refused[0]!.reason.code).toBe('RECOVERY_IN_PROGRESS');
+			expect(ran[0]!.value.failed).toEqual([]);
+			expect(ran[0]!.value.committed).toHaveLength(1);
+			await expectOneOwner();
+		});
+	}
+
+	it('stops a stale executor at its next journal write once another holder took the lease', async () => {
+		await leaveMoveAt('prepared');
+		const pause = world.plan.pauseOn(HISTORY_INSERT);
+		const stale = recoverMigrations().then(
+			() => undefined,
+			(error: unknown) => error
+		);
+		await pause.reached;
+		expect(leaseRows()).toMatchObject([{ generation: 1 }]);
+
+		// the lease runs out, a second holder takes it, and the row it was about to copy is gone
+		jumpClock(61_000);
+		world.raw[SOURCE]!.prepare('DELETE FROM items WHERE id = ?').run('k');
+		const report = await recoverMigrations();
+		expect(report.aborted).toMatchObject([{ reason: 'SOURCE_ROW_MISSING' }]);
+		expect(leaseRows()).toMatchObject([{ generation: 2 }]);
+
+		const history = historyRows();
+		const mark = world.plan.log.length;
+		pause.resume();
+		const error = (await stale) as CollegeDBError;
+
+		expect(error).toBeInstanceOf(CollegeDBError);
+		expect(error.code).toBe('RECOVERY_FENCED');
+		expect(historyRows()).toEqual(history);
+		expect(rowsOn(world, TARGET, 'k')).toHaveLength(0);
+		expect(leaseRows()).toMatchObject([{ generation: 2 }]);
+
+		// the held statement is the only write the stale executor issues, and it matched no row
+		const tail = world.plan.log.slice(mark);
+		expect(tail.filter((entry) => /db-[ab] (run|batch)/.test(entry))).toEqual([]);
+		expect(tail.filter((entry) => /db-j (run|batch)/.test(entry))).toHaveLength(1);
+	});
+
+	it('stops a stale executor before a destination write with reads only', async () => {
+		await leaveMoveAt('prepared');
+		const pause = world.plan.pauseOn(/db-b first/);
+		const stale = recoverMigrations().then(
+			() => undefined,
+			(error: unknown) => error
+		);
+		await pause.reached;
+
+		jumpClock(61_000);
+		world.raw[SOURCE]!.prepare('DELETE FROM items WHERE id = ?').run('k');
+		await recoverMigrations();
+		expect(leaseRows()).toMatchObject([{ generation: 2 }]);
+
+		const history = historyRows();
+		const mark = world.plan.log.length;
+		pause.resume();
+		const error = (await stale) as CollegeDBError;
+
+		expect(error.code).toBe('RECOVERY_FENCED');
+		expect(rowsOn(world, TARGET, 'k')).toHaveLength(0);
+		expect(historyRows()).toEqual(history);
+		const tail = world.plan.log.slice(mark);
+		expect(tail.length).toBeGreaterThan(0);
+		expect(tail.filter((entry) => /db-[abj] (run|batch)/.test(entry))).toEqual([]);
+	});
+
+	it('refuses a second recovery while a crashed one still holds the lease, and takes over after expiry', async () => {
+		await leaveMoveAt('prepared');
+		world.plan.crashOn(HISTORY_INSERT);
+		await recoverMigrations().catch(() => undefined);
+		world.plan.revive();
+
+		expect(leaseRows()).toMatchObject([{ generation: 1 }]);
+		expect(leaseRows()[0]!.expires_at).toBeGreaterThan(Date.now());
+		expect(await codeOf(recoverMigrations())).toBe('RECOVERY_IN_PROGRESS');
+		expect(activeClaims(world)).toBe(1);
+
+		jumpClock(61_000);
+		const report = await recoverMigrations();
+
+		expect(report.failed).toEqual([]);
+		expect(report.committed).toHaveLength(1);
+		expect(leaseRows()).toMatchObject([{ generation: 2, expires_at: 0 }]);
+		await expectOneOwner();
+	});
+
+	it('holds the lease while it runs and keeps the generation rising across acquire, release and acquire', async () => {
+		await leaveMoveAt('prepared');
+		let held: ReturnType<typeof leaseRows> = [];
+		setMigrationStepHook((at) => {
+			if (at === 'copied') {
+				held = leaseRows();
+			}
+		});
+
+		await recoverMigrations();
+
+		expect(held).toHaveLength(1);
+		expect(held[0]).toMatchObject({ scope: 'default', generation: 1 });
+		expect(held[0]!.expires_at).toBeGreaterThan(Date.now());
+		expect(leaseRows()).toMatchObject([{ generation: 1, expires_at: 0 }]);
+
+		await recoverMigrations();
+		expect(leaseRows()).toMatchObject([{ generation: 2, expires_at: 0 }]);
+
+		await recoverMigrations();
+		expect(leaseRows()).toMatchObject([{ generation: 3, expires_at: 0 }]);
+	});
+
+	it('creates the lease table and the history index idempotently, twice over one database', async () => {
+		const raw = openNodeSqlite();
+		await ensureJournalSchema({ j: createNodeSqliteProvider(raw) }, 'j');
+		await ensureJournalSchema({ j: createNodeSqliteProvider(raw) }, 'j');
+
+		const columns = raw.prepare('PRAGMA table_info(collegedb_recovery_lease)').all() as Array<{ name: string }>;
+		const indexes = raw.prepare('PRAGMA index_list(collegedb_migration_history)').all() as Array<{ name: string }>;
+		expect(columns.map((column) => column.name)).toEqual(['scope', 'holder', 'generation', 'expires_at']);
+		expect(indexes.map((index) => index.name)).toContain('collegedb_history_by_key');
+	});
+
+	it('takes the lease for verifyMigrations repair, and not for a plain verify or a live move', async () => {
+		await recoverMigrations();
+		world.raw[JOURNAL]!.prepare('UPDATE collegedb_recovery_lease SET holder = ?, generation = ?, expires_at = ?').run(
+			'other',
+			7,
+			Date.now() + 60_000
+		);
+
+		expect(await codeOf(verifyMigrations({ repair: true }))).toBe('RECOVERY_IN_PROGRESS');
+		await expect(verifyMigrations()).resolves.toMatchObject({ clean: true });
+		await reassignShard('k', TARGET, 'items');
+		expect(rowsOn(world, TARGET, 'k')).toHaveLength(1);
+
+		expect(leaseRows()).toMatchObject([{ holder: 'other', generation: 7 }]);
+		await expectOneOwner();
+	});
+});
+
+// #endregion
+
 // #region retention, verification and rollback
 
 describe('Retention, verification and purge', () => {
@@ -1424,14 +1627,13 @@ describe('Retention, verification and purge', () => {
 		resetPlacementState();
 		world = makeWorld();
 		await start(world);
-		vi.useFakeTimers({ toFake: ['Date'] });
-		vi.setSystemTime(10_000);
+		setClock(10_000);
 		await seed(world, 'k', { name: 'Ada' });
 		await reassignShard('k', TARGET, 'items', { retire: { afterMs: 1000 } });
 	});
 
 	it('refuses to purge before the retention window passes', async () => {
-		vi.setSystemTime(10_500);
+		setClock(10_500);
 		await verifyMigrations();
 
 		const report = await purgeRetired();
@@ -1442,13 +1644,13 @@ describe('Retention, verification and purge', () => {
 	});
 
 	it('refuses to purge until a verification pass finished after the move', async () => {
-		vi.setSystemTime(20_000);
+		setClock(20_000);
 
 		expect((await purgeRetired()).refused).toMatchObject([{ reason: 'NOT_VERIFIED' }]);
 	});
 
 	it('purges the archive after a clean verification, and keeps the tombstone fence', async () => {
-		vi.setSystemTime(20_000);
+		setClock(20_000);
 		expect((await verifyMigrations()).clean).toBe(true);
 
 		const report = await purgeRetired();
@@ -1463,7 +1665,7 @@ describe('Retention, verification and purge', () => {
 	});
 
 	it('reports a ghost without touching it, and removes one equal to the archive only on repair', async () => {
-		vi.setSystemTime(20_000);
+		setClock(20_000);
 		world.raw[SOURCE]!.prepare('INSERT INTO items (id, name, qty) VALUES (?, ?, ?)').run('k', 'Ada', 1);
 
 		const observed = await verifyMigrations();
@@ -1479,7 +1681,7 @@ describe('Retention, verification and purge', () => {
 	});
 
 	it('keeps a ghost that differs from the archive and reports it', async () => {
-		vi.setSystemTime(20_000);
+		setClock(20_000);
 		world.raw[SOURCE]!.prepare('INSERT INTO items (id, name) VALUES (?, ?)').run('k', 'newer, unrelated');
 
 		const report = await verifyMigrations({ repair: true });

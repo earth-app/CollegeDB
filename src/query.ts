@@ -427,21 +427,115 @@ export function nullSafeEquals(quotedColumn: string, dialect?: SQLDialect): stri
 	return dialect === 'mysql' ? `${quotedColumn} <=> ?` : `${quotedColumn} IS ?`;
 }
 
+/** Name of the journal table that serializes recovery. @since 1.4.0 */
+export const LEASE_TABLE = 'collegedb_recovery_lease';
+
 /**
- * Builds an insert that ignores a duplicate key instead of failing.
+ * The lease generation a journal write must still match to land.
  * @since 1.4.0
  */
-export function buildInsertIgnore(table: string, values: ColumnValues, dialect?: SQLDialect): BuiltQuery {
+export interface LeaseFence {
+	/** Journal scope of the lease row */
+	scope: string;
+	/** Generation the writer acquired */
+	generation: number;
+}
+
+/**
+ * The predicate of a fenced journal write: true while the lease row of the scope
+ * still holds the writer's generation. A write that carries it matches no row once
+ * another holder has taken the lease.
+ * @since 1.4.0
+ */
+export function buildLeaseFence(fence: LeaseFence, dialect?: SQLDialect): BuiltQuery {
+	const cols = (name: string) => quoteIdentifier(name, dialect);
+	return {
+		sql: `(SELECT ${cols('generation')} FROM ${cols(LEASE_TABLE)} WHERE ${cols('scope')} = ?) = ?`,
+		bindings: [fence.scope, fence.generation]
+	};
+}
+
+/**
+ * Builds an insert that ignores a duplicate key instead of failing. With a
+ * `fence` it becomes an `INSERT ... SELECT ... WHERE <lease still held>`, so the
+ * row is written only while the lease generation matches.
+ * @since 1.4.0
+ */
+export function buildInsertIgnore(table: string, values: ColumnValues, dialect?: SQLDialect, fence?: LeaseFence): BuiltQuery {
 	const entries = definedEntries(values);
 	const columns = entries.map(([column]) => quoteIdentifier(column, dialect)).join(', ');
 	const placeholders = entries.map(() => '?').join(', ');
-	const target = `INTO ${quoteIdentifier(table, dialect)} (${columns}) VALUES (${placeholders})`;
 	const bindings = entries.map(([, value]) => value);
+	const prefix = dialect === 'postgres' ? 'INSERT' : dialect === 'mysql' ? 'INSERT IGNORE' : 'INSERT OR IGNORE';
+	const tail = dialect === 'postgres' ? ' ON CONFLICT DO NOTHING' : '';
+	const into = `INTO ${quoteIdentifier(table, dialect)} (${columns})`;
 
-	if (dialect === 'postgres') {
-		return { sql: `INSERT ${target} ON CONFLICT DO NOTHING`, bindings };
+	if (!fence) {
+		return { sql: `${prefix} ${into} VALUES (${placeholders})${tail}`, bindings };
 	}
-	return { sql: `${dialect === 'mysql' ? 'INSERT IGNORE' : 'INSERT OR IGNORE'} ${target}`, bindings };
+
+	const predicate = buildLeaseFence(fence, dialect);
+	return {
+		sql: `${prefix} ${into} SELECT ${placeholders}${dialect === 'mysql' ? ' FROM DUAL' : ''} WHERE ${predicate.sql}${tail}`,
+		bindings: [...bindings, ...predicate.bindings]
+	};
+}
+
+/**
+ * Builds the compare-and-swap that takes the recovery lease of a scope: insert
+ * when no row exists, or take over when the current one has expired. The
+ * generation rises by one on every takeover. The statement changes no row while
+ * a live lease exists, but drivers differ on whether they report that, so the
+ * caller reads the row back and compares the holder.
+ * @since 1.4.0
+ */
+export function buildLeaseAcquire(scope: string, holder: string, now: number, ttlMs: number, dialect?: SQLDialect): BuiltQuery {
+	const cols = (name: string) => quoteIdentifier(name, dialect);
+	const table = cols(LEASE_TABLE);
+	const insert = `INSERT INTO ${table} (${cols('scope')}, ${cols('holder')}, ${cols('generation')}, ${cols('expires_at')}) VALUES (?, ?, 1, ?)`;
+	const expiresAt = now + ttlMs;
+
+	if (dialect === 'mysql') {
+		// assignments run left to right, so expires_at goes last: the others still read the old value
+		const expired = `${cols('expires_at')} <= ?`;
+		return {
+			sql:
+				`${insert} ON DUPLICATE KEY UPDATE ` +
+				`${cols('holder')} = IF(${expired}, VALUES(${cols('holder')}), ${cols('holder')}), ` +
+				`${cols('generation')} = IF(${expired}, ${cols('generation')} + 1, ${cols('generation')}), ` +
+				`${cols('expires_at')} = IF(${expired}, VALUES(${cols('expires_at')}), ${cols('expires_at')})`,
+			bindings: [scope, holder, expiresAt, now, now, now]
+		};
+	}
+
+	return {
+		sql:
+			`${insert} ON CONFLICT (${cols('scope')}) DO UPDATE SET ${cols('holder')} = EXCLUDED.${cols('holder')}, ` +
+			`${cols('generation')} = ${table}.${cols('generation')} + 1, ${cols('expires_at')} = EXCLUDED.${cols('expires_at')} ` +
+			`WHERE ${table}.${cols('expires_at')} <= ?`,
+		bindings: [scope, holder, expiresAt, now]
+	};
+}
+
+/**
+ * Builds the extension of a held lease, conditional on the holder's generation.
+ * @since 1.4.0
+ */
+export function buildLeaseRenew(fence: LeaseFence, expiresAt: number, dialect?: SQLDialect): BuiltQuery {
+	const cols = (name: string) => quoteIdentifier(name, dialect);
+	return {
+		sql: `UPDATE ${cols(LEASE_TABLE)} SET ${cols('expires_at')} = ? WHERE ${cols('scope')} = ? AND ${cols('generation')} = ?`,
+		bindings: [expiresAt, fence.scope, fence.generation]
+	};
+}
+
+/**
+ * Builds the release of a held lease. The row stays with `expires_at` at zero,
+ * so the generation keeps rising across holders.
+ * @since 1.4.0
+ */
+export function buildLeaseRelease(fence: LeaseFence, dialect?: SQLDialect): BuiltQuery {
+	return buildLeaseRenew(fence, 0, dialect);
 }
 
 /**
@@ -667,15 +761,23 @@ export function buildShardSidecarSchema(dialect?: SQLDialect): string[] {
 	return statements;
 }
 
+/** Name of the index that serves the history lookup by key. @since 1.4.0 */
+export const HISTORY_KEY_INDEX = 'collegedb_history_by_key';
+
 /**
  * The statements for the journal shard: the active claim table, the append-only
- * history, the durable placement exception set and the verification record.
+ * history with its key index, the durable placement exception set, the
+ * verification record and the recovery lease.
+ *
+ * MySQL has no `CREATE INDEX IF NOT EXISTS`, so there the index is part of the
+ * history table definition and a history table created without it keeps none.
  * @since 1.4.0
  */
 export function buildJournalSchema(dialect?: SQLDialect): string[] {
 	const key = dialect === 'mysql' ? 'VARCHAR(190)' : 'TEXT';
 	const long = dialect === 'mysql' ? 'LONGTEXT' : 'TEXT';
 	const int = dialect === 'sqlite' || dialect === undefined ? 'INTEGER' : 'BIGINT';
+	const historyKeys = '(scope, primary_key, table_name)';
 
 	return [
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_active (scope ${key} NOT NULL, table_name ${key} NOT NULL, ` +
@@ -683,11 +785,14 @@ export function buildJournalSchema(dialect?: SQLDialect): string[] {
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_history (op_id ${key} NOT NULL, state ${key} NOT NULL, attempt ${int} NOT NULL, ` +
 			`scope ${key} NOT NULL, table_name ${key} NOT NULL, primary_key ${key} NOT NULL, source ${key} NOT NULL, ` +
 			`destination ${key} NOT NULL, generation ${int} NOT NULL, placement_epoch ${int}, digest ${key}, detail ${long}, ` +
-			`at ${int} NOT NULL, PRIMARY KEY (op_id, state, attempt))`,
+			`at ${int} NOT NULL, PRIMARY KEY (op_id, state, attempt)${dialect === 'mysql' ? `, INDEX ${HISTORY_KEY_INDEX} ${historyKeys}` : ''})`,
+		...(dialect === 'mysql' ? [] : [`CREATE INDEX IF NOT EXISTS ${HISTORY_KEY_INDEX} ON collegedb_migration_history ${historyKeys}`]),
 		`CREATE TABLE IF NOT EXISTS collegedb_placement_exceptions (scope ${key} NOT NULL, hashed_key ${key} NOT NULL, ` +
 			`added_at ${int} NOT NULL, PRIMARY KEY (scope, hashed_key))`,
 		`CREATE TABLE IF NOT EXISTS collegedb_migration_verification (scope ${key} NOT NULL, completed_at ${int} NOT NULL, ` +
-			`clean ${int} NOT NULL, PRIMARY KEY (scope))`
+			`clean ${int} NOT NULL, PRIMARY KEY (scope))`,
+		`CREATE TABLE IF NOT EXISTS ${LEASE_TABLE} (scope ${key} NOT NULL, holder ${key} NOT NULL, generation ${int} NOT NULL, ` +
+			`expires_at ${int} NOT NULL, PRIMARY KEY (scope))`
 	];
 }
 
