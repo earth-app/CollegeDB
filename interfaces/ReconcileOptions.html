@@ -19,7 +19,7 @@
 </div></div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">ReconcileOptions</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#limit">limit</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#pruneverified">pruneVerified</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#repair">repair</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#signal">signal</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">AbortSignal</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#verifyrecords">verifyRecords</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">tables</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">pkColumn</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span> <span class="tsd-kind-property">table</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span> <span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">[]</span> <span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L46">src/reconcile.ts:46</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L46">src/reconcile.ts:46</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -42,7 +42,7 @@
 <div class="tsd-comment tsd-typography"><p>Ledger rows per coordinator page. Defaults to 100.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L48">src/reconcile.ts:48</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L48">src/reconcile.ts:48</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="pruneverified"><code class="tsd-tag">Optional</code><span>prune<wbr/>Verified</span><a href="#pruneverified" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">pruneVerified</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -50,7 +50,7 @@
 <code>verifyRecords</code>, the row must also exist on the routed shard.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L58">src/reconcile.ts:58</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L58">src/reconcile.ts:58</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="repair"><code class="tsd-tag">Optional</code><span>repair</span><a href="#repair" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">repair</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -58,14 +58,14 @@
 the row exists on that shard. Requires <code>verifyRecords</code>.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L53">src/reconcile.ts:53</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L53">src/reconcile.ts:53</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="signal"><code class="tsd-tag">Optional</code><span>signal</span><a href="#signal" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">signal</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">AbortSignal</span></div>
 <div class="tsd-comment tsd-typography"><p>Checked between pages. An aborted signal rejects the run.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L65">src/reconcile.ts:65</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L65">src/reconcile.ts:65</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="verifyrecords"><code class="tsd-tag">Optional</code><span>verify<wbr/>Records</span><a href="#verifyrecords" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">verifyRecords</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">tables</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-symbol">{</span> <span class="tsd-kind-property">pkColumn</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span> <span class="tsd-kind-property">table</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span> <span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">[]</span> <span class="tsd-signature-symbol">}</span></div>
@@ -73,7 +73,7 @@ the row exists on that shard. Requires <code>verifyRecords</code>.</p>
 shard is queried. <code>pkColumn</code> defaults to <code>id</code>.</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/ab89fe9a023266ced5140118b29e1a63210164a9/src/reconcile.ts#L63">src/reconcile.ts:63</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/earth-app/CollegeDB/blob/87e896b19eedf6ec1223d16027d84e8eea7dac45/src/reconcile.ts#L63">src/reconcile.ts:63</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
