@@ -15,6 +15,7 @@ import {
 	isKVStorage,
 	isSQLDatabase,
 	toProvider,
+	type DrizzleClientLike,
 	type SQLBatchOptions,
 	type WorkersKVNamespaceLike
 } from '../src/providers';
@@ -825,6 +826,174 @@ describe('SQLite adapter validation', () => {
 
 		const first = await provider.prepare('SELECT id').first<{ id: string }>();
 		expect(first).toEqual({ id: 'fallback' });
+	});
+});
+
+describe('Drizzle result shapes per driver', () => {
+	type Dialect = 'sqlite' | 'postgres' | 'mysql';
+	type Row = { id: number; name: string };
+
+	const sqlTag = createMockDrizzleSqlTag();
+	const rowsOf = (count: number): Row[] => Array.from({ length: count }, (_, index) => ({ id: index + 1, name: `row-${index + 1}` }));
+	const fieldPackets = [
+		{ name: 'id', table: 't', columnType: 3 },
+		{ name: 'name', table: 't', columnType: 253 }
+	];
+
+	class ResultSetHeader {
+		fieldCount = 0;
+		affectedRows = 1;
+		insertId = 42;
+		info = '';
+		serverStatus = 2;
+		warningStatus = 0;
+	}
+
+	function providerFor(client: DrizzleClientLike, dialect: Dialect | undefined) {
+		if (dialect === 'sqlite') return createSQLiteProvider(client, sqlTag);
+		if (dialect === 'postgres') return createPostgreSQLProvider(client, sqlTag);
+		if (dialect === 'mysql') return createMySQLProvider(client, sqlTag);
+		return createDrizzleSQLProvider(client, sqlTag);
+	}
+
+	const selectShapes: { driver: string; dialect: Dialect; client: (rows: Row[]) => DrizzleClientLike }[] = [
+		{
+			driver: 'bun:sqlite, better-sqlite3, libsql and D1 all(), a plain row array',
+			dialect: 'sqlite',
+			client: (rows) => ({ all: () => rows })
+		},
+		{
+			driver: 'node-postgres execute(), a result object',
+			dialect: 'postgres',
+			client: (rows) => ({ execute: async () => ({ rows, rowCount: rows.length, command: 'SELECT', fields: [] }) })
+		},
+		{
+			driver: 'postgres-js execute(), a row array with count and command',
+			dialect: 'postgres',
+			client: (rows) => ({ execute: async () => Object.assign([...rows], { count: rows.length, command: 'SELECT' }) })
+		},
+		{
+			driver: 'pglite and neon execute(), rows with fields',
+			dialect: 'postgres',
+			client: (rows) => ({ execute: async () => ({ rows, fields: [], affectedRows: 0 }) })
+		},
+		{
+			driver: 'mysql2 execute(), a [rows, fields] tuple',
+			dialect: 'mysql',
+			client: (rows) => ({ execute: async () => [rows, fieldPackets] })
+		}
+	];
+
+	for (const shape of selectShapes) {
+		for (const dialect of [shape.dialect, undefined]) {
+			for (const count of [0, 1, 2, 3]) {
+				it(`reads ${count} rows from ${shape.driver} (${dialect ?? 'no dialect'})`, async () => {
+					const rows = rowsOf(count);
+					const provider = providerFor(shape.client(rows), dialect);
+
+					const all = await provider.prepare('SELECT id, name FROM t').all<Row>();
+					expect(Array.from(all.results)).toEqual(rows);
+
+					const first = await provider.prepare('SELECT id, name FROM t').first<Row>();
+					expect(first).toEqual(rows[0] ?? null);
+				});
+			}
+		}
+	}
+
+	for (const dialect of ['mysql', undefined] as const) {
+		it(`reads a mysql2 INSERT as no rows with its ResultSetHeader as meta (${dialect ?? 'no dialect'})`, async () => {
+			const provider = providerFor({ execute: async () => [new ResultSetHeader(), undefined] }, dialect);
+
+			const result = await provider.prepare('INSERT INTO t (id) VALUES (?)').bind(1).run();
+			expect(result.results).toEqual([]);
+			expect(result.meta.changes).toBe(1);
+			expect(result.meta.last_row_id).toBe(42);
+
+			const all = await provider.prepare('INSERT INTO t (id) VALUES (?)').bind(1).all();
+			expect(all.results).toEqual([]);
+			expect(all.meta.changes).toBe(1);
+		});
+
+		it(`reads a mysql2 tuple whose rows are arrays (${dialect ?? 'no dialect'})`, async () => {
+			const provider = providerFor({ execute: async () => [[[1, 'a']], fieldPackets] }, dialect);
+			const result = await provider.prepare('SELECT id, name FROM t').all();
+			expect(result.results).toEqual([[1, 'a']]);
+		});
+	}
+
+	for (const count of [0, 1, 2, 3]) {
+		it(`reads ${count} rows from a D1 run() result object`, async () => {
+			const rows = rowsOf(count);
+			const provider = providerFor({ run: async () => ({ results: rows, success: true, meta: { changes: 1, last_row_id: 7 } }) }, 'sqlite');
+
+			const result = await provider.prepare('SELECT id, name FROM t').run<Row>();
+			expect(result.results).toEqual(rows);
+			expect(result.meta.changes).toBe(1);
+			expect(result.meta.last_row_id).toBe(7);
+		});
+	}
+
+	it('reads a bun:sqlite and better-sqlite3 run() result as meta only', async () => {
+		const provider = providerFor({ run: () => ({ changes: 2, lastInsertRowid: 9 }) }, 'sqlite');
+		const result = await provider.prepare('DELETE FROM t').run();
+		expect(result.results).toEqual([]);
+		expect(result.meta.changes).toBe(2);
+		expect(result.meta.last_row_id).toBe(9);
+	});
+
+	it('keeps two rows when a postgres-js row holds an array column named data', async () => {
+		const rows = [{ data: [1, 2] }, { data: [3] }];
+		const provider = providerFor({ execute: async () => Object.assign([...rows], { count: 2, command: 'SELECT' }) }, 'postgres');
+		const result = await provider.prepare('SELECT data FROM t').all();
+		expect(Array.from(result.results)).toEqual(rows);
+	});
+
+	it('does not read meta from a row of a two-row result', async () => {
+		const rows = [
+			{ changes: 5, meta: { duration: 99 } },
+			{ changes: 6, meta: { duration: 98 } }
+		];
+		for (const dialect of ['sqlite', undefined] as const) {
+			const provider = providerFor({ all: () => rows }, dialect);
+			const result = await provider.prepare('SELECT changes, meta FROM t').all();
+			expect(result.results).toEqual(rows);
+			expect(result.meta.changes).toBeUndefined();
+			expect(result.meta.duration).not.toBe(99);
+		}
+	});
+
+	it('keeps two array rows whose cells are blobs when the dialect is sqlite', async () => {
+		const rows = [[new Uint8Array([1])], [new Uint8Array([2])]];
+		const provider = providerFor({ all: () => rows }, 'sqlite');
+		const result = await provider.prepare('SELECT data FROM t').all();
+		expect(result.results).toEqual(rows);
+	});
+
+	it('keeps two array rows of plain values without a dialect', async () => {
+		const rows = [
+			[1, 'a'],
+			[2, 'b']
+		];
+		const provider = providerFor({ all: () => rows }, undefined);
+		const result = await provider.prepare('SELECT id, name FROM t').all();
+		expect(result.results).toEqual(rows);
+	});
+
+	it('reads every row of a real node:sqlite select behind a drizzle-shaped client', async () => {
+		const db = openNodeSqlite();
+		db.exec('CREATE TABLE t (op TEXT NOT NULL, state TEXT NOT NULL)');
+		const client: DrizzleClientLike = {
+			run: (query: MockDrizzleChunk) => db.prepare(query.text).run(...query.params),
+			all: (query: MockDrizzleChunk) => db.prepare(query.text).all(...query.params)
+		};
+		const provider = createSQLiteProvider(client, sqlTag);
+
+		for (let count = 1; count <= 4; count++) {
+			await provider.prepare('INSERT INTO t (op, state) VALUES (?, ?)').bind('o', `s${count}`).run();
+			const result = await provider.prepare('SELECT state FROM t ORDER BY state').all<{ state: string }>();
+			expect(result.results.map((row) => row.state)).toEqual(Array.from({ length: count }, (_, index) => `s${index + 1}`));
+		}
 	});
 });
 

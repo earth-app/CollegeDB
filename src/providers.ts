@@ -659,7 +659,7 @@ export function createDrizzleSQLProvider(client: DrizzleClientLike, sqlTag: Driz
 		dialect,
 		consistency: SINGLE_NODE_CONSISTENCY,
 		prepare(sql: string): PreparedStatement {
-			return new DrizzlePreparedStatement(client, sqlTag, sql);
+			return new DrizzlePreparedStatement(client, sqlTag, sql, [], dialect);
 		}
 	};
 
@@ -695,11 +695,11 @@ export function createDrizzleSQLProvider(client: DrizzleClientLike, sqlTag: Driz
 
 						if (typeof (raw as PromiseLike<unknown> | null)?.then === 'function') {
 							return Promise.resolve(raw as PromiseLike<unknown>).then((value) => {
-								results.push(toDrizzleRunResult<T>(value, startedAt));
+								results.push(toDrizzleRunResult<T>(value, startedAt, dialect));
 								return runFrom(index + 1);
 							});
 						}
-						results.push(toDrizzleRunResult<T>(raw, startedAt));
+						results.push(toDrizzleRunResult<T>(raw, startedAt, dialect));
 					}
 					return results;
 				};
@@ -1814,22 +1814,24 @@ class DrizzlePreparedStatement implements PreparedStatement {
 	private readonly sqlTag: DrizzleSqlTagLike;
 	private readonly sqlText: string;
 	private readonly bindings: any[];
+	private readonly dialect: SQLDialect | undefined;
 
-	constructor(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike, sqlText: string, bindings: any[] = []) {
+	constructor(client: DrizzleClientLike, sqlTag: DrizzleSqlTagLike, sqlText: string, bindings: any[] = [], dialect?: SQLDialect) {
 		this.client = client;
 		this.sqlTag = sqlTag;
 		this.sqlText = sqlText;
 		this.bindings = bindings;
+		this.dialect = dialect;
 	}
 
 	bind(...bindings: any[]): PreparedStatement {
-		return new DrizzlePreparedStatement(this.client, this.sqlTag, this.sqlText, bindings);
+		return new DrizzlePreparedStatement(this.client, this.sqlTag, this.sqlText, bindings, this.dialect);
 	}
 
 	async run<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
 		const startedAt = nowMs();
 		const query = buildDrizzleQuery(this.sqlTag, this.sqlText, this.bindings);
-		return toDrizzleRunResult<T>(await executeDrizzleRun(this.client, query), startedAt);
+		return toDrizzleRunResult<T>(await executeDrizzleRun(this.client, query), startedAt, this.dialect);
 	}
 
 	async all<T = Record<string, unknown>>(): Promise<QueryResult<T>> {
@@ -1839,15 +1841,15 @@ class DrizzlePreparedStatement implements PreparedStatement {
 
 		return {
 			success: true,
-			results: extractRowsFromDrizzleExecute<T>(result),
-			meta: createMeta(startedAt, extractMetaFromDrizzleExecute(result))
+			results: extractRowsFromDrizzleExecute<T>(result, this.dialect),
+			meta: createMeta(startedAt, extractMetaFromDrizzleExecute(result, this.dialect))
 		};
 	}
 
 	async first<T = Record<string, unknown>>(): Promise<T | null> {
 		const query = buildDrizzleQuery(this.sqlTag, this.sqlText, this.bindings);
 		const result = await executeDrizzleFirst(this.client, query);
-		const rows = extractRowsFromDrizzleExecute<T>(result);
+		const rows = extractRowsFromDrizzleExecute<T>(result, this.dialect);
 		if (rows.length > 0) {
 			return rows[0] ?? null;
 		}
@@ -1942,11 +1944,11 @@ async function executeDrizzleRun(client: DrizzleClientLike, query: DrizzleSqlChu
 	return await dispatchDrizzleRun(client, query);
 }
 
-function toDrizzleRunResult<T>(result: unknown, startedAt: number): QueryResult<T> {
+function toDrizzleRunResult<T>(result: unknown, startedAt: number, dialect?: SQLDialect): QueryResult<T> {
 	return {
 		success: true,
-		results: extractRowsFromDrizzleExecute<T>(result),
-		meta: createMeta(startedAt, extractMetaFromDrizzleExecute(result))
+		results: extractRowsFromDrizzleExecute<T>(result, dialect),
+		meta: createMeta(startedAt, extractMetaFromDrizzleExecute(result, dialect))
 	};
 }
 
@@ -2072,13 +2074,40 @@ function splitQuestionPlaceholders(sql: string): string[] {
 	return segments;
 }
 
-function extractRowsFromDrizzleExecute<T>(result: unknown): T[] {
-	const extractRowsFromObject = (value: unknown): T[] | undefined => {
-		if (!value || typeof value !== 'object' || Array.isArray(value)) {
-			return undefined;
+// mysql2 resolves [rows, fields] for a read and [ResultSetHeader, undefined] for a write
+function isMySQLTuple(result: unknown[]): boolean {
+	if (result.length !== 2) {
+		return false;
+	}
+
+	const [head, fields] = result;
+	if (head === null || typeof head !== 'object') {
+		return false;
+	}
+
+	if (Array.isArray(head)) {
+		return Array.isArray(fields) && fields.every((field) => field !== null && typeof field === 'object' && !Array.isArray(field));
+	}
+
+	return fields === undefined || Array.isArray(fields);
+}
+
+// sqlite and postgres drivers never return a pair, and array rows of blobs would read as one
+function readsMySQLTuple(dialect: SQLDialect | undefined): boolean {
+	return dialect === undefined || dialect === 'mysql';
+}
+
+function extractRowsFromDrizzleExecute<T>(result: unknown, dialect?: SQLDialect): T[] {
+	if (Array.isArray(result)) {
+		if (readsMySQLTuple(dialect) && isMySQLTuple(result)) {
+			return (Array.isArray(result[0]) ? result[0] : []) as T[];
 		}
 
-		const objectValue = value as Record<string, unknown>;
+		return result as T[];
+	}
+
+	if (result && typeof result === 'object') {
+		const objectValue = result as Record<string, unknown>;
 		if (Array.isArray(objectValue.rows)) {
 			return objectValue.rows as T[];
 		}
@@ -2090,63 +2119,12 @@ function extractRowsFromDrizzleExecute<T>(result: unknown): T[] {
 		if (Array.isArray(objectValue.data)) {
 			return objectValue.data as T[];
 		}
-
-		return undefined;
-	};
-
-	const looksLikeRowObject = (value: unknown): value is Record<string, unknown> => {
-		if (!value || typeof value !== 'object' || Array.isArray(value)) {
-			return false;
-		}
-
-		return Object.keys(value).length > 0;
-	};
-
-	if (Array.isArray(result)) {
-		if (result.length === 2) {
-			const firstObjectRows = extractRowsFromObject(result[0]);
-			if (firstObjectRows) {
-				return firstObjectRows;
-			}
-
-			const secondObjectRows = extractRowsFromObject(result[1]);
-			if (secondObjectRows) {
-				return secondObjectRows;
-			}
-
-			if (!Array.isArray(result[0]) && !Array.isArray(result[1])) {
-				if (looksLikeRowObject(result[0])) {
-					return [result[0] as T];
-				}
-
-				if (looksLikeRowObject(result[1])) {
-					return [result[1] as T];
-				}
-			}
-
-			if (Array.isArray(result[0])) {
-				return result[0] as T[];
-			}
-
-			if (Array.isArray(result[1])) {
-				return result[1] as T[];
-			}
-		}
-
-		return result as T[];
-	}
-
-	if (result && typeof result === 'object') {
-		const objectRows = extractRowsFromObject(result);
-		if (objectRows) {
-			return objectRows;
-		}
 	}
 
 	return [];
 }
 
-function extractMetaFromDrizzleExecute(result: unknown): Record<string, unknown> {
+function extractMetaFromDrizzleExecute(result: unknown, dialect?: SQLDialect): Record<string, unknown> {
 	if (!result) {
 		return {};
 	}
@@ -2154,17 +2132,10 @@ function extractMetaFromDrizzleExecute(result: unknown): Record<string, unknown>
 	let objectResult: Record<string, unknown> | undefined;
 
 	if (Array.isArray(result)) {
-		if (result.length === 2) {
-			// Try result[0] first (metadata-first format like [metadata, rows])
-			if (result[0] && typeof result[0] === 'object' && !Array.isArray(result[0])) {
-				objectResult = result[0] as Record<string, unknown>;
-			}
-			// Try result[1] if result[0] is not metadata (metadata-second format like [rows, metadata])
-			else if (result[1] && typeof result[1] === 'object' && !Array.isArray(result[1])) {
-				objectResult = result[1] as Record<string, unknown>;
-			}
+		if (readsMySQLTuple(dialect) && isMySQLTuple(result) && !Array.isArray(result[0])) {
+			objectResult = result[0] as Record<string, unknown>;
 		}
-	} else if (typeof result === 'object' && !Array.isArray(result)) {
+	} else if (typeof result === 'object') {
 		objectResult = result as Record<string, unknown>;
 	}
 
