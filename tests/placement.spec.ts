@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { first, initializeAsync, insertInto, KVShardMapper, pruneEpochs, reassignShard, resetConfig } from '../src/index';
 import { withKVTimeout } from '../src/kv-timeout';
 import {
@@ -22,6 +22,7 @@ import {
 import { createInMemoryKVProvider } from '../src/providers-memory';
 import { buildFenceRaise, commitJournalManifest, loadJournalManifest, raiseFence, readFence, setPruneStepHook } from '../src/topology';
 import type { KVStorage, PreparedStatement, SQLDatabase } from '../src/types';
+import { restoreClock, setClock } from './helpers/clock';
 import { createNodeSqliteProvider, openNodeSqlite } from './helpers/concurrent-sqlite';
 import { runFenceRace } from './helpers/fence-race';
 
@@ -414,11 +415,6 @@ describe('Placement under KV failure', () => {
 
 	beforeEach(() => {
 		resetPlacementState();
-		vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-	});
-
-	afterEach(() => {
-		vi.useRealTimers();
 	});
 
 	it('throws PLACEMENT_UNVERIFIED when the manifest read fails on a cold cache', async () => {
@@ -445,7 +441,7 @@ describe('Placement under KV failure', () => {
 		const manifest = createManifest(SHARDS, 'hrw');
 		await savePlacementManifest(kv, manifest);
 
-		vi.advanceTimersByTime(11_000);
+		setClock(Date.now() + 11_000);
 		mode.state = 'down';
 
 		expect(await loadPlacementManifest(kv, undefined, { staleOk: true })).toEqual(manifest);
@@ -459,7 +455,7 @@ describe('Placement under KV failure', () => {
 		await savePlacementManifest(kv, manifest);
 		manifest = await addPlacementException(kv, manifest, 'hashed-key-1');
 
-		vi.advanceTimersByTime(11_000);
+		setClock(Date.now() + 11_000);
 		mode.state = 'down';
 
 		const stale = await loadPlacementExceptions(kv, manifest.exceptionsVersion, undefined, { staleOk: true });
@@ -474,7 +470,7 @@ describe('Placement under KV failure', () => {
 		await savePlacementManifest(kv, manifest);
 		manifest = await addPlacementException(kv, manifest, 'hashed-key-1');
 
-		vi.advanceTimersByTime(11_000);
+		setClock(Date.now() + 11_000);
 		mode.state = 'down';
 
 		await expect(loadPlacementExceptions(kv, manifest.exceptionsVersion + 1, undefined, { staleOk: true })).rejects.toMatchObject({
@@ -485,15 +481,10 @@ describe('Placement under KV failure', () => {
 	it('reads a hung KV as a failure through withKVTimeout, never as a missing manifest', async () => {
 		const mode: Mode = { state: 'hung' };
 		const { kv } = switchableKV(mode);
-		const bounded = withKVTimeout(kv, 50);
+		const bounded = withKVTimeout(kv, 30);
 
-		const manifestRead = expect(loadPlacementManifest(bounded)).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
-		await vi.advanceTimersByTimeAsync(60);
-		await manifestRead;
-
-		const exceptionRead = expect(loadPlacementExceptions(bounded, 0)).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
-		await vi.advanceTimersByTimeAsync(60);
-		await exceptionRead;
+		await expect(loadPlacementManifest(bounded)).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
+		await expect(loadPlacementExceptions(bounded, 0)).rejects.toMatchObject({ code: 'PLACEMENT_UNVERIFIED' });
 	});
 
 	it('still returns null for a manifest that is genuinely absent', async () => {
@@ -639,7 +630,7 @@ async function codeOf(work: Promise<unknown>): Promise<string | undefined> {
 
 afterEach(() => {
 	setPruneStepHook(null);
-	vi.useRealTimers();
+	restoreClock();
 	resetConfig();
 });
 
@@ -811,7 +802,6 @@ describe('Journal-held manifest', () => {
 	});
 
 	it('treats an unreachable journal like an unreachable KV: stale reads, refused writes, a cold start that fails', async () => {
-		vi.useFakeTimers({ toFake: ['Date'] });
 		const world = makeWorld();
 		const down = { on: false };
 		const db = world.shards[JOURNAL]!;
@@ -825,7 +815,7 @@ describe('Journal-held manifest', () => {
 		await bootAndWarm(world, NAMES3);
 		await insertInto('a-1', 'items', { id: 'a-1', name: 'x' });
 
-		vi.setSystemTime(Date.now() + 11_000);
+		setClock(Date.now() + 11_000);
 		down.on = true;
 		expect(await first<{ name: string }>('a-1', 'SELECT * FROM items WHERE id = ?', ['a-1'])).toMatchObject({ name: 'x' });
 		expect(await codeOf(insertInto('a-2', 'items', { id: 'a-2', name: 'y' }))).toBe('PLACEMENT_UNVERIFIED');
@@ -833,7 +823,7 @@ describe('Journal-held manifest', () => {
 		await boot(world, NAMES3);
 		await expect(first('a-1', 'SELECT * FROM items WHERE id = ?', ['a-1'])).rejects.toMatchObject({
 			code: 'PLACEMENT_UNVERIFIED',
-			message: /the journal failed/
+			message: expect.stringMatching(/the journal failed/)
 		});
 
 		down.on = false;
@@ -1035,7 +1025,10 @@ describe('pruneEpochs', () => {
 		await boot(world, NAMES3);
 		await first('warm', 'SELECT * FROM items WHERE id = ?', ['warm']);
 
-		await expect(pruneEpochs({ tables: ['items'] })).rejects.toMatchObject({ code: 'PRUNE_REFUSED', message: /db-c.*not proven/ });
+		await expect(pruneEpochs({ tables: ['items'] })).rejects.toMatchObject({
+			code: 'PRUNE_REFUSED',
+			message: expect.stringMatching(/db-c.*not proven/)
+		});
 		expect(NAMES3.map((name) => fenceOn(world, name))).toEqual([0, 0, 0]);
 	});
 
@@ -1165,7 +1158,10 @@ describe('pruneEpochs', () => {
 			}
 		});
 
-		await expect(pruneEpochs({ tables: ['items'] })).rejects.toMatchObject({ code: 'PRUNE_REFUSED', message: /changed between/ });
+		await expect(pruneEpochs({ tables: ['items'] })).rejects.toMatchObject({
+			code: 'PRUNE_REFUSED',
+			message: expect.stringMatching(/changed between/)
+		});
 		expect(storedRow(world)).toEqual(before);
 	});
 

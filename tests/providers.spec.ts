@@ -1794,6 +1794,11 @@ describe('Single-connection batch gate', () => {
 	const INSERT_ONE = 'INSERT INTO users (id) VALUES (1)';
 	const INSERT_TWO = 'INSERT INTO users (id) VALUES (2)';
 	const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+	const outcome = (work: Promise<unknown>) =>
+		work.then(
+			() => undefined,
+			(error: unknown) => error
+		);
 	const within = <T>(promise: Promise<T>, ms = 250) =>
 		Promise.race([promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timed out behind the gate')), ms))]);
 
@@ -1950,14 +1955,14 @@ describe('Single-connection batch gate', () => {
 			failOnce(INSERT_TWO, 'statement failed');
 
 			const batch = provider.runBatch!([{ sql: INSERT_ONE }, { sql: INSERT_TWO }]);
-			const rejected = expect(batch).rejects.toThrow('statement failed');
+			const failure = outcome(batch);
 			await flush();
 			const plain = provider.prepare('SELECT 1').all();
 			await flush();
 			expect(log).toEqual(['BEGIN', INSERT_ONE]);
 
 			release();
-			await rejected;
+			expect(await failure).toMatchObject({ message: 'statement failed' });
 			await plain;
 			expect(log).toEqual(['BEGIN', INSERT_ONE, INSERT_TWO, 'ROLLBACK', 'SELECT 1']);
 		});
@@ -2078,13 +2083,13 @@ describe('Single-connection batch gate', () => {
 			const { provider, release } = heldSqlite('INSERT INTO t (id) SELECT 1');
 
 			const batch = provider.runBatch!([{ sql: 'INSERT INTO t (id) VALUES (1)' }, { sql: 'INSERT INTO t (id) SELECT 1' }]);
-			const rejected = expect(batch).rejects.toThrow();
+			const failure = outcome(batch);
 			await flush();
 			const read = provider.prepare('SELECT id FROM t ORDER BY id').all();
 			await flush();
 
 			release();
-			await rejected;
+			expect(await failure).toBeInstanceOf(Error);
 			expect((await read).results).toEqual([]);
 		});
 

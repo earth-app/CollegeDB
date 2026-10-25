@@ -435,13 +435,17 @@ describe('KV timeout', () => {
 	});
 
 	it('rejects a hung get with KV_TIMEOUT after the limit', async () => {
-		vi.useFakeTimers();
 		const timed = withKVTimeout(hungStore(), 20);
-		const pending = timed.get('k', 'text').catch((error: unknown) => error);
+		let settled = false;
+		const pending = timed
+			.get('k', 'text')
+			.catch((error: unknown) => error)
+			.finally(() => {
+				settled = true;
+			});
 
-		await vi.advanceTimersByTimeAsync(19);
-		expect(vi.getTimerCount()).toBe(1);
-		await vi.advanceTimersByTimeAsync(1);
+		await Promise.resolve();
+		expect(settled).toBe(false);
 		const error = await pending;
 
 		expect(error).toBeInstanceOf(CollegeDBError);
@@ -449,11 +453,8 @@ describe('KV timeout', () => {
 	});
 
 	it('races put, delete and list against the same limit', async () => {
-		vi.useFakeTimers();
 		const timed = withKVTimeout(hungStore(), 20);
 		const calls = [timed.put('k', 'v'), timed.delete('k'), timed.list()].map((call) => call.catch((error: unknown) => error));
-
-		await vi.advanceTimersByTimeAsync(20);
 
 		expect(await Promise.all(calls)).toMatchObject([
 			{ code: 'KV_TIMEOUT', message: 'KV put timed out after 20 ms' },

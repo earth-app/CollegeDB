@@ -131,8 +131,12 @@ describe('KV read-through cache', () => {
 		const first = cached('k:hang2', () => new Promise<string>(() => {}), { fetchTimeoutMs: 20 });
 		const second = cached('k:hang2', joiner, { fetchTimeoutMs: 20 });
 
-		await expect(first).rejects.toMatchObject({ code: 'CACHE_FETCH_TIMEOUT' });
-		await expect(second).rejects.toMatchObject({ code: 'CACHE_FETCH_TIMEOUT' });
+		const outcomes = await Promise.allSettled([first, second]);
+
+		expect(outcomes).toMatchObject([
+			{ status: 'rejected', reason: { code: 'CACHE_FETCH_TIMEOUT' } },
+			{ status: 'rejected', reason: { code: 'CACHE_FETCH_TIMEOUT' } }
+		]);
 		expect(joiner).not.toHaveBeenCalled();
 	});
 });
