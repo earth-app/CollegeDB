@@ -1126,7 +1126,19 @@ acknowledged.
 A crash after the cutover leaves the key readable and refuses its writes with
 `MIGRATION_CUTOVER_PENDING` until `recoverMigrations()` runs. `getMigrationStatus(key, table)` returns
 the latest recorded state of a key's move. A read that finds nothing on a shard holding a tombstone
-for the key follows the tombstone's `moved_to` shard, up to four hops.
+for the key follows the tombstone's `moved_to` shard, up to four hops. A failed tombstone lookup, a
+chain past four hops, a cycle, or a tombstone that names an unconfigured shard throws
+`MIGRATION_LOOKUP_UNAVAILABLE` or `MIGRATION_CHAIN_EXCEEDED` instead of returning not found. Pass
+`bestEffort: true` in the read options to keep the not-found result.
+
+One recovery runs per journal scope at a time, across isolates. `recoverMigrations()` first takes a
+lease row in the journal. A second call while the lease is live throws `RECOVERY_IN_PROGRESS`, which
+is the normal result for a scheduler that calls on every tick. A lease lasts 60 seconds without
+renewal, so the first call after a crashed recovery takes it over at a higher fencing generation. A
+recovery that loses its lease stops with `RECOVERY_FENCED` and makes no further writes. A live move
+does not take the lease; `verifyMigrations({ repair: true })` does. The full contract, the window the
+fence does not cover, and a Workers `scheduled()` example are in `docs/migration-protocol.md` under
+Recovery lease.
 
 Crash recovery is not a backup or a restore. Archived source rows are kept for seven days by default
 (`retire: { afterMs }` changes this), and `purgeRetired()` clears their payloads once the retention
@@ -1148,7 +1160,7 @@ overwrites the destination row.
 
 - The journal covers statements that CollegeDB routes. Raw SQL and raw `run()` or `all()` statements
   bypass it.
-- Each move covers one table row. A key's rows in other tables need one move per table.
+- Each move covers one table row. The key mapping is per key, not per table, so a `reassignShard` on one table strands the key's rows in the other tables. Relocating an organization's related rows across tables is an application procedure built from one move per table.
 - Nothing is atomic across shards. The journal makes an interrupted move recoverable, and nothing else.
 - Production D1 batch rollback has not been tested. The D1 declaration rests on local workerd runs.
 
@@ -2573,6 +2585,7 @@ The `CollegeDBError` class extends the native `Error` class and includes an opti
 | `BOOKMARK_IDENTITY_UNVERIFIED`  | A session read supplies bookmarks for a binding with no `shardState` id                                     |
 | `COORDINATOR_NOT_CONFIGURED`    | `reconcileAllocations` runs without a `coordinator` in the config                                           |
 | `COORDINATOR_ERROR`             | The coordinator returned an error while reconcile listed or pruned allocations                              |
+| `RECONCILE_VERIFY_REQUIRED`     | `reconcileAllocations` got `repair` without `verifyRecords`. Not retryable; add `verifyRecords`             |
 | `JOURNAL_NOT_CONFIGURED`        | A move, `recoverMigrations`, or a non-dry `rebalance` runs on a multi-shard config without `journalShard`   |
 | `INVALID_JOURNAL_SHARD`         | `journalShard` names a binding that is not configured                                                       |
 | `MIGRATION_UNSUPPORTED_DIALECT` | A move or journaled write involves a shard on a dialect the journal is not proven on                        |
@@ -2580,6 +2593,10 @@ The `CollegeDBError` class extends the native `Error` class and includes an opti
 | `MIGRATION_NO_ATOMIC_BATCH`     | A shard's `runBatch` does not declare `atomicBatch`                                                         |
 | `MIGRATION_IN_PROGRESS`         | Another move holds the claim on this key                                                                    |
 | `MIGRATION_CUTOVER_PENDING`     | A write cannot tell which shard owns the key during a move. Retryable                                       |
+| `MIGRATION_LOOKUP_UNAVAILABLE`  | Tombstone lookup failed (retryable) or names an unknown shard (not). `bestEffort` reads not found           |
+| `MIGRATION_CHAIN_EXCEEDED`      | Move chain loops or runs past four tombstone hops. Not retryable. `bestEffort` reads not found              |
+| `RECOVERY_IN_PROGRESS`          | Another recovery holds the lease for this scope. Retryable; a scheduler can treat it as success             |
+| `RECOVERY_FENCED`               | This recovery lost its lease mid-run and made no further writes. Not retryable; the next call recovers      |
 | `MIGRATION_SOURCE_TOMBSTONED`   | The source shard holds a tombstone for the key from another move                                            |
 | `MIGRATION_ABORTED`             | `reassignShard` stopped after repeated recopies failed to cut over                                          |
 | `MIGRATION_AMBIGUOUS`           | Recovery found an archived row that does not match the destination; an operator must decide                 |
@@ -3773,20 +3790,25 @@ await coordinator.decrementShardCount('db-west');
 
 #### Reconciling Allocations
 
-`reconcileAllocations` compares the coordinator's allocation ledger with the shard each key lives on. The KV mapping is the record, and the ledger is advisory. Call it after `initialize`. It throws `COORDINATOR_NOT_CONFIGURED` when the config has no `coordinator`.
+`reconcileAllocations` compares the coordinator's allocation ledger with routing metadata: the KV mapping, or the computed owner for a key with no mapping. The KV mapping is the record, and the ledger is advisory. Call it after `initialize`. It throws `COORDINATOR_NOT_CONFIGURED` when the config has no `coordinator`.
+
+Routing agreement does not show that a row exists. Pass `verifyRecords` with the tables to check, and each key's primary key is probed on the shard routing points at (the ledger shard when a key has no mapping). `pkColumn` names the key column of a table and defaults to `id`. Without `verifyRecords`, no shard is queried and every examined row counts as `recordUnchecked`. With it, each row lands in one count: `recordVerified` when a listed table holds the key, `recordMissing` (with `recordMissingCount` for the total) when none does, and `recordUnchecked` when the probe could not run, because the shard is not configured, the table list is empty, or the query threw. A row on the routed shard is not proof that it is the authoritative copy. A shard that holds a tombstone can keep a retained row, and for moved keys the journal is the authority.
 
 The run is observational by default and writes nothing unless a flag is set:
 
-- `repair: true` writes a KV mapping for each key that has none, using the ledger shard when it is configured.
-- `pruneVerified: true` removes ledger rows whose shard matches their KV mapping. Rows that match only the computed placement stay.
+- `repair: true` writes a KV mapping for each key with no KV mapping and no computed owner, using the ledger shard, and only when the probe finds the key's row there. It requires `verifyRecords`; without it the call throws `RECONCILE_VERIFY_REQUIRED`.
+- `pruneVerified: true` removes ledger rows that agree with routing and have an explicit KV mapping. With `verifyRecords`, the row must also be verified. Rows that match only the computed placement stay.
 
 Disagreements are reported and never resolved. Key lists in the report hold at most 1,000 entries, and the counts are exact.
 
 ```typescript
 import { reconcileAllocations } from '@earth-app/collegedb';
 
-const report = await reconcileAllocations({ limit: 100 });
-console.log(report.examined, report.agreed, report.missingMappingCount, report.disagreeingCount);
+const report = await reconcileAllocations({
+	limit: 100,
+	verifyRecords: { tables: [{ table: 'users' }] }
+});
+console.log(report.examined, report.routingAgreed, report.recordMissingCount, report.disagreeingCount);
 ```
 
 #### Advanced Monitoring Setup
