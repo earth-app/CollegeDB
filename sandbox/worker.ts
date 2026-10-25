@@ -7,25 +7,34 @@ import {
 	allAllShards,
 	allShard,
 	batch,
+	CollegeDBError,
 	createHyperdrivePostgresProvider,
 	createMappingsForExistingKeys,
 	createNuxtHubKVProvider,
 	createSchemaAcrossShards,
 	createSQLiteProvider,
+	createWorkersKVProvider,
 	first,
 	flush,
 	getShardStats,
 	initialize,
+	initializeAsync,
 	insert,
+	insertInto,
+	invalidateMappingCache,
 	listKnownShards,
+	reassignShard,
 	run,
 	runAllShards,
 	runShard,
-	ShardCoordinator
+	ShardCoordinator,
+	toProvider,
+	updateRow
 } from '../src/index';
 import { KVShardMapper } from '../src/kvmap';
 import type { HyperdriveProvider } from '../src/providers';
 import type { CollegeDBConfig, D1Region, MixedShardingStrategy, ShardingStrategy, ShardLocation, SQLDialect } from '../src/types';
+import { alsOverlapProbe, alsRejectProbe, type AlsMode } from './als-probe';
 
 export { ShardCoordinator };
 
@@ -111,6 +120,8 @@ function metadataQueryFor(dialect: SQLDialect | undefined): string {
 		? "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name LIMIT 25"
 		: "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name LIMIT 25";
 }
+
+const RACE_SCHEMA = 'CREATE TABLE IF NOT EXISTS race_items (id TEXT PRIMARY KEY, name TEXT, qty INTEGER)';
 
 const INSERT_USER_SQL = 'INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)';
 const SELECT_USER_SQL = 'SELECT id, name, email, created_at FROM users WHERE id = ?';
@@ -723,6 +734,150 @@ export default {
 					targetRegion,
 					shardLocations: strategySetup.config.shardLocations
 				});
+			}
+
+			if (pathname === '/api/benchmark/journal-move' && request.method === 'POST') {
+				if (profile !== 'native' && profile !== 'hyperdrive') {
+					return json({ success: true, skipped: `the ${profile} profile has no transactional batch on every shard` });
+				}
+
+				const body = await parseJson(request);
+				const id = String(body.id ?? `journal-${Date.now()}`);
+				const shards = Object.fromEntries(Object.entries(config.shards).map(([name, shard]) => [name, toProvider(shard)!]));
+				await initializeAsync({
+					...config,
+					shards,
+					journalShard: 'db-central',
+					hashShardMappings: false,
+					waitUntil: (promise) => ctx.waitUntil(promise)
+				});
+				await createSchemaAcrossShards(shards, RACE_SCHEMA);
+
+				const mapper = new KVShardMapper(config.kv, { hashShardMappings: false });
+				const rowsOn = async (shard: string, key: string) =>
+					(await allShard<{ name: string }>(shard, 'SELECT name FROM race_items WHERE id = ?', [key])).results;
+
+				await runShard('db-east', 'INSERT INTO race_items (id, name, qty) VALUES (?, ?, ?)', [id, 'orig', 1]);
+				await mapper.setShardMapping(id, 'db-east');
+				await invalidateMappingCache(id);
+				await reassignShard(id, 'db-west', 'race_items');
+
+				const moved = await rowsOn('db-west', id);
+				const left = await rowsOn('db-east', id);
+				const tombstones = (await allShard('db-east', 'SELECT op_id FROM collegedb_retired WHERE primary_key = ?', [id])).results;
+				const updated = await updateRow(id, 'race_items', { name: 'after' }, { id });
+
+				const fresh = `${id}-new`;
+				const inserted = await insertInto(fresh, 'race_items', { id: fresh, name: 'new', qty: 9 });
+
+				// a caller still routing to the old shard must be refused, and leave no row
+				await mapper.setShardMapping(id, 'db-east');
+				await invalidateMappingCache(id);
+				const refusals: string[] = [];
+				for (const stale of [
+					() => updateRow(id, 'race_items', { name: 'stale' }, { id }),
+					() => insertInto(id, 'race_items', { id, name: 'ghost', qty: 1 })
+				]) {
+					try {
+						await stale();
+						refusals.push('acknowledged');
+					} catch (error) {
+						refusals.push(error instanceof CollegeDBError ? String(error.code) : 'other');
+					}
+				}
+				const ghosts = await rowsOn('db-east', id);
+
+				const ok =
+					moved.length === 1 &&
+					moved[0]!.name === 'orig' &&
+					left.length === 0 &&
+					tombstones.length === 1 &&
+					updated.meta.changes === 1 &&
+					inserted.meta.changes === 1 &&
+					refusals.every((code) => code === 'MIGRATION_CUTOVER_PENDING') &&
+					ghosts.length === 0;
+
+				return json(
+					{
+						success: ok,
+						label: profile === 'hyperdrive' ? 'local workerd D1 and local Hyperdrive Postgres' : 'local workerd D1',
+						refusals,
+						ghosts: ghosts.length,
+						tombstones: tombstones.length
+					},
+					ok ? 200 : 500
+				);
+			}
+
+			if (pathname === '/api/benchmark/kv-bulk-read' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const prefix = String(body.prefix ?? `kvbulk:${Date.now()}:`);
+				const kv = createWorkersKVProvider(env.KV, { cacheTtl: 0 });
+				const check = async (count: number) => {
+					const keys = Array.from({ length: count }, (_, i) => `${prefix}${count}:${i}`);
+					await kv.putMany!(keys.filter((_, i) => i % 10 !== 0).map((key) => ({ key, value: JSON.stringify({ key }) })));
+					const values = await kv.getMany!(keys, 'text');
+					const exact =
+						values.length === count && values.every((value, i) => value === (i % 10 === 0 ? null : JSON.stringify({ key: keys[i] })));
+					await Promise.all(keys.map((key) => env.KV.delete(key)));
+					return exact;
+				};
+
+				const single = await check(100);
+				const chunked = await check(250);
+				return json({ success: single && chunked, single, chunked, label: 'local workerd KV' }, single && chunked ? 200 : 500);
+			}
+
+			if (pathname === '/api/probe/failing-batch' && request.method === 'POST') {
+				const db = env['db-east'];
+				await db.exec('CREATE TABLE IF NOT EXISTS probe_rollback (id TEXT PRIMARY KEY, v INTEGER)');
+				await db.exec('DELETE FROM probe_rollback');
+
+				const insert = (id: string, v: number) => db.prepare('INSERT INTO probe_rollback (id, v) VALUES (?, ?)').bind(id, v);
+				const countRows = async () => Number((await db.prepare('SELECT COUNT(*) AS n FROM probe_rollback').first<{ n: number }>())?.n);
+
+				// the third statement repeats the first key, so it fails after two good ones
+				let rawError: string | null = null;
+				try {
+					await db.batch([insert('a', 1), insert('b', 2), insert('a', 3)]);
+				} catch (error) {
+					rawError = error instanceof Error ? error.message : String(error);
+				}
+				const rawRows = await countRows();
+				await db.exec('DELETE FROM probe_rollback');
+
+				let adapterError: string | null = null;
+				try {
+					await toProvider(db)!.runBatch!([
+						{ sql: 'INSERT INTO probe_rollback (id, v) VALUES (?, ?)', bindings: ['a', 1] },
+						{ sql: 'INSERT INTO probe_rollback (id, v) VALUES (?, ?)', bindings: ['b', 2] },
+						{ sql: 'INSERT INTO probe_rollback (id, v) VALUES (?, ?)', bindings: ['a', 3] }
+					]);
+				} catch (error) {
+					adapterError = error instanceof Error ? error.message : String(error);
+				}
+				const adapterRows = await countRows();
+				await db.exec('DROP TABLE probe_rollback');
+
+				return json({
+					success: rawError !== null && adapterError !== null && rawRows === 0 && adapterRows === 0,
+					label: 'local workerd D1',
+					raw: { threw: rawError !== null, rowsAfter: rawRows, rolledBack: rawRows === 0 },
+					adapter: { threw: adapterError !== null, rowsAfter: adapterRows, rolledBack: adapterRows === 0 }
+				});
+			}
+
+			if (pathname === '/api/probe/als' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const mode = String(body.mode ?? '') as AlsMode;
+				const iterations = toBoundedInt(body.iterations, 200, 1, 1000);
+				if (mode === 'reject') {
+					return json({ success: true, ...(await alsRejectProbe(env, ctx, iterations)) });
+				}
+				if (mode === 'scoped' || mode === 'unscoped' || mode === 'client') {
+					return json({ success: true, ...(await alsOverlapProbe(env, ctx, mode, iterations)) });
+				}
+				return json({ success: false, error: `unknown mode ${mode}` }, 400);
 			}
 
 			if (pathname === '/api/benchmark/database-sizes' && request.method === 'GET') {
