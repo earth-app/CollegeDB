@@ -19,10 +19,11 @@ import {
 	getShardStats,
 	initialize,
 	initializeAsync,
-	insert,
 	insertInto,
+	insertShard,
 	invalidateMappingCache,
 	listKnownShards,
+	nextId,
 	reassignShard,
 	run,
 	runAllShards,
@@ -128,10 +129,9 @@ const SELECT_USER_SQL = 'SELECT id, name, email, created_at FROM users WHERE id 
 const UPDATE_USER_SQL = 'UPDATE users SET name = ?, email = ? WHERE id = ?';
 const DELETE_USER_SQL = 'DELETE FROM users WHERE id = ?';
 const INSERT_POST_SQL = 'INSERT INTO posts (id, user_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)';
-// RETURNING is required, not decorative: Postgres reports no insert id in its
-// result metadata, so a generated key can only come back through the row.
-// D1 and SQLite accept the same statement.
-const INSERT_AUTO_USER_SQL = 'INSERT INTO auto_users (name, email, created_at) VALUES (?, ?, ?) RETURNING id';
+const INSERT_AUTO_USER_SQL = 'INSERT INTO auto_users (id, name, email, created_at) VALUES (?, ?, ?, ?)';
+// insertShard reads the id from RETURNING, the only place Postgres reports it
+const INSERT_AUTO_USER_RETURNING_SQL = `${INSERT_AUTO_USER_SQL} RETURNING id`;
 const SELECT_AUTO_USER_SQL = 'SELECT id, name, email, created_at FROM auto_users WHERE id = ?';
 const CLOUDFLARE_BENCH_SHARD_LOCATIONS: Record<string, ShardLocation> = {
 	'db-east': { region: 'enam', priority: 2 },
@@ -544,20 +544,54 @@ export default {
 				const body = await parseJson(request);
 				const prefix = String(body.prefix ?? `auto-${Date.now()}`);
 				const records = toBoundedInt(body.records, 10, 1, 100);
-				const generatedIds: Array<number | string> = [];
+				const generatedIds: number[] = [];
 
 				for (let i = 0; i < records; i++) {
-					const routingKey = `${prefix}-${i}`;
-					const result = await insert(INSERT_AUTO_USER_SQL, [`Auto ${i}`, `${routingKey}@auto.local`, Date.now()]);
-					generatedIds.push(result.generatedId);
+					const id = await nextId('auto_users');
+					await run(String(id), INSERT_AUTO_USER_SQL, [id, `Auto ${i}`, `${prefix}-${i}@auto.local`, Date.now()]);
+					generatedIds.push(id);
 
-					const row = await first<Record<string, unknown>>(String(result.generatedId), SELECT_AUTO_USER_SQL, [result.generatedId]);
-					if (!row) {
-						return json({ success: false, error: 'Generated id could not be read back' }, 500);
+					const row = await first<Record<string, unknown>>(String(id), SELECT_AUTO_USER_SQL, [id]);
+					if (!row || Number(row.id) !== id) {
+						return json({ success: false, error: `Routed read of id ${id} returned ${JSON.stringify(row)}` }, 500);
 					}
 				}
 
 				return json({ success: true, inserted: records, generatedIds });
+			}
+
+			if (pathname === '/api/benchmark/auto-increment-collision' && request.method === 'POST') {
+				const body = await parseJson(request);
+				const prefix = String(body.prefix ?? `collision-${Date.now()}`);
+				const id = await nextId('auto_users');
+				const email = (label: string) => `${prefix}-${label}@auto.local`;
+				const attempt = async (label: string, options?: { table: string }) => {
+					try {
+						await insertShard('db-west', INSERT_AUTO_USER_RETURNING_SQL, [id, label, email(label), Date.now()], options);
+						return { code: null as string | null };
+					} catch (error) {
+						return { code: error instanceof CollegeDBError ? String(error.code) : 'other' };
+					}
+				};
+				const rowsOnWest = async () => (await allShard('db-west', SELECT_AUTO_USER_SQL, [id])).results.length;
+
+				await insertShard('db-east', INSERT_AUTO_USER_RETURNING_SQL, [id, 'first', email('first'), Date.now()]);
+
+				const withoutTable = await attempt('without-table');
+				const orphansWithoutTable = await rowsOnWest();
+				await runShard('db-west', 'DELETE FROM auto_users WHERE id = ?', [id]);
+
+				const withTable = await attempt('with-table', { table: 'auto_users' });
+				const orphansWithTable = await rowsOnWest();
+
+				const routed = await first<Record<string, unknown>>(String(id), SELECT_AUTO_USER_SQL, [id]);
+				return json({
+					success: true,
+					id,
+					withoutTable: { ...withoutTable, orphanRows: orphansWithoutTable },
+					withTable: { ...withTable, orphanRows: orphansWithTable },
+					routedName: routed?.name ?? null
+				});
 			}
 
 			if (pathname === '/api/benchmark/migration' && request.method === 'POST') {

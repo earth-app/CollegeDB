@@ -43,6 +43,7 @@ import {
 	paginate,
 	pruneEpochs,
 	reassignShard,
+	reconcileAllocations,
 	resetConfig,
 	run,
 	runAllShards,
@@ -51,9 +52,27 @@ import {
 	upsert
 } from '../../src/index';
 import { KVShardMapper } from '../../src/kvmap';
-import { runGuardedWrite, setMigrationStepHook } from '../../src/migrations';
+import type { MigrationEnv } from '../../src/migrations';
+import {
+	ensureIndex,
+	ensureJournalSchema,
+	findTombstone,
+	getMigrationStatus,
+	moveRecord,
+	recoverMigrations,
+	runGuardedWrite,
+	setMigrationStepHook
+} from '../../src/migrations';
 import { createManifest, resetPlacementState } from '../../src/placement';
-import { buildGuardedInsert, buildInsert, buildJournalSchema, buildShardSidecarSchema } from '../../src/query';
+import {
+	HISTORY_INDEX,
+	LEASE_TABLE,
+	buildGuardedInsert,
+	buildInsert,
+	buildJournalSchema,
+	buildShardSidecarSchema,
+	quoteIdentifier
+} from '../../src/query';
 import { PhaseCollector } from '../../src/telemetry';
 import { buildManifestSchema, commitJournalManifest, loadJournalManifest, raiseFence, readFence } from '../../src/topology';
 import type {
@@ -62,6 +81,7 @@ import type {
 	D1Region,
 	KVStorage,
 	MixedShardingStrategy,
+	PreparedStatement,
 	SQLDatabase,
 	ShardLocation,
 	ShardingStrategy
@@ -113,6 +133,10 @@ const SCENARIO_NAMES = [
 	'kv_bulk_read',
 	'batch_rollback',
 	'topology_cas',
+	'missing_sidecar_lookup',
+	'reconcile_record_probe',
+	'recovery_lease_takeover',
+	'history_index_ensure',
 	'als_overlap',
 	'als_no_compat'
 ] as const;
@@ -266,6 +290,8 @@ interface RowMetricCell {
 interface SQLRuntime {
 	shards: Record<string, SQLDatabase>;
 	close: () => Promise<void>;
+	/** Opens the same database as a login that can only read the listed tables; Postgres, MySQL and MariaDB only */
+	restricted?: (binding: string, readableTables: string[]) => Promise<SQLDatabase>;
 }
 
 interface KVRuntime {
@@ -383,8 +409,9 @@ const SCENARIO_CATALOG: Record<
 	},
 	auto_increment: {
 		title: 'Auto-generated primary keys',
-		details: 'Inserts rows with generated ids, captures the returned key, then validates follow-up routed reads.',
-		workload: (plan) => `${plan.autoIncrement} iterations; insert + generated-id readback per iteration`
+		details:
+			'Docker lanes pin a generated-id table to one shard with insertShard, capture the returned key and read it back through the router. Cloudflare lanes allocate ids with nextId, insert them explicitly across shards and read them back, then hand one id to two shards and expect GENERATED_KEY_COLLISION with and without the table option.',
+		workload: (plan) => `${plan.autoIncrement} iterations; insert + generated-id readback per iteration (Cloudflare: plus one refusal arm)`
 	},
 	indexing: {
 		title: 'Indexed query scan',
@@ -473,6 +500,30 @@ const SCENARIO_CATALOG: Record<
 		details:
 			'Creates the manifest, sidecar and journal tables twice, races manifest publishers on the compare-and-swap, races a stale-generation writer against the fence raise and the census, and runs pruneEpochs (dry run, then real) on three shards. Control arms (a swap with no revision check, a writer with no fence) must report violations.',
 		workload: () => '--race-iterations per race kind; protocol arm plus control arm'
+	},
+	missing_sidecar_lookup: {
+		title: 'Missing sidecar table on a journaled read',
+		details:
+			'Reads a key that has no row from a shard that holds no sidecar tables, and checks the read answers not found, issues no DDL and leaves the tables absent. Records the driver error of the missing table. Then breaks the lookup for a real reason (a revoked privilege on Postgres, MySQL and MariaDB, a renamed column everywhere) and checks the read throws MIGRATION_LOOKUP_UNAVAILABLE, or answers not found with bestEffort.',
+		workload: () => 'a few reads per arm; missing-table, followed-tombstone, renamed-column and revoked-privilege arms'
+	},
+	reconcile_record_probe: {
+		title: 'Reconcile record probes on live shards',
+		details:
+			'Runs reconcileAllocations against a fake ledger and live shards: a row that exists, a row that is missing, a mapping that repair may write, a routed shard that refuses the probe, and a table that does not exist. Checks recordVerified, recordMissing and recordUnchecked, that repair and prune act only on verified rows, and that a run without verifyRecords issues no SQL. Control arms that read a failed probe as missing, or every probe as a hit, must trip the same checks.',
+		workload: () => '9 reconcile runs per engine and adapter; 6 ledger keys over 3 shards'
+	},
+	recovery_lease_takeover: {
+		title: 'Recovery lease expiry and takeover',
+		details:
+			'Leaves a move at cutover_pending or copied, holds recovery A at a protocol step, expires its lease on an injected clock, lets recovery B take over and finish, then releases A and checks it throws RECOVERY_FENCED and writes nothing. Pairs and quads of recoveries started together must give one winner and RECOVERY_IN_PROGRESS for the rest. Control arms (no generation condition on journal writes, no generation read before a shard step, an acquire with no expiry condition) must each report violations.',
+		workload: () => 'about a quarter of --race-iterations per arm; three protocol arms plus three control arms'
+	},
+	history_index_ensure: {
+		title: 'History index on a journal made without it',
+		details:
+			'Creates the journal tables with the old DDL, which holds no history index, then runs ensureJournalSchema and checks the engine catalog holds the index on the key columns. Runs ensureIndex again, then four at once over a dropped index in several rounds, and checks every call succeeds and one index remains. A plain CREATE INDEX run twice must fail, which shows the repeat above is not vacuous.',
+		workload: () => '2 sequential ensures and about a quarter of --race-iterations rounds of 4 concurrent ensures'
 	},
 	als_overlap: {
 		title: 'Overlapping collegedb calls on workerd',
@@ -892,6 +943,25 @@ async function benchmarkCombo(combo: Combo, profile: AdapterProfile, options: CL
 			initialize(config);
 		}
 
+		if (selected('missing_sidecar_lookup')) {
+			scenarios.missing_sidecar_lookup = await scenarioMissingSidecarLookup(combo.db, profile, kvRuntime.kv);
+			initialize(config);
+		}
+
+		if (selected('reconcile_record_probe')) {
+			scenarios.reconcile_record_probe = await scenarioReconcileRecordProbe(combo.db, profile, kvRuntime.kv);
+			initialize(config);
+		}
+
+		if (selected('recovery_lease_takeover')) {
+			scenarios.recovery_lease_takeover = await scenarioRecoveryLeaseTakeover(combo.db, profile, options.raceIterations);
+			initialize(config);
+		}
+
+		if (selected('history_index_ensure')) {
+			scenarios.history_index_ensure = await scenarioHistoryIndexEnsure(combo.db, profile, options.raceIterations);
+		}
+
 		scenarios.als_overlap = createSkippedScenario('als_overlap', 'needs workerd; the cloudflare lane runs it');
 		scenarios.als_no_compat = createSkippedScenario('als_no_compat', 'needs workerd; the cloudflare lane runs it');
 
@@ -1075,6 +1145,14 @@ async function benchmarkCloudflare(options: CLIOptions, profile: AdapterProfile)
 				'topology_cas',
 				'local D1 is one SQLite file behind workerd, so the swap and the fence have no second connection to race; the Docker lanes cover them'
 			);
+		}
+		for (const name of ['missing_sidecar_lookup', 'reconcile_record_probe', 'recovery_lease_takeover', 'history_index_ensure'] as const) {
+			if (selected(name)) {
+				scenarios[name] = createSkippedScenario(
+					name,
+					'local D1 has no second connection, no privilege to revoke and no engine error codes to record; the Docker lanes cover it'
+				);
+			}
 		}
 
 		if (!options.only) {
@@ -2899,6 +2977,1090 @@ async function pruneEndToEnd(shards: Record<string, SQLDatabase>, kv: KVStorage)
 
 // #endregion
 
+// #region live engine scenarios
+
+/** What a statement tap does besides logging; every field is a test seam that breaks one protection on purpose */
+interface Tap {
+	/** Every statement sent, as `shard sql` */
+	log: string[];
+	/** What a `SELECT 1 FROM` probe returns: its real answer, a hit for every key, or an empty answer for every failure */
+	probe: 'real' | 'always' | 'swallow';
+	/** Rewrites a statement before it is sent; `drop` counts the trailing bindings the rewrite removes */
+	rewrite?: (sql: string) => { sql: string; drop: number } | null;
+	/** Answers the lease generation read with this value instead of asking the journal */
+	fakeLease?: number;
+}
+
+const LEASE_CHECK = /^SELECT\s+generation\s+FROM\s+collegedb_recovery_lease\s+WHERE\s+scope\s*=\s*\?$/i;
+const FENCE_PREDICATE =
+	/\(SELECT\s+["`]?generation["`]?\s+FROM\s+["`]?collegedb_recovery_lease["`]?\s+WHERE\s+["`]?scope["`]?\s*=\s*\?\)\s*=\s*\?/;
+const CRASH_MESSAGE = 'sandbox crash';
+
+const isWriteEntry = (entry: string): boolean => !/^\S+\s+SELECT\s/i.test(entry);
+
+/** Wraps a shard so every statement is logged and the Tap seams apply; the shard itself is untouched */
+function tapShard(inner: SQLDatabase, name: string, tap: Tap): SQLDatabase {
+	const wrapped = Object.create(inner) as SQLDatabase;
+
+	const statement = (sql: string, bound: any[] | null): PreparedStatement => {
+		const rewritten = tap.rewrite?.(sql) ?? null;
+		const text = rewritten?.sql ?? sql;
+		const open = (): PreparedStatement => {
+			const prepared = inner.prepare(text);
+			return bound === null ? prepared : prepared.bind(...(rewritten ? bound.slice(0, bound.length - rewritten.drop) : bound));
+		};
+		const isProbe = /^SELECT 1 FROM/i.test(sql);
+
+		return {
+			bind: (...bindings: any[]) => statement(sql, bindings),
+			run: (() => {
+				tap.log.push(`${name} ${text}`);
+				return open().run();
+			}) as PreparedStatement['run'],
+			all: (() => {
+				tap.log.push(`${name} ${text}`);
+				return open().all();
+			}) as PreparedStatement['all'],
+			first: (async () => {
+				tap.log.push(`${name} ${text}`);
+				if (isProbe && tap.probe === 'always') {
+					return { one: 1 };
+				}
+				if (tap.fakeLease !== undefined && LEASE_CHECK.test(sql)) {
+					return { generation: tap.fakeLease };
+				}
+				try {
+					return await open().first();
+				} catch (error) {
+					if (isProbe && tap.probe === 'swallow') {
+						return null;
+					}
+					throw error;
+				}
+			}) as PreparedStatement['first']
+		};
+	};
+
+	wrapped.prepare = (sql: string) => statement(sql, null);
+	if (inner.runBatch) {
+		wrapped.runBatch = (async (statements: BatchStatement[]) => {
+			for (const entry of statements) {
+				tap.log.push(`${name} ${entry.sql}`);
+			}
+			return await inner.runBatch!(statements);
+		}) as SQLDatabase['runBatch'];
+	}
+
+	return wrapped;
+}
+
+function tapAll(shards: Record<string, SQLDatabase>, tap: Tap): Record<string, SQLDatabase> {
+	return Object.fromEntries(Object.entries(shards).map(([name, db]) => [name, tapShard(db, name, tap)]));
+}
+
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+async function settle<T>(work: Promise<T>): Promise<Settled<T>> {
+	try {
+		return { ok: true, value: await work };
+	} catch (error) {
+		return { ok: false, error };
+	}
+}
+
+/** The driver's own code, number, SQLSTATE and message for an error and its causes, which is what a classifier has to match */
+function describeDriverError(error: unknown): string {
+	const parts: string[] = [];
+	let current: unknown = error;
+	for (let depth = 0; depth < 3 && current && typeof current === 'object'; depth++) {
+		const e = current as { name?: string; code?: unknown; errno?: unknown; sqlState?: unknown; message?: string; cause?: unknown };
+		const fields = [
+			e.name,
+			e.code !== undefined && `code=${e.code}`,
+			e.errno !== undefined && `errno=${e.errno}`,
+			e.sqlState && `sqlState=${e.sqlState}`
+		];
+		parts.push(
+			`${depth === 0 ? '' : 'cause '}{${fields.filter(Boolean).join(' ')}: ${String(e.message).replace(/\s+/g, ' ').slice(0, 100)}}`
+		);
+		current = e.cause;
+	}
+	return parts.join(' ') || String(error);
+}
+
+function describeOutcome(outcome: Settled<unknown>): string {
+	if (outcome.ok) {
+		return 'no error';
+	}
+	if (outcome.error instanceof CollegeDBError) {
+		return `${outcome.error.code}: ${outcome.error.message.slice(0, 120)} cause ${describeDriverError((outcome.error as { cause?: unknown }).cause)}`;
+	}
+	return describeDriverError(outcome.error);
+}
+
+async function tableExists(db: SQLDatabase, table: string): Promise<boolean> {
+	const sql =
+		db.dialect === 'postgres'
+			? "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ?"
+			: db.dialect === 'mysql'
+				? 'SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?'
+				: "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?";
+	const row = await db.prepare(sql).bind(table).first<{ n: unknown }>();
+	return Number(row?.n) > 0;
+}
+
+function liveResult(name: ScenarioName, started: number, iterations: number, lines: string[], problems: string[]): ScenarioStats {
+	const elapsed = performance.now() - started;
+	return {
+		name,
+		status: problems.length === 0 ? 'passed' : 'failed',
+		iterations,
+		samplesMs: [elapsed],
+		...calculateLatencyStats([elapsed]),
+		notes: lines.join(' | '),
+		// a failed row shows only its error, so the recorded driver errors travel with it
+		error: problems.length === 0 ? undefined : `${problems.join('; ')} [${lines.join(' | ')}]`
+	};
+}
+
+const insertRaceRow = (db: SQLDatabase, key: string, name = 'orig') =>
+	db.prepare(`INSERT INTO ${RACE_TABLE} (id, name, qty) VALUES (?, ?, ?)`).bind(key, name, 1).run();
+
+// #region missing sidecar scenario
+
+/**
+ * A shard that never held the sidecar tables must read as "no tombstone", a lookup that fails for any
+ * other reason must not, and the read must never create a table.
+ */
+async function scenarioMissingSidecarLookup(dbFlavor: DatabaseFlavor, profile: AdapterProfile, kv: KVStorage): Promise<ScenarioStats> {
+	const started = performance.now();
+	const lines: string[] = [];
+	const problems: string[] = [];
+	const expect = (condition: unknown, message: string) => {
+		if (!condition) {
+			problems.push(message);
+		}
+	};
+	const mysqlFamily = dbFlavor === 'mysql' || dbFlavor === 'mariadb';
+	const select = `SELECT name FROM ${RACE_TABLE} WHERE id = ?`;
+	const pending: Promise<unknown>[] = [];
+	let runtime: SQLRuntime | null = null;
+	let reads = 0;
+
+	try {
+		runtime = await createSQLRuntime(dbFlavor, createRunId(`sidecar_${dbFlavor}_${profile}`), profile, ['shard-a', 'shard-b', 'shard-j']);
+		const raw = runtime.shards;
+		const tap: Tap = { log: [], probe: 'real' };
+		const shards = tapAll(raw, tap);
+		const configFor = (used: Record<string, SQLDatabase>): CollegeDBConfig => ({
+			kv,
+			shards: used,
+			strategy: 'hash',
+			journalShard: 'shard-j',
+			disableAutoMigration: true,
+			hashShardMappings: false,
+			mappingCacheTtlMs: 0,
+			waitUntil: (promise) => void pending.push(promise)
+		});
+
+		await createSchemaAcrossShards(raw, RACE_SCHEMA);
+		await initializeAsync(configFor(shards));
+		await Promise.allSettled(pending);
+
+		const mapper = raceMapper(kv);
+		const a = raw['shard-a']!;
+		const sidecar = ['collegedb_retired', 'collegedb_topology', ...(mysqlFamily ? ['collegedb_lock_stripes'] : [])];
+		const routedTo = async (key: string, binding: string) => {
+			await mapper.setShardMapping(key, binding);
+			await invalidateMappingCache(key);
+		};
+		const absent = async () => (await Promise.all(sidecar.map((table) => tableExists(a, table)))).every((exists) => !exists);
+
+		// arm 1: the shard has never held the sidecar tables
+		for (const table of sidecar) {
+			await a.prepare(`DROP TABLE IF EXISTS ${table}`).run();
+		}
+		expect(await absent(), 'the sidecar tables could not be removed from shard-a');
+
+		const key = `sc_${Date.now()}`;
+		const lookup = await settle(findTombstone(a, 'default', key));
+		expect(!lookup.ok, 'a tombstone lookup on a shard with no sidecar table did not fail');
+		lines.push(`missing table error: ${lookup.ok ? 'none' : describeDriverError(lookup.error)}`);
+
+		await routedTo(key, 'shard-a');
+		tap.log.length = 0;
+		for (let i = 0; i < 3; i++) {
+			const row = await settle(first(key, select, [key]));
+			const rows = await settle(all(key, select, [key]));
+			const best = await settle(first(key, select, [key], { bestEffort: true }));
+			reads += 3;
+			expect(row.ok && row.value === null, `first on a shard with no sidecar table: ${describeOutcome(row)}`);
+			expect(rows.ok && rows.value.results.length === 0, `all on a shard with no sidecar table: ${describeOutcome(rows)}`);
+			expect(best.ok && best.value === null, `first with bestEffort on a shard with no sidecar table: ${describeOutcome(best)}`);
+		}
+		const onA = tap.log.filter((entry) => entry.startsWith('shard-a '));
+		expect(
+			onA.filter((entry) => entry.includes('FROM collegedb_retired')).length === 9,
+			`expected 9 tombstone lookups on shard-a, saw ${onA.filter((entry) => entry.includes('FROM collegedb_retired')).length}`
+		);
+		expect(!onA.some((entry) => /^\S+\s+(CREATE|DROP|ALTER|INSERT|UPDATE|DELETE)\b/i.test(entry)), 'a read sent DDL or a write to shard-a');
+		expect(await absent(), 'a read created a sidecar table on shard-a');
+		lines.push('absent read: 9 reads answered not found, 9 lookups, no DDL, tables still absent');
+
+		// control: the catalog check sees a table when one exists
+		await runStatements(a, buildShardSidecarSchema(a.dialect));
+		expect(await tableExists(a, 'collegedb_retired'), 'the catalog check missed a table that exists');
+
+		// control: with the tables present the same lookup finds a real tombstone
+		const moved = `${key}_moved`;
+		await seedRaceRow(mapper, moved);
+		await reassignShard(moved, 'shard-b', RACE_TABLE);
+		await routedTo(moved, 'shard-a');
+		const followed = await settle(first<{ name: string }>(moved, select, [moved]));
+		reads++;
+		expect(followed.ok && followed.value?.name === 'orig', `a moved key was not followed to its destination: ${describeOutcome(followed)}`);
+		await routedTo(moved, 'shard-b');
+
+		// arm 2: the lookup fails for a real reason that is not a missing table
+		const failing = async (label: string, code: string) => {
+			const target = `sc_${label}_${Date.now()}`;
+			await routedTo(target, 'shard-a');
+			const thrown = await settle(first(target, select, [target]));
+			const quiet = await settle(first(target, select, [target], { bestEffort: true }));
+			const quietAll = await settle(all(target, select, [target], { bestEffort: true }));
+			reads += 3;
+			const cause = !thrown.ok && thrown.error instanceof CollegeDBError ? (thrown.error as { cause?: unknown }).cause : undefined;
+			expect(
+				!thrown.ok && thrown.error instanceof CollegeDBError && thrown.error.code === code,
+				`${label}: first threw ${describeOutcome(thrown)}`
+			);
+			expect(quiet.ok && quiet.value === null, `${label}: bestEffort first: ${describeOutcome(quiet)}`);
+			expect(quietAll.ok, `${label}: all: ${describeOutcome(quietAll)}`);
+			lines.push(`${label}: ${describeDriverError(cause)}`);
+		};
+
+		await a.prepare('ALTER TABLE collegedb_retired RENAME COLUMN moved_to TO moved_to_x').run();
+		try {
+			await failing('renamed column', 'MIGRATION_LOOKUP_UNAVAILABLE');
+		} finally {
+			await a.prepare('ALTER TABLE collegedb_retired RENAME COLUMN moved_to_x TO moved_to').run();
+		}
+		const restored = `sc_restored_${Date.now()}`;
+		await routedTo(restored, 'shard-a');
+		const afterRestore = await settle(first(restored, select, [restored]));
+		reads++;
+		expect(afterRestore.ok && afterRestore.value === null, `after the column was restored: ${describeOutcome(afterRestore)}`);
+
+		if (runtime.restricted) {
+			const reader = await runtime.restricted('shard-a', [RACE_TABLE]);
+			const warn = console.warn;
+			console.warn = () => undefined;
+			try {
+				initialize(configFor({ ...shards, 'shard-a': tapShard(reader, 'shard-a', tap) }));
+				await Promise.allSettled(pending);
+			} finally {
+				console.warn = warn;
+			}
+			await failing('revoked privilege', 'MIGRATION_LOOKUP_UNAVAILABLE');
+		} else {
+			lines.push('revoked privilege: not available on SQLite');
+		}
+	} catch (error) {
+		problems.push(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
+	} finally {
+		resetConfig();
+		resetPlacementState();
+		await safely(async () => void (await Promise.all(PLACEMENT_KV_KEYS.map((entry) => kv.delete(entry)))));
+		if (runtime) {
+			await safely(async () => runtime?.close());
+		}
+	}
+
+	return liveResult('missing_sidecar_lookup', started, reads, lines, problems);
+}
+
+// #endregion
+
+// #region reconcile scenario
+
+interface ReconcileExpectation {
+	examined: number;
+	routingAgreed: number;
+	recordVerified: number;
+	recordMissing: string[];
+	recordUnchecked: number;
+	missingMapping: string[];
+	disagreeing: string[];
+	repaired: number;
+	pruned: number;
+}
+
+/** A coordinator ledger in memory, shaped like the Durable Object's allocations routes */
+function fakeCoordinator(ledger: Map<string, string>): NonNullable<CollegeDBConfig['coordinator']> {
+	const stub = {
+		fetch: async (url: string, init?: { body?: string }) => {
+			const target = new URL(url);
+			if (target.pathname === '/allocations/prune') {
+				const { primaryKeys } = JSON.parse(init?.body ?? '{}') as { primaryKeys: string[] };
+				return Response.json({ pruned: primaryKeys.filter((key) => ledger.delete(key)).length });
+			}
+			const after = target.searchParams.get('after') ?? '';
+			const limit = Number(target.searchParams.get('limit') ?? 100);
+			const keys = [...ledger.keys()].filter((key) => key > after).sort();
+			const page = keys.slice(0, limit);
+			return Response.json({
+				allocations: page.map((primaryKey) => ({ primaryKey, shard: ledger.get(primaryKey) })),
+				next: keys.length > limit ? page[page.length - 1] : null
+			});
+		}
+	};
+	return { idFromName: (name: string) => name, get: () => stub } as unknown as NonNullable<CollegeDBConfig['coordinator']>;
+}
+
+/** Compares a report with what the live rows say it must be; the controls feed it a distorted shard layer and must fail it */
+function reconcileProblems(
+	label: string,
+	report: Awaited<ReturnType<typeof reconcileAllocations>>,
+	expected: ReconcileExpectation
+): string[] {
+	const actual: ReconcileExpectation = {
+		examined: report.examined,
+		routingAgreed: report.routingAgreed,
+		recordVerified: report.recordVerified,
+		recordMissing: report.recordMissing,
+		recordUnchecked: report.recordUnchecked,
+		missingMapping: report.missingMapping,
+		disagreeing: report.disagreeing.map((entry) => entry.key),
+		repaired: report.repaired,
+		pruned: report.pruned
+	};
+	const found: string[] = [];
+	for (const field of Object.keys(expected) as Array<keyof ReconcileExpectation>) {
+		if (JSON.stringify(actual[field]) !== JSON.stringify(expected[field])) {
+			found.push(`${label}: ${field} was ${JSON.stringify(actual[field])}, expected ${JSON.stringify(expected[field])}`);
+		}
+	}
+	if (report.recordMissingCount !== report.recordMissing.length) {
+		found.push(`${label}: recordMissingCount ${report.recordMissingCount} against ${report.recordMissing.length} listed`);
+	}
+	return found;
+}
+
+/**
+ * reconcileAllocations with verifyRecords against live rows: a hit, a miss, a probe the shard refuses
+ * and a table that does not exist.
+ */
+async function scenarioReconcileRecordProbe(dbFlavor: DatabaseFlavor, profile: AdapterProfile, kv: KVStorage): Promise<ScenarioStats> {
+	const started = performance.now();
+	const lines: string[] = [];
+	const problems: string[] = [];
+	const pending: Promise<unknown>[] = [];
+	let runtime: SQLRuntime | null = null;
+	let runs = 0;
+
+	try {
+		runtime = await createSQLRuntime(dbFlavor, createRunId(`reconcile_${dbFlavor}_${profile}`), profile, ['shard-a', 'shard-b', 'shard-c']);
+		const raw = runtime.shards;
+		await createSchemaAcrossShards(raw, RACE_SCHEMA);
+
+		// shard-c refuses every probe: a login with no privilege on the table, or on SQLite a view that overflows when read
+		// (a renamed column would not do, since SQLite reads a double-quoted unknown column as a string literal)
+		let refusing = raw['shard-c']!;
+		if (runtime.restricted) {
+			refusing = await runtime.restricted('shard-c', []);
+		} else {
+			await refusing.prepare(`DROP TABLE ${RACE_TABLE}`).run();
+			await refusing.prepare(`CREATE VIEW ${RACE_TABLE} (id, name, qty) AS SELECT abs(-9223372036854775807 - 1), 'x', 1`).run();
+		}
+		const refusal = await settle(refusing.prepare(`SELECT 1 FROM ${RACE_TABLE} WHERE id = ? LIMIT 1`).bind('x').first());
+		lines.push(`refused probe on shard-c: ${refusal.ok ? 'none' : describeDriverError(refusal.error)}`);
+		if (refusal.ok) {
+			problems.push('shard-c did not refuse the probe');
+		}
+		const missingTable = await settle(
+			raw['shard-a']!.prepare(`SELECT 1 FROM ${quoteIdentifier('no_such_table_ff2', raw['shard-a']!.dialect)} WHERE id = ? LIMIT 1`)
+				.bind('x')
+				.first()
+		);
+		lines.push(`unconfigured table probe: ${missingTable.ok ? 'none' : describeDriverError(missingTable.error)}`);
+
+		const tap: Tap = { log: [], probe: 'real' };
+		const shards = tapAll({ ...raw, 'shard-c': refusing }, tap);
+		const ledger = new Map<string, string>();
+		const prefix = `rp_${Date.now()}`;
+		const [k1, k2, k3, k4, k5, k6] = [1, 2, 3, 4, 5, 6].map((n) => `${prefix}_${n}`) as [string, string, string, string, string, string];
+		const mapper = raceMapper(kv);
+
+		await insertRaceRow(raw['shard-a']!, k1);
+		await insertRaceRow(raw['shard-a']!, k3);
+		await insertRaceRow(raw['shard-b']!, k5);
+		for (const [key, shard] of [
+			[k1, 'shard-a'],
+			[k2, 'shard-a'],
+			[k3, 'shard-a'],
+			[k4, 'shard-a'],
+			[k5, 'shard-a'],
+			[k6, 'shard-c']
+		] as const) {
+			ledger.set(key, shard);
+		}
+		for (const [key, shard] of [
+			[k1, 'shard-a'],
+			[k2, 'shard-a'],
+			[k5, 'shard-b'],
+			[k6, 'shard-c']
+		] as const) {
+			await mapper.setShardMapping(key, shard);
+		}
+
+		initialize({
+			kv,
+			shards,
+			strategy: 'hash',
+			hashShardMappings: false,
+			mappingCacheTtlMs: 0,
+			disableAutoMigration: true,
+			coordinator: fakeCoordinator(ledger),
+			waitUntil: (promise) => void pending.push(promise)
+		});
+		await Promise.allSettled(pending);
+
+		const verify = { tables: [{ table: RACE_TABLE }] };
+		const probesSent = () => tap.log.filter((entry) => /^\S+\s+SELECT 1 FROM/i.test(entry)).length;
+		const reconcile = async (options: Parameters<typeof reconcileAllocations>[0]) => {
+			tap.log.length = 0;
+			runs++;
+			return await reconcileAllocations(options);
+		};
+		const reader = new KVShardMapper(kv, { hashShardMappings: false, mappingCacheTtlMs: 0 });
+		const mapped = async (key: string) => (await reader.getShardMapping(key))?.shard ?? null;
+		const addProblems = (found: string[]) => void problems.push(...found);
+		const expectation = (overrides: Partial<ReconcileExpectation>): ReconcileExpectation => ({
+			examined: 6,
+			routingAgreed: 3,
+			recordVerified: 3,
+			recordMissing: [k2, k4],
+			recordUnchecked: 1,
+			missingMapping: [k3, k4],
+			disagreeing: [k5],
+			repaired: 0,
+			pruned: 0,
+			...overrides
+		});
+
+		// no verifyRecords: nothing is queried and nothing counts as checked
+		const observed = await reconcile({ limit: 4 });
+		addProblems(
+			reconcileProblems('without verifyRecords', observed, expectation({ recordVerified: 0, recordMissing: [], recordUnchecked: 6 }))
+		);
+		if (tap.log.length !== 0) {
+			problems.push(`a run without verifyRecords sent ${tap.log.length} statements to the shards, first: ${tap.log[0]}`);
+		}
+
+		// verifyRecords, observational
+		const first1 = await reconcile({ limit: 4, verifyRecords: verify });
+		addProblems(reconcileProblems('verifyRecords', first1, expectation({})));
+		if (probesSent() !== 6) {
+			problems.push(`verifyRecords sent ${probesSent()} probes for 6 rows`);
+		}
+		if (ledger.size !== 6 || (await mapped(k3)) !== null || (await mapped(k4)) !== null) {
+			problems.push('an observational run changed the ledger or wrote a mapping');
+		}
+		const paged = await reconcile({ limit: 1, verifyRecords: verify });
+		if (JSON.stringify(paged) !== JSON.stringify(first1)) {
+			problems.push(`a page size of 1 changed the report: ${JSON.stringify(paged)}`);
+		}
+
+		// controls: a failed probe read as missing, and every probe read as a hit, must trip the same checks
+		for (const mode of ['swallow', 'always'] as const) {
+			tap.probe = mode;
+			const distorted = reconcileProblems(`control ${mode}`, await reconcile({ limit: 4, verifyRecords: verify }), expectation({}));
+			tap.probe = 'real';
+			lines.push(`control ${mode}: ${distorted.length} checks tripped`);
+			if (distorted.length === 0) {
+				problems.push(`control ${mode} tripped no check, so the checks are not shown able to see it`);
+			}
+		}
+
+		// repair writes a mapping only where the row exists on the ledger shard
+		const repaired = await reconcile({ limit: 4, repair: true, verifyRecords: verify });
+		addProblems(reconcileProblems('repair', repaired, expectation({ repaired: 1 })));
+		if ((await mapped(k3)) !== 'shard-a' || (await mapped(k4)) !== null || ledger.size !== 6) {
+			problems.push(`repair left k3 at ${await mapped(k3)} and k4 at ${await mapped(k4)}`);
+		}
+
+		// prune removes only the rows routing agrees on, that have a mapping, and whose row exists
+		const pruned = await reconcile({ limit: 4, pruneVerified: true, verifyRecords: verify });
+		addProblems(reconcileProblems('prune', pruned, expectation({ routingAgreed: 4, missingMapping: [k4], pruned: 2 })));
+		if ([...ledger.keys()].sort().join() !== [k2, k4, k5, k6].sort().join()) {
+			problems.push(`prune left ledger keys ${[...ledger.keys()].sort().join()}`);
+		}
+
+		// a table that does not exist: the engine's missing-table error is unchecked, never missing
+		const left = { examined: 4, routingAgreed: 2, missingMapping: [k4], disagreeing: [k5], repaired: 0, pruned: 0 };
+		const mixed = await reconcile({
+			limit: 4,
+			repair: true,
+			pruneVerified: true,
+			verifyRecords: { tables: [{ table: RACE_TABLE }, { table: 'no_such_table_ff2' }] }
+		});
+		addProblems(
+			reconcileProblems('listed table plus a missing one', mixed, { ...left, recordVerified: 1, recordMissing: [], recordUnchecked: 3 })
+		);
+		const absentOnly = await reconcile({
+			limit: 4,
+			repair: true,
+			pruneVerified: true,
+			verifyRecords: { tables: [{ table: 'no_such_table_ff2' }] }
+		});
+		addProblems(
+			reconcileProblems('only a missing table', absentOnly, { ...left, recordVerified: 0, recordMissing: [], recordUnchecked: 4 })
+		);
+		if (ledger.size !== 4 || (await mapped(k4)) !== null) {
+			problems.push('a run whose probes all failed repaired or pruned something');
+		}
+	} catch (error) {
+		problems.push(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
+	} finally {
+		resetConfig();
+		resetPlacementState();
+		await safely(async () => void (await Promise.all(PLACEMENT_KV_KEYS.map((entry) => kv.delete(entry)))));
+		if (runtime) {
+			await safely(async () => runtime?.close());
+		}
+	}
+
+	return liveResult('reconcile_record_probe', started, runs, lines, problems);
+}
+
+// #endregion
+
+// #region recovery lease scenario
+
+interface LeaseWorld {
+	/** The shards as the engine sees them, with no tap */
+	raw: Record<string, SQLDatabase>;
+	shards: Record<string, SQLDatabase>;
+	tap: Tap;
+	clock: { now: number };
+	dialect: SQLDatabase['dialect'];
+	close: () => Promise<void>;
+}
+
+interface LeaseArm {
+	label: string;
+	kind: 'takeover' | 'race';
+	/** The state the move is left in, which is also the step recovery A is held at */
+	leftAt?: 'cutover_pending' | 'copied';
+	/** The protection this arm breaks on purpose */
+	control?: 'no-fence' | 'no-check' | 'no-expiry';
+	iterations: number;
+}
+
+async function openLeaseWorld(dbFlavor: DatabaseFlavor, profile: AdapterProfile): Promise<LeaseWorld> {
+	const runtime = await createSQLRuntime(dbFlavor, createRunId(`lease_${dbFlavor}_${profile}`), profile, ['shard-a', 'shard-b', 'shard-j']);
+	const tap: Tap = { log: [], probe: 'real' };
+	const shards = tapAll(runtime.shards, tap);
+
+	try {
+		await createSchemaAcrossShards(runtime.shards, RACE_SCHEMA);
+		await ensureJournalSchema(shards, 'shard-j');
+	} catch (error) {
+		await safely(async () => runtime.close());
+		throw error;
+	}
+
+	return {
+		raw: runtime.shards,
+		shards,
+		tap,
+		clock: { now: Date.now() },
+		dialect: runtime.shards['shard-j']!.dialect,
+		close: runtime.close
+	};
+}
+
+const leaseEnv = (world: LeaseWorld, scope: string): MigrationEnv => ({
+	scope,
+	journalBinding: 'shard-j',
+	shards: world.shards,
+	publish: async () => undefined,
+	now: () => world.clock.now
+});
+
+/** Drops the generation condition from every fenced journal write */
+const stripFence = (sql: string) => (FENCE_PREDICATE.test(sql) ? { sql: sql.replace(FENCE_PREDICATE, '1 = 1'), drop: 2 } : null);
+
+/** Drops the expiry condition from the lease acquire, so every caller takes the lease */
+const stripAcquire = (sql: string) => {
+	if (!sql.includes(LEASE_TABLE)) {
+		return null;
+	}
+	if (/ON DUPLICATE KEY UPDATE/i.test(sql)) {
+		return { sql: sql.replace(/IF\([`"]?expires_at[`"]? <= \?, ([^,]+), [^)]+\)/g, '$1'), drop: 3 };
+	}
+	if (/DO UPDATE SET/i.test(sql)) {
+		return { sql: sql.replace(/ WHERE \S*expires_at\S* <= \?$/, ''), drop: 1 };
+	}
+	return null;
+};
+
+/** Installs the process-wide step hook for one key: crash once at a step, hold the first arrival at a step, or slow each arrival */
+function makeGate(key: string) {
+	let arrive: () => void = () => undefined;
+	let release: () => void = () => undefined;
+	const arrived = new Promise<void>((resolveArrival) => (arrive = resolveArrival));
+	const released = new Promise<void>((resolveRelease) => (release = resolveRelease));
+	const gate = { crashAt: '', holdAt: '', delayAt: '', held: false, arrived, release: () => release() };
+
+	setMigrationStepHook(async (step, info) => {
+		if (info.key !== key) {
+			return;
+		}
+		if (step === gate.crashAt) {
+			gate.crashAt = '';
+			throw new Error(CRASH_MESSAGE);
+		}
+		if (step === gate.delayAt) {
+			await pause(6);
+		}
+		if (step === gate.holdAt && !gate.held) {
+			gate.held = true;
+			arrive();
+			await released;
+		}
+	});
+
+	return gate;
+}
+
+async function leaseRow(world: LeaseWorld, scope: string) {
+	return await world.raw['shard-j']!.prepare(`SELECT holder, generation, expires_at FROM ${LEASE_TABLE} WHERE scope = ?`)
+		.bind(scope)
+		.first<{ holder: string; generation: unknown; expires_at: unknown }>();
+}
+
+/** Everything a recovery could still write for one move: its journal rows, the lease, and the key on both shards */
+async function leaseSnapshot(world: LeaseWorld, scope: string, key: string): Promise<string> {
+	const rows = async (binding: string, sql: string, ...bindings: unknown[]) =>
+		(
+			await world.raw[binding]!.prepare(sql)
+				.bind(...bindings)
+				.all()
+		).results;
+
+	return JSON.stringify([
+		await rows(
+			'shard-j',
+			'SELECT op_id, state, attempt, generation, digest FROM collegedb_migration_history WHERE scope = ? ORDER BY op_id, state, attempt',
+			scope
+		),
+		await rows('shard-j', 'SELECT op_id FROM collegedb_migration_active WHERE scope = ? AND primary_key = ?', scope, key),
+		await rows('shard-j', `SELECT holder, generation, expires_at FROM ${LEASE_TABLE} WHERE scope = ?`, scope),
+		await rows('shard-a', `SELECT id, name, qty FROM ${RACE_TABLE} WHERE id = ?`, key),
+		await rows('shard-b', `SELECT id, name, qty FROM ${RACE_TABLE} WHERE id = ?`, key),
+		await rows('shard-a', 'SELECT op_id, generation FROM collegedb_retired WHERE scope = ? AND primary_key = ?', scope, key),
+		await rows('shard-b', 'SELECT op_id, generation FROM collegedb_retired WHERE scope = ? AND primary_key = ?', scope, key)
+	]);
+}
+
+/** Leaves a move at the named step by crashing the executor there, and returns what went wrong if it did not stop */
+async function leaveMoveAt(
+	world: LeaseWorld,
+	gate: ReturnType<typeof makeGate>,
+	env: MigrationEnv,
+	key: string,
+	step: string
+): Promise<string | null> {
+	await insertRaceRow(world.raw['shard-a']!, key);
+	gate.crashAt = step;
+	const crashed = await settle(moveRecord(env, { table: RACE_TABLE, key, source: 'shard-a', destination: 'shard-b' }));
+	if (crashed.ok || !(crashed.error instanceof Error) || crashed.error.message !== CRASH_MESSAGE) {
+		return `the move did not stop at ${step}: ${describeOutcome(crashed)}`;
+	}
+	const status = await getMigrationStatus(env, key, RACE_TABLE);
+	if (status?.state === step && status.active) {
+		return null;
+	}
+	const history = await world.raw['shard-j']!.prepare(`SELECT state, attempt FROM collegedb_migration_history WHERE primary_key = ?`)
+		.bind(key)
+		.all();
+	const tail = world.tap.log.slice(-5).map((entry) => entry.slice(0, 80));
+	return `the journal shows ${status?.state} (active ${status?.active}) after a crash at ${step}; history ${JSON.stringify(history.results)}; last statements ${JSON.stringify(tail)}`;
+}
+
+/** Recovery A is held mid-run, its lease expires, B takes over and finishes, then A is released */
+async function leaseTakeover(world: LeaseWorld, arm: LeaseArm, i: number, prefix: string): Promise<string[]> {
+	const problems: string[] = [];
+	const key = `${prefix}_${i}`;
+	const fail = (message: string) => void problems.push(`${arm.label}/${i}: ${message}`);
+	const env = leaseEnv(world, key);
+	const gate = makeGate(key);
+	const step = arm.leftAt!;
+	let recoveryA: Promise<Settled<Awaited<ReturnType<typeof recoverMigrations>>>> | null = null;
+
+	world.tap.log.length = 0;
+	world.tap.rewrite = undefined;
+	world.tap.fakeLease = undefined;
+
+	try {
+		const left = await leaveMoveAt(world, gate, env, key, step);
+		if (left) {
+			fail(left);
+			return problems;
+		}
+
+		gate.holdAt = step;
+		const startedAt = world.clock.now;
+		recoveryA = settle(recoverMigrations(env));
+		const reached = await Promise.race([gate.arrived.then(() => true), recoveryA.then(() => false)]);
+		if (!reached) {
+			fail('recovery A finished without reaching the hold');
+			return problems;
+		}
+
+		let row = await leaseRow(world, key);
+		if (Number(row?.generation) !== 1 || Number(row?.expires_at) !== startedAt + 60_000) {
+			fail(`lease row while A runs: generation ${row?.generation}, expires_at ${row?.expires_at}, expected 1 and ${startedAt + 60_000}`);
+		}
+		for (const offset of [0, 59_999]) {
+			world.clock.now = startedAt + offset;
+			const refused = await settle(recoverMigrations(env));
+			if (refused.ok || !(refused.error instanceof CollegeDBError) || refused.error.code !== 'RECOVERY_IN_PROGRESS') {
+				fail(`a recovery ${offset} ms into a live lease: ${describeOutcome(refused)}`);
+			}
+		}
+
+		world.clock.now = startedAt + 60_000;
+		const takeover = await settle(recoverMigrations(env));
+		if (!takeover.ok || takeover.value.committed.length !== 1 || takeover.value.failed.length !== 0) {
+			fail(`recovery B at expiry: ${takeover.ok ? JSON.stringify(takeover.value) : describeOutcome(takeover)}`);
+		}
+		row = await leaseRow(world, key);
+		if (Number(row?.generation) !== 2) {
+			fail(`lease generation after the takeover is ${row?.generation}, expected 2`);
+		}
+		const status = await getMigrationStatus(env, key, RACE_TABLE);
+		const [onA, onB] = await Promise.all(
+			['shard-a', 'shard-b'].map(
+				async (binding) => (await world.raw[binding]!.prepare(`SELECT id FROM ${RACE_TABLE} WHERE id = ?`).bind(key).all()).results.length
+			)
+		);
+		if (status?.active !== false || onA !== 0 || onB !== 1) {
+			fail(`after B: state ${status?.state}, active ${status?.active}, ${onA} rows on the source, ${onB} on the destination`);
+		}
+
+		const before = await leaseSnapshot(world, key, key);
+		const mark = world.tap.log.length;
+		if (arm.control === 'no-fence') {
+			world.tap.rewrite = stripFence;
+		} else if (arm.control === 'no-check') {
+			world.tap.fakeLease = 1;
+		}
+		gate.release();
+		const resumed = await recoveryA;
+		recoveryA = null;
+
+		const sent = world.tap.log.slice(mark).filter(isWriteEntry);
+		const shardWrites = sent.filter((entry) => !entry.startsWith('shard-j '));
+		const journalWrites = sent.filter((entry) => entry.startsWith('shard-j '));
+		const fenced = !resumed.ok && resumed.error instanceof CollegeDBError && resumed.error.code === 'RECOVERY_FENCED';
+		const allowed = step === 'copied' ? 1 : 0;
+
+		if (!fenced) {
+			fail(`recovery A ended with ${describeOutcome(resumed)}, expected RECOVERY_FENCED`);
+		}
+		if ((await leaseSnapshot(world, key, key)) !== before) {
+			fail('the journal, the lease or a shard changed after the takeover');
+		}
+		if (shardWrites.length > 0) {
+			fail(`recovery A sent ${shardWrites.length} writes to a shard after the takeover, first: ${shardWrites[0]!.slice(0, 90)}`);
+		}
+		if (journalWrites.length > allowed || journalWrites.some((entry) => !entry.includes(LEASE_TABLE))) {
+			fail(
+				`recovery A sent ${journalWrites.length} journal writes after the takeover (${allowed} fenced write allowed), first: ${journalWrites[0]?.slice(0, 90)}`
+			);
+		}
+	} finally {
+		gate.release();
+		setMigrationStepHook(null);
+		world.tap.rewrite = undefined;
+		world.tap.fakeLease = undefined;
+		if (recoveryA) {
+			await recoveryA;
+		}
+	}
+
+	return problems;
+}
+
+/** Two or four recoveries start together on one unfinished move */
+async function leaseRace(world: LeaseWorld, arm: LeaseArm, i: number, prefix: string): Promise<string[]> {
+	const problems: string[] = [];
+	const key = `${prefix}_${i}`;
+	const racers = i % 2 === 0 ? 2 : 4;
+	const fail = (message: string) => void problems.push(`${arm.label}/${i}/${racers} racers: ${message}`);
+	const env = leaseEnv(world, key);
+	const gate = makeGate(key);
+
+	world.tap.log.length = 0;
+	world.tap.rewrite = arm.control === 'no-expiry' ? stripAcquire : undefined;
+
+	try {
+		const left = await leaveMoveAt(world, gate, env, key, 'cutover_pending');
+		if (left) {
+			fail(left);
+			return problems;
+		}
+
+		// holding each arrival keeps the winner inside its recovery while the others try to take the lease
+		gate.delayAt = 'cutover_pending';
+		const outcomes = await Promise.all(Array.from({ length: racers }, () => settle(recoverMigrations(env))));
+		const won = outcomes.filter((outcome) => outcome.ok);
+		const refused = outcomes.filter(
+			(outcome) => !outcome.ok && outcome.error instanceof CollegeDBError && outcome.error.code === 'RECOVERY_IN_PROGRESS'
+		);
+		const other = outcomes.filter((outcome) => !outcome.ok && !refused.includes(outcome));
+		if (won.length !== 1 || refused.length !== racers - 1 || other.length > 0) {
+			fail(
+				`${won.length} ran, ${refused.length} refused with RECOVERY_IN_PROGRESS, ${other.length} other: ${other.map(describeOutcome).join(', ')}`
+			);
+		}
+		const report = won.find((outcome) => outcome.ok);
+		if (report?.ok && (report.value.committed.length !== 1 || report.value.failed.length !== 0)) {
+			fail(`the winner reported ${JSON.stringify(report.value)}`);
+		}
+
+		const row = await leaseRow(world, key);
+		if (Number(row?.generation) !== 1 || Number(row?.expires_at) !== 0) {
+			fail(`lease row after the race: generation ${row?.generation}, expires_at ${row?.expires_at}, expected 1 and 0`);
+		}
+		const status = await getMigrationStatus(env, key, RACE_TABLE);
+		const [onA, onB, tombstones] = await Promise.all([
+			world.raw['shard-a']!.prepare(`SELECT id FROM ${RACE_TABLE} WHERE id = ?`)
+				.bind(key)
+				.all()
+				.then((result) => result.results.length),
+			world.raw['shard-b']!.prepare(`SELECT id FROM ${RACE_TABLE} WHERE id = ?`)
+				.bind(key)
+				.all()
+				.then((result) => result.results.length),
+			world.raw['shard-a']!.prepare('SELECT op_id FROM collegedb_retired WHERE scope = ? AND primary_key = ?')
+				.bind(key, key)
+				.all()
+				.then((result) => result.results.length)
+		]);
+		if (status?.active !== false || onA !== 0 || onB !== 1 || tombstones !== 1) {
+			fail(
+				`move ended in ${status?.state} (active ${status?.active}): ${onA} source rows, ${onB} destination rows, ${tombstones} tombstones`
+			);
+		}
+	} finally {
+		setMigrationStepHook(null);
+		world.tap.rewrite = undefined;
+	}
+
+	return problems;
+}
+
+/**
+ * Lease expiry and takeover on a live engine, and the same protections broken on purpose. A control
+ * arm that reports no violation would mean its check cannot see the defect it stands for.
+ */
+async function scenarioRecoveryLeaseTakeover(dbFlavor: DatabaseFlavor, profile: AdapterProfile, perKind: number): Promise<ScenarioStats> {
+	const started = performance.now();
+	const lines: string[] = [];
+	const problems: string[] = [];
+	const n = Math.max(8, Math.ceil(perKind / 4));
+	const nc = Math.max(4, Math.ceil(n / 2));
+	const arms: LeaseArm[] = [
+		{ label: 'takeover at cutover_pending', kind: 'takeover', leftAt: 'cutover_pending', iterations: n },
+		{ label: 'takeover at copied', kind: 'takeover', leftAt: 'copied', iterations: n },
+		{ label: 'concurrent recoveries', kind: 'race', iterations: n },
+		{ label: 'control (no generation on journal writes)', kind: 'takeover', leftAt: 'copied', control: 'no-fence', iterations: nc },
+		{
+			label: 'control (no generation read before a shard step)',
+			kind: 'takeover',
+			leftAt: 'cutover_pending',
+			control: 'no-check',
+			iterations: nc
+		},
+		{ label: 'control (acquire with no expiry condition)', kind: 'race', control: 'no-expiry', iterations: nc }
+	];
+	let world: LeaseWorld | null = null;
+	let total = 0;
+
+	try {
+		world = await openLeaseWorld(dbFlavor, profile);
+		const prefix = `ls_${Date.now()}`;
+
+		for (const [index, arm] of arms.entries()) {
+			const found: string[][] = [];
+			for (let i = 0; i < arm.iterations; i++) {
+				found.push(await (arm.kind === 'takeover' ? leaseTakeover : leaseRace)(world, arm, i, `${prefix}_${index}`));
+				total++;
+			}
+
+			const flagged = found.filter((entry) => entry.length > 0);
+			const line = `${arm.label} n=${arm.iterations}: ${flagged.length} iterations with violations`;
+			lines.push(line);
+			console.log(`[Sandbox] recovery_lease_takeover ${dbFlavor}/${profile} ${line}`);
+			if (flagged.length > 0) {
+				console.log(`[Sandbox]   first violation: ${flagged[0]![0]}`);
+			}
+			if (!arm.control && flagged.length > 0) {
+				problems.push(`${arm.label}: ${flagged.length} iterations, first: ${flagged[0]![0]}`);
+			} else if (arm.control && flagged.length === 0) {
+				problems.push(`${arm.label}: the control reported no violation, so the checks are not shown able to see it`);
+			}
+		}
+	} catch (error) {
+		problems.push(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
+	} finally {
+		setMigrationStepHook(null);
+		if (world) {
+			await safely(async () => world?.close());
+		}
+	}
+
+	return liveResult('recovery_lease_takeover', started, total, lines, problems);
+}
+
+// #endregion
+
+// #region history index scenario
+
+/** The columns of the history key index in order, read from the engine catalog; empty when the index does not exist */
+async function historyIndexColumns(db: SQLDatabase): Promise<string[]> {
+	const { table, name } = HISTORY_INDEX;
+	if (db.dialect === 'postgres') {
+		const row = await db
+			.prepare("SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = ? AND indexname = ?")
+			.bind(table, name)
+			.first<{ indexdef: string }>();
+		return row ? (/\(([^)]*)\)\s*$/.exec(row.indexdef)?.[1] ?? '').split(',').map((column) => column.trim()) : [];
+	}
+
+	const sql =
+		db.dialect === 'mysql'
+			? 'SELECT column_name AS col FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? ORDER BY seq_in_index'
+			: 'SELECT name AS col FROM pragma_index_info(?) ORDER BY seqno';
+	const rows = await db
+		.prepare(sql)
+		.bind(...(db.dialect === 'mysql' ? [table, name] : [name]))
+		.all<{ col: string }>();
+	return rows.results.map((row) => row.col);
+}
+
+/** How many indexes the history table has besides its primary key, so a duplicate under another name shows up */
+async function historyExtraIndexes(db: SQLDatabase): Promise<number> {
+	const { table } = HISTORY_INDEX;
+	const sql =
+		db.dialect === 'postgres'
+			? "SELECT COUNT(*) AS n FROM pg_indexes WHERE schemaname = 'public' AND tablename = ? AND indexname NOT LIKE '%_pkey'"
+			: db.dialect === 'mysql'
+				? "SELECT COUNT(DISTINCT index_name) AS n FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name <> 'PRIMARY'"
+				: "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name NOT LIKE 'sqlite_autoindex%'";
+	return Number((await db.prepare(sql).bind(table).first<{ n: unknown }>())?.n);
+}
+
+/**
+ * A journal table created before the index existed gets it from the ensure step, once and without error,
+ * however often and however concurrently the step runs.
+ */
+async function scenarioHistoryIndexEnsure(dbFlavor: DatabaseFlavor, profile: AdapterProfile, perKind: number): Promise<ScenarioStats> {
+	const started = performance.now();
+	const lines: string[] = [];
+	const problems: string[] = [];
+	const rounds = Math.max(8, Math.ceil(perKind / 4));
+	const wanted = HISTORY_INDEX.columns.join(',');
+	let runtime: SQLRuntime | null = null;
+	let ensures = 0;
+
+	try {
+		runtime = await createSQLRuntime(dbFlavor, createRunId(`index_${dbFlavor}_${profile}`), profile, ['shard-j']);
+		const tap: Tap = { log: [], probe: 'real' };
+		const db = tapShard(runtime.shards['shard-j']!, 'shard-j', tap);
+		const state = async () => ({ columns: (await historyIndexColumns(db)).join(','), extra: await historyExtraIndexes(db) });
+		const expectState = (label: string, actual: { columns: string; extra: number }, columns: string, extra: number) => {
+			if (actual.columns !== columns || actual.extra !== extra) {
+				problems.push(`${label}: index columns [${actual.columns}] and ${actual.extra} extra indexes, expected [${columns}] and ${extra}`);
+			}
+		};
+
+		// the old DDL: the journal tables with no history index
+		await runStatements(db, buildJournalSchema(db.dialect));
+		expectState('journal tables made by the old DDL', await state(), '', 0);
+
+		// the ensure step on a fresh provider adds it
+		await ensureJournalSchema({ 'shard-j': db }, 'shard-j');
+		ensures++;
+		expectState('after ensureJournalSchema', await state(), wanted, 1);
+
+		// again, sequentially: no error, no second index, and on MySQL and MariaDB no second CREATE
+		tap.log.length = 0;
+		for (let i = 0; i < 2; i++) {
+			const repeat = await settle(ensureIndex(db, HISTORY_INDEX));
+			ensures++;
+			if (!repeat.ok) {
+				problems.push(`ensureIndex on an existing index: ${describeOutcome(repeat)}`);
+			}
+		}
+		expectState('after two more ensures', await state(), wanted, 1);
+		const creates = tap.log.filter((entry) => /\bCREATE INDEX\b/i.test(entry)).length;
+		if (db.dialect === 'mysql' && creates !== 0) {
+			problems.push(`ensureIndex sent ${creates} CREATE INDEX statements for an index that exists`);
+		}
+
+		// four at once over a dropped index, several rounds
+		let contested = 0;
+		for (let round = 0; round < rounds; round++) {
+			await db
+				.prepare(db.dialect === 'mysql' ? `DROP INDEX ${HISTORY_INDEX.name} ON ${HISTORY_INDEX.table}` : `DROP INDEX ${HISTORY_INDEX.name}`)
+				.run();
+			const dropped = await state();
+			if (dropped.columns !== '') {
+				problems.push(`round ${round}: the index could not be dropped`);
+				break;
+			}
+
+			tap.log.length = 0;
+			const outcomes = await Promise.all(Array.from({ length: 4 }, () => settle(ensureIndex(db, HISTORY_INDEX))));
+			ensures += 4;
+			const failed = outcomes.filter((outcome) => !outcome.ok);
+			if (failed.length > 0) {
+				problems.push(`round ${round}: ${failed.length} of 4 concurrent ensures failed: ${describeOutcome(failed[0]!)}`);
+			}
+			expectState(`round ${round}`, await state(), wanted, 1);
+			if (tap.log.filter((entry) => /\bCREATE INDEX\b/i.test(entry)).length > 1) {
+				contested++;
+			}
+		}
+		lines.push(`${rounds} rounds of 4 concurrent ensures, ${contested} sent more than one CREATE INDEX`);
+
+		// control: a plain CREATE INDEX over the existing index fails, so a clean repeat above means something
+		const columns = HISTORY_INDEX.columns.join(', ');
+		const naive = await settle(db.prepare(`CREATE INDEX ${HISTORY_INDEX.name} ON ${HISTORY_INDEX.table} (${columns})`).run());
+		lines.push(`plain CREATE INDEX over an existing one: ${naive.ok ? 'no error' : describeDriverError(naive.error)}`);
+		if (naive.ok) {
+			problems.push('a plain CREATE INDEX over an existing index did not fail, so the repeat checks cannot tell');
+		}
+		expectState('after the plain repeat', await state(), wanted, 1);
+	} catch (error) {
+		problems.push(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
+	} finally {
+		if (runtime) {
+			await safely(async () => runtime?.close());
+		}
+	}
+
+	return liveResult('history_index_ensure', started, ensures, lines, problems);
+}
+
+// #endregion
+
+// #endregion
+
 // #region kv and batch scenarios
 
 const BULK_READ_KEYS = 100;
@@ -3069,7 +4231,9 @@ async function scenarioCloudflareBulk(iterations: number, bulkSize: number, prof
 }
 
 async function scenarioCloudflareAutoIncrement(iterations: number, profile: AdapterProfile): Promise<ScenarioStats> {
-	return measureScenario('auto_increment', iterations, async (i) => {
+	const seen = new Set<number>();
+
+	const stats = await measureScenario('auto_increment', iterations, async (i) => {
 		const response = await postCloudflareBenchmark(
 			'/api/benchmark/auto-increment',
 			{
@@ -3079,7 +4243,7 @@ async function scenarioCloudflareAutoIncrement(iterations: number, profile: Adap
 			profile
 		);
 
-		const body = (await response.json()) as { success?: boolean; inserted?: number; generatedIds?: Array<number | string> };
+		const body = (await response.json()) as { success?: boolean; inserted?: number; generatedIds?: number[] };
 		if (!body?.success || typeof body.inserted !== 'number' || body.inserted <= 0) {
 			throw new Error('Cloudflare auto-increment endpoint did not return an inserted count');
 		}
@@ -3087,7 +4251,45 @@ async function scenarioCloudflareAutoIncrement(iterations: number, profile: Adap
 		if (!Array.isArray(body.generatedIds) || body.generatedIds.length !== body.inserted) {
 			throw new Error('Cloudflare auto-increment endpoint did not return generated ids');
 		}
+
+		for (const id of body.generatedIds) {
+			check(!seen.has(id), `nextId handed out id ${id} twice`);
+			seen.add(id);
+		}
 	});
+	if (stats.status !== 'passed') {
+		return stats;
+	}
+
+	// two shards given the same id stand in for two per-shard sequences colliding
+	try {
+		const response = await postCloudflareBenchmark(
+			'/api/benchmark/auto-increment-collision',
+			{ prefix: `cf-collision-${Date.now()}` },
+			profile
+		);
+		const arm = (await response.json()) as {
+			withoutTable: { code: string | null; orphanRows: number };
+			withTable: { code: string | null; orphanRows: number };
+			routedName: string | null;
+		};
+
+		check(arm.withoutTable.code === 'GENERATED_KEY_COLLISION', `second shard without { table } got code ${arm.withoutTable.code}`);
+		check(
+			arm.withoutTable.orphanRows === 1,
+			`without { table } the refused row should stay on the shard, found ${arm.withoutTable.orphanRows}`
+		);
+		check(arm.withTable.code === 'GENERATED_KEY_COLLISION', `second shard with { table } got code ${arm.withTable.code}`);
+		check(arm.withTable.orphanRows === 0, `with { table } the refused row should be deleted, found ${arm.withTable.orphanRows}`);
+		check(arm.routedName === 'first', `the first mapping no longer routes to the first row (read ${arm.routedName})`);
+
+		return {
+			...stats,
+			notes: `${seen.size} ids from nextId read back through routed reads; a repeated id on a second shard was refused with GENERATED_KEY_COLLISION, left its row without { table } and removed it with { table }, and the first mapping still routes`
+		};
+	} catch (error) {
+		return { ...stats, status: 'failed', error: error instanceof Error ? error.message : String(error) };
+	}
 }
 
 async function scenarioCloudflareMigration(
@@ -3607,9 +4809,48 @@ async function createPostgresRuntime(runId: string, profile: AdapterProfile, sha
 		shards[binding] = createPostgresProviderForProfile(pool, connectionString, profile);
 	}
 
+	const adminOn = async (database: string): Promise<PostgresClient> => {
+		const client = new PostgresClient({ host: '127.0.0.1', port: PORTS.postgres, user: 'collegedb', password: 'collegedb', database });
+		await client.connect();
+		return client;
+	};
+	const restrictedLogins: Array<{ role: string; database: string; pool: PostgresPool; provider: SQLDatabase }> = [];
+
 	return {
 		shards,
+		restricted: async (binding, readableTables) => {
+			const database = dbNamesByBinding.get(binding)!;
+			const role = `cdb_ro_${Math.floor(Math.random() * 1e9)}`;
+			const admin = await adminOn(database);
+			try {
+				await admin.query(`CREATE ROLE "${role}" LOGIN PASSWORD 'ro'`);
+				await admin.query(`GRANT CONNECT ON DATABASE "${escapePgIdentifier(database)}" TO "${role}"`);
+				await admin.query(`GRANT USAGE ON SCHEMA public TO "${role}"`);
+				for (const table of readableTables) {
+					await admin.query(`GRANT SELECT ON "${escapePgIdentifier(table)}" TO "${role}"`);
+				}
+			} finally {
+				await admin.end();
+			}
+
+			const pool = new PostgresPool({ host: '127.0.0.1', port: PORTS.postgres, user: role, password: 'ro', database, max: 4 });
+			await pool.query('SELECT 1');
+			const provider = createPostgresProviderForProfile(pool, `postgres://${role}:ro@127.0.0.1:${PORTS.postgres}/${database}`, profile);
+			restrictedLogins.push({ role, database, pool, provider });
+			return provider;
+		},
 		close: async () => {
+			await disposeHyperdriveShards(Object.fromEntries(restrictedLogins.map((login, i) => [String(i), login.provider])));
+			for (const login of restrictedLogins) {
+				await login.pool.end();
+				const admin = await adminOn(login.database);
+				await admin.query(`DROP OWNED BY "${login.role}"`);
+				await admin.end();
+				const cluster = await adminOn('postgres');
+				await cluster.query(`DROP ROLE IF EXISTS "${login.role}"`);
+				await cluster.end();
+			}
+
 			await disposeHyperdriveShards(shards);
 			for (const pool of poolsByBinding.values()) {
 				await pool.end();
@@ -3709,9 +4950,41 @@ async function createMySQLRuntime(runId: string, port: number, profile: AdapterP
 		shards[binding] = createMySQLProviderForProfile(pool, connectionString, profile);
 	}
 
+	const rootConnection = () => mysql.createConnection({ host: '127.0.0.1', port, user: 'root', password: 'root' });
+	const restrictedLogins: Array<{ user: string; pool: mysql.Pool; provider: SQLDatabase }> = [];
+
 	return {
 		shards,
+		restricted: async (binding, readableTables) => {
+			const dbName = dbNamesByBinding.get(binding)!;
+			const user = `cdb_ro_${Math.floor(Math.random() * 1e9)}`;
+			const admin = await rootConnection();
+			try {
+				await admin.execute(`CREATE USER '${user}'@'%' IDENTIFIED BY 'ro'`);
+				// a login needs a privilege somewhere in the database to connect to it, so it gets a table of its own
+				await admin.execute(`CREATE TABLE IF NOT EXISTS \`${dbName}\`.cdb_ro_anchor (id INT)`);
+				for (const table of ['cdb_ro_anchor', ...readableTables]) {
+					await admin.execute(`GRANT SELECT ON \`${dbName}\`.\`${table}\` TO '${user}'@'%'`);
+				}
+			} finally {
+				await admin.end();
+			}
+
+			const pool = mysql.createPool({ host: '127.0.0.1', port, user, password: 'ro', database: dbName, connectionLimit: 4 });
+			await pool.query('SELECT 1');
+			const provider = createMySQLProviderForProfile(pool, `mysql://${user}:ro@127.0.0.1:${port}/${dbName}`, profile);
+			restrictedLogins.push({ user, pool, provider });
+			return provider;
+		},
 		close: async () => {
+			await disposeHyperdriveShards(Object.fromEntries(restrictedLogins.map((login, i) => [String(i), login.provider])));
+			for (const login of restrictedLogins) {
+				await login.pool.end();
+				const admin = await rootConnection();
+				await admin.execute(`DROP USER IF EXISTS '${login.user}'@'%'`);
+				await admin.end();
+			}
+
 			await disposeHyperdriveShards(shards);
 			for (const pool of poolsByBinding.values()) {
 				await pool.end();
@@ -4199,6 +5472,10 @@ const SCENARIO_OPS_PER_ITERATION: Record<ScenarioName, (bulkSize: number) => num
 	kv_bulk_read: () => 100,
 	batch_rollback: () => 3,
 	topology_cas: () => 2,
+	missing_sidecar_lookup: () => 6,
+	reconcile_record_probe: () => 6,
+	recovery_lease_takeover: () => 8,
+	history_index_ensure: () => 4,
 	als_overlap: () => 1,
 	als_no_compat: () => 1
 };
@@ -4209,6 +5486,10 @@ const CORRECTNESS_SCENARIOS: ReadonlySet<ScenarioName> = new Set<ScenarioName>([
 	'stale_route_write',
 	'batch_rollback',
 	'topology_cas',
+	'missing_sidecar_lookup',
+	'reconcile_record_probe',
+	'recovery_lease_takeover',
+	'history_index_ensure',
 	'als_overlap',
 	'als_no_compat'
 ]);
@@ -4545,7 +5826,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('## Matrix: Adapter Profiles (Overall Avg)');
 		lines.push('');
 		lines.push('| Combination | native | drizzle | per-statement-connection |');
-		lines.push('| --- | --- | --- | --- | --- |');
+		lines.push('| --- | --- | --- | --- |');
 		for (const [baseId, byProfile] of groupedByBase) {
 			const profileCells = [
 				profileCell(byProfile.get('native')),
@@ -4554,9 +5835,7 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 			];
 			const formattedProfileCells = emphasizeRowExtremes(profileCells);
 
-			lines.push(
-				`| ${baseId} | ${formattedProfileCells[0]} | ${formattedProfileCells[1]} | ${formattedProfileCells[2]} | ${formattedProfileCells[3]} |`
-			);
+			lines.push(`| ${baseId} | ${formattedProfileCells[0]} | ${formattedProfileCells[1]} | ${formattedProfileCells[2]} |`);
 		}
 		lines.push('');
 
@@ -4695,12 +5974,12 @@ function buildMarkdownReport(options: CLIOptions, comboResults: ComboResult[], c
 		lines.push('');
 		lines.push('## Matrix: Cloudflare Adapter Profiles (Overall Avg)');
 		lines.push('');
-		lines.push('| Environment | native | drizzle |');
+		lines.push('| Environment | native | drizzle | hyperdrive |');
 		lines.push('| --- | --- | --- | --- |');
 		const cloudflareProfileCells = [
 			profileCell(groupedCloudflare.get('native')),
 			profileCell(groupedCloudflare.get('drizzle')),
-			profileCell(groupedCloudflare.get('drizzle'))
+			profileCell(groupedCloudflare.get('hyperdrive'))
 		];
 		const formattedCloudflareProfiles = emphasizeRowExtremes(cloudflareProfileCells);
 		lines.push(
