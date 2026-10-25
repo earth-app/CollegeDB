@@ -24,8 +24,12 @@ SQL backends: Cloudflare D1, PostgreSQL, MySQL, MariaDB, SQLite, and any Drizzle
 - [In-Memory Providers for Testing & Development](#in-memory-providers-for-testing--development)
 - [Basic Usage](#basic-usage)
 - [Sharding Strategies](#sharding-strategies)
+- [Safe Shard Moves](#safe-shard-moves)
 - [Auto-Generated Primary Keys](#auto-generated-primary-keys)
 - [Utility Helpers](#utility-helpers)
+- [Instance Clients](#instance-clients)
+- [Topology and Epochs](#topology-and-epochs)
+- [Shard Eligibility](#shard-eligibility)
 - [Multi-Key Shard Mappings](#multi-key-shard-mappings)
 - [Drop-in Replacement for Existing Databases](#drop-in-replacement-for-existing-databases)
 - [Troubleshooting](#troubleshooting)
@@ -1061,6 +1065,93 @@ This approach provides:
 - **Optimal read performance**: Queries use `hash` strategy for consistent, high-performance routing
 - **Flexibility**: Each operation type can use the most appropriate routing strategy
 
+## Safe Shard Moves
+
+`reassignShard`, `rebalance` and `recoverMigrations` move rows through a journal. Each step of a move
+is recorded before its work runs, so `recoverMigrations()` can finish or abort a move that a crash
+interrupted. The journal lives on the shard named by `journalShard`:
+
+```typescript
+import { initialize, reassignShard, recoverMigrations } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST, 'db-west': env.DB_WEST },
+	strategy: 'hash',
+	journalShard: 'db-east'
+});
+
+await reassignShard('user-california-123', 'db-west', 'users');
+
+// Run after any deploy that may have interrupted a move.
+await recoverMigrations();
+```
+
+### Configuration
+
+`journalScope` (default `'default'`) keeps separate journals when several sets share one database.
+`initialize` rejects a `journalShard` that is not a configured binding with `INVALID_JOURNAL_SHARD`.
+With more than one shard and no `journalShard`, `reassignShard`, `recoverMigrations` and a
+`rebalance` that is not a dry run throw `JOURNAL_NOT_CONFIGURED`. A single-shard configuration uses
+its only shard as the journal. With `journalShard` set, every shard holds the `collegedb_retired` and
+`collegedb_topology` tables.
+
+`createClient(config)` exposes `reassignShard`, `rebalance` and `recoverMigrations` as client methods. Each client reads `journalShard` and `journalScope` from its own config.
+
+### Requirements
+
+A move runs only between shards on a proven dialect: SQLite (including D1 and a raw binding with no
+`dialect`), Postgres, and MySQL or MariaDB through the MySQL dialect. A shard on any other dialect
+throws `MIGRATION_UNSUPPORTED_DIALECT`.
+
+The source and destination shards must also declare `atomicBatch`, which means their `runBatch`
+rolls back the whole group when one statement fails. A shard without the declaration refuses with
+`MIGRATION_NO_ATOMIC_BATCH`, and a shard with no `runBatch` refuses with `MIGRATION_NO_BATCH`. The
+native Postgres, MySQL, MariaDB and SQLite adapters declare it, as do the Drizzle adapters over
+Postgres, MySQL, MariaDB and `bun:sqlite`, the Hyperdrive Postgres and MySQL providers, and a D1
+binding passed through `toProvider`. Drizzle over D1 and libsql over HTTP declare nothing, so a move
+from either refuses. Use the raw D1 binding for those shards.
+
+Single-connection adapters (`singleConnection: true`) hold their other statements until an open
+batch commits. A caller `lease` gates only when `singleConnection: true` is also set. Pooled
+adapters are not affected.
+
+### Write Ordering and Recovery
+
+Every router-issued write either commits before the cutover and is reflected in the cutover's
+comparison, or runs after the source is fenced and cannot create a stale source row. A write that
+cannot tell which shard owns the key fails with `MIGRATION_CUTOVER_PENDING` and is never
+acknowledged.
+
+A crash after the cutover leaves the key readable and refuses its writes with
+`MIGRATION_CUTOVER_PENDING` until `recoverMigrations()` runs. `getMigrationStatus(key, table)` returns
+the latest recorded state of a key's move. A read that finds nothing on a shard holding a tombstone
+for the key follows the tombstone's `moved_to` shard, up to four hops.
+
+Crash recovery is not a backup or a restore. Archived source rows are kept for seven days by default
+(`retire: { afterMs }` changes this), and `purgeRetired()` clears their payloads once the retention
+deadline has passed and a clean verification pass has run after the move. Tombstones remain, so stale
+writers stay refused. `verifyMigrations()` reports unfinished moves, ghost rows and tombstones without
+a journal record. `verifyMigrations({ repair: true })` removes a ghost only when it matches the
+archived payload.
+
+### Single-Row Copy
+
+`migrateRecord(source, target, primaryKey, tableName, options)` copies one row to another shard and
+then deletes the source row. It writes no journal, so use `reassignShard` when a crash between the
+two writes must be recoverable. `pkColumn` names the key column (default `id`). With
+`onConflict: 'fail'` (the default), a destination row that differs from the source makes the copy
+fail with `DESTINATION_CONFLICT`, and an identical row counts as a retried copy. `onConflict: 'replace'`
+overwrites the destination row.
+
+### Limits
+
+- The journal covers statements that CollegeDB routes. Raw SQL and raw `run()` or `all()` statements
+  bypass it.
+- Each move covers one table row. A key's rows in other tables need one move per table.
+- Nothing is atomic across shards. The journal makes an interrupted move recoverable, and nothing else.
+- Production D1 batch rollback has not been tested. The D1 declaration rests on local workerd runs.
+
 ## Auto-Generated Primary Keys
 
 When your table assigns the primary key during insert, use `insert()` for the automatic shard-allocation path or `insertShard()` when you already know the target shard. Both helpers capture the generated id from provider metadata or `RETURNING` rows, then store the generated-id mapping so the normal routed `first()` / `all()` helpers can read the row back.
@@ -1228,6 +1319,42 @@ export default {
 `initializeAsync()` awaits both tasks instead, which suits a script or a test but adds their
 latency to the request that calls it.
 
+### Instance Clients
+
+`createClient(config)` returns a client with the same operations as the module-level functions, including `run`, `first`, `all` and `reassignShard`. Each client holds its own state: the key mapper, placement, schema fingerprints, size caches, phase observer and migration caches. Clients in one isolate share no router state, so each can serve a separate database group or tenant.
+
+```typescript
+import { createClient } from '@earth-app/collegedb';
+
+const tenantA = createClient({
+	kv: env.KV_A,
+	shards: { 'db-a1': env.DB_A1, 'db-a2': env.DB_A2 }
+});
+
+const tenantB = createClient({
+	kv: env.KV_B,
+	shards: { 'db-b1': env.DB_B1 }
+});
+
+const user = await tenantA.first('user-1', 'SELECT * FROM users WHERE id = ?', ['user-1']);
+await tenantB.run('user-9', 'INSERT INTO users (id) VALUES (?)', ['user-9']);
+```
+
+A client does not use `AsyncLocalStorage`, so it works for overlapping configurations on any runtime, including those without an async context.
+
+The module-level functions keep working on a default instance that `initialize` configures. `createClient` does not change that instance.
+
+`collegedb(config, callback)` runs its callback in a scope of its own when `AsyncLocalStorage` is available. The callback, and everything it awaits, uses its `config` even while another `collegedb` call with a different configuration runs. CollegeDB reaches it through `process.getBuiltinModule('node:async_hooks')`, which Node 20.16 and later, Node 22.3 and later, and Bun expose. Runtimes without that function take the path described below.
+
+With a scope:
+
+- The module-level configuration is unset when the callback returns, so `isInitialized()` is false afterwards.
+- Each configuration gets its own state. Up to eight states are kept per KV store. A later call with the same bindings and options reuses its state, so a Worker that calls `collegedb` on every request keeps its caches warm.
+
+Without `AsyncLocalStorage`, the callback runs on the default instance and the module-level configuration stays set. A callback with a different configuration that starts while another one runs throws `CONCURRENT_CONFIG`. Use `createClient` for overlapping configurations on such a runtime.
+
+`setPhaseObserver` acts on the default instance only. A client takes its phase observer from the `onPhase` option of its own config.
+
 ### One-Call Setup From a Worker `env`
 
 `initializeFromEnv` discovers D1 bindings on `env` (any name matching `DB_`, `DB-`, or `db-`, plus a primary `env.DB`), resolves each with `toProvider` (D1 / Drizzle / SQLite), wires the KV store (raw Workers KV is auto-wrapped), and calls `initialize`. Shard names are the binding name lowercased with `_` replaced by `-` (`DB_EAST` -> `db-east`).
@@ -1324,6 +1451,46 @@ const { results, total, page, pages } = await paginate<User>('SELECT * FROM user
 	sortDirection: 'desc'
 });
 ```
+
+### Read Consistency
+
+Read helpers accept an optional `consistency` option. Without it, a read opens no session and runs on the shard's default routing.
+
+```typescript
+import { all } from '@earth-app/collegedb';
+
+const orders = await all<Order>('customer-42', 'SELECT * FROM orders WHERE customer_id = ?', ['customer-42'], {
+	consistency: { mode: 'primary' }
+});
+```
+
+The modes:
+
+- `primary`: the first query of a D1 session goes to the primary database, and the session continues in sequence. The option does not promise that every query of the operation runs on the primary.
+- `session`: resumes from the bookmarks passed in `bookmarks`, keyed by database id. With no bookmarks, the first query can reach any instance of the database.
+- `eventual`: no constraint.
+
+A shard supports a mode unless its `consistency` capability declares that mode `false`. `session` also requires `withSession`, which D1 bindings provide. The Postgres, MySQL, MariaDB, SQLite and Drizzle adapters report `primary` and `eventual` but not `session`. The in-memory provider reports the same set. A shard that cannot serve the requested mode throws `CONSISTENCY_UNSUPPORTED` before any query runs. The call does not fall back to a weaker mode. An unknown mode throws `INVALID_CONSISTENCY`.
+
+Session bookmarks are keyed by database id. Set `shardState[binding].id` to the physical database id, which is the D1 database UUID for D1:
+
+```typescript
+import { initialize } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-east': env.DB_EAST },
+	shardState: { 'db-east': { id: 'your-d1-database-uuid' } }
+});
+```
+
+A session read that supplies bookmarks for a binding with no `id` throws `BOOKMARK_IDENTITY_UNVERIFIED`. Reads without bookmarks do not need `shardState`.
+
+A read made with a session reports the bookmark it ended on. A single-shard read returns it at `meta.bookmark`. A read that merges several databases returns one bookmark per database at `meta.bookmarks`, keyed by database id. Pass that object back as `bookmarks` to resume. Databases without an `id` in `shardState` are left out of it. `paginate` returns the same object as `bookmarks`.
+
+These helpers accept `consistency`: `first`, `all`, `count`, `countShard`, `countAllShards`, `firstByLookupKey`, `allByLookupKey`, `firstShard`, `allShard`, `firstAllShards`, `allAllShards`, `firstAllShardsGlobal`, `allAllShardsGlobal`, `firstResilient`, `queryFirst`, `queryAll`, and `paginate`. Write helpers do not accept it.
+
+`paginate` is not a single snapshot. Each shard runs its query in one session, and each call for a page starts its own sessions, so two pages can reflect different states.
 
 ### Idempotent Schema Across Shards
 
@@ -1597,6 +1764,24 @@ await kv.putMany?.([
 ]);
 ```
 
+On Workers KV, `getMany` issues native bulk gets of up to 100 keys each, and `batch()` uses it to read mappings in bulk. `putMany` issues single `put` calls with up to 16 in flight. Set `putConcurrency` in `createWorkersKVProvider` to change that limit. The writes are not atomic. A failed put rejects with `KV_PUT_MANY_FAILED`, and the message names the key that failed. Entries written before the failure stay written.
+
+#### KV Timeouts
+
+`kvTimeoutMs` limits each KV call the router makes. A call that runs longer rejects with `KV_TIMEOUT`. It never resolves as a missing key, so a stalled read cannot send a lookup down the "not mapped" path. The underlying call is not cancelled, so a write that times out can still complete.
+
+```typescript
+import { initialize } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	kvTimeoutMs: 2000,
+	shards: { 'db-east': env.DB_EAST }
+});
+```
+
+`withKVTimeout(kv, timeoutMs)` applies the same wrapper to a store used outside the router.
+
 #### Workers KV Edge Caching
 
 Shard mappings are close to write-once, so the Workers KV adapter asks for a one-hour edge cache by
@@ -1694,13 +1879,141 @@ if (plan?.keys.length === 1) {
 ```typescript
 import { cached, invalidate, setLookup, getLookup, deleteLookup } from '@earth-app/collegedb';
 
-const user = await cached(`user:${id}`, () => loadUser(id), { ttl: 3600 });
+const user = await cached(
+	`user:${id}`,
+	async () => {
+		// load the user row from your database and return it
+		return userRow;
+	},
+	{ ttl: 3600 }
+);
 await invalidate('tickets:list:'); // after a write
 
 await setLookup(emailHash, String(customerId));
-const customerId = await getLookup(emailHash);
+const found = await getLookup(emailHash);
 await deleteLookup(oldEmailHash);
 ```
+
+Concurrent `cached` calls for the same key on the same KV store share one fetch within an isolate, so a miss under load runs the fetcher once. Pass `fetchTimeoutMs` to bound the wait. Callers waiting on a fetch that runs past the limit reject with `CACHE_FETCH_TIMEOUT`. The fetch is not cancelled, and if it resolves later its value is still stored.
+
+## Topology and Epochs
+
+With `placement: 'computed'`, a key's shard is computed from a placement manifest. The manifest is an
+ordered list of epochs, newest first. Each epoch records a shard set and the algorithm that computes an
+owner from it. A key that was placed under an older epoch still resolves through that epoch. See
+[Computed Placement](#computed-placement).
+
+A manifest holds at most 8 epochs, the current one included. Creating a ninth throws
+`TOO_MANY_EPOCHS`. The library never drops an epoch to make room, because a key placed under it would
+stop resolving. Move keys to their current owners and run [Pruning Epochs](#pruning-epochs) first.
+
+A read that misses on the newest epoch checks older epochs, one query each. A key found through an
+older epoch is stored as a placement exception on its first hit, so later reads go straight to it. A
+move records a placement exception only when its destination differs from the computed owner.
+
+### Manifest Storage
+
+With `journalShard` set on a proven dialect, the manifest is the `collegedb_manifest` row on the
+journal shard. Every update is a compare-and-swap on the manifest revision. A writer that loses five
+swaps in a row throws `PLACEMENT_CONFLICT`. KV holds a derived copy, which isolates refresh on a
+timer.
+
+Reads may use a cached manifest when KV cannot confirm the current one. Writes need a fresh manifest.
+When a write cannot confirm one, it throws `PLACEMENT_UNVERIFIED` and routes nothing. Retry the call.
+
+### Topology Fence
+
+Each data shard holds a fence, `min_generation`, in `collegedb_topology`. A write binds the generation
+of the manifest it routed with, and a guarded insert or upsert matches no row while the fence is above
+that generation. The router distinguishes three zero-row results. A raised fence means the manifest is
+stale: the router reloads it once and throws `STALE_TOPOLOGY` if the write still cannot land. A
+tombstone follows the builder write rules in the [migration protocol](docs/migration-protocol.md). An
+ignored conflict is a real zero-row result.
+
+### Writes After a Topology Change
+
+After a topology change, a write first finds the shard that holds its row. The router probes the shards
+for the key column named in `keyColumns` (default `id`) and writes to the one that has the row. When
+the probe cannot run, the write throws `WRITE_UNRESOLVED`. A statement keyed on another column goes to
+the newest owner unless the key already has a placement exception.
+
+### Pruning Epochs
+
+`pruneEpochs({ tables, pkColumns, dryRun, pageSize, concurrency })` drops every epoch that no row depends
+on. It requires `journalShard` and refuses with `PRUNE_REFUSED` otherwise. List every table that holds
+keyed rows in `tables`. A census over fewer tables cannot show that no row depends on an epoch.
+
+A run raises the fence on every shard, counts the rows that depend on each epoch, and publishes the
+shorter manifest with the same compare-and-swap. A row depends on the newest epoch whose owner is the
+shard the row sits on. A key keeps an epoch when it has a placement exception and a mapping that points
+at the shard it sits on. A KV mapping alone does not keep an epoch.
+
+With `dryRun: true`, the call returns the dependents of each epoch and changes nothing, the fence
+included. A writer that holds a manifest older than the fence is refused with `STALE_TOPOLOGY`.
+
+```typescript
+import { pruneEpochs } from '@earth-app/collegedb';
+
+const plan = await pruneEpochs({ tables: ['users', 'tickets'], dryRun: true });
+console.log(plan.dependents);
+
+const report = await pruneEpochs({ tables: ['users', 'tickets'] });
+console.log(report.removed, report.retained);
+```
+
+## Shard Eligibility
+
+Each shard binding can carry a `ShardState` in the `shardState` config field:
+
+- `id` is the physical database id. Session bookmarks are keyed by it, so a topology change cannot
+  apply one database's bookmark to another.
+- `writable` (default `true`) keeps a shard out of new allocations when `false`. Its existing keys stay
+  readable and writable.
+- `drain` (default `'active'`) takes `'draining'` or `'retired'`. Only `active` shards take new keys.
+  Draining and retired shards stay readable and keep resolving through older epochs. `pruneEpochs` is
+  what proves a retired shard is empty.
+- `tags` are labels that the `eligible` predicate can read, such as a jurisdiction.
+
+```typescript
+import { initialize, publishEligibility } from '@earth-app/collegedb';
+
+initialize({
+	kv: env.KV,
+	shards: { 'db-eu': env.DB_EU, 'db-us': env.DB_US },
+	strategy: 'hash',
+	shardState: {
+		'db-eu': { id: 'eu-database-uuid', tags: { jurisdiction: 'eu' } },
+		'db-us': { drain: 'draining' }
+	},
+	eligible: (shard, context) => context.tags.jurisdiction === 'eu'
+});
+
+await publishEligibility();
+```
+
+### Eligibility Predicate
+
+`eligible(shard, context)` decides whether a shard takes new keys. `shardState` and `maxDatabaseSize`
+apply first. A shard whose database size cannot be read is not excluded for that reason. The predicate
+runs with `operation: 'allocate'` for each new key under kv-mapped placement. Under computed placement
+it runs with `operation: 'publish'` when a snapshot is published: at cold start and in
+`publishEligibility()`. The result becomes a topology epoch. The predicate never affects reads or
+existing keys.
+
+Returning `false` keeps the shard out. A throw or a rejection fails the operation with
+`ELIGIBILITY_FAILED`, and the shard does not count as eligible. `rebalance` moves keys only onto
+eligible shards.
+
+Re-initializing does not compare the predicate. A changed predicate takes effect through
+`publishEligibility()` or the next cold start. `publishEligibility()` returns the eligible shards, whether
+it published a new epoch, and the epoch number.
+
+### No Eligible Shard
+
+When no shard is eligible, allocation throws `NO_ELIGIBLE_SHARD`. Under computed placement, a process
+that finds an existing manifest and no eligible shard publishes nothing. It keeps serving reads from the
+epochs it has and refuses writes with `NO_ELIGIBLE_SHARD`. The cluster is then in read-only mode until a
+shard becomes eligible again.
 
 ## Multi-Key Shard Mappings
 
@@ -1895,7 +2208,6 @@ const result = await integrateExistingDatabase(
 	{
 		tables: ['users', 'posts', 'orders'], // Tables to integrate
 		primaryKeyColumn: 'id', // Primary key column name
-		strategy: 'hash', // Allocation strategy for future records
 		addShardMappingsTable: true, // Add CollegeDB metadata table
 		dryRun: false // Set true for testing
 	}
@@ -2165,6 +2477,7 @@ await first('user-123', 'SELECT * FROM users WHERE email = ?', [email]);
 | ------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | `collegedb(config, callback)`                     | Initialize CollegeDB, then run a callback                              | `CollegeDBConfig, () => T`                                         |
 | `initialize(config)`                              | Initialize CollegeDB with configuration                                | `CollegeDBConfig`                                                  |
+| `createClient(config)`                            | Create a client with its own state and the same operations             | `CollegeDBConfig`                                                  |
 | `createSchema(db, schema)`                        | Create schema on a shard database                                      | `SQLDatabase, string`                                              |
 | `prepare(key, sql)`                               | Prepare a SQL statement for execution                                  | `string, string`                                                   |
 | `run(key, sql, bindings)`                         | Execute a SQL query with primary key routing                           | `string, string, any[]`                                            |
@@ -2237,20 +2550,51 @@ await first('user-123', 'SELECT * FROM users WHERE email = ?', [email]);
 
 The `CollegeDBError` class extends the native `Error` class and includes an optional error code for better error categorization:
 
-| Code                        | Raised when                                                             |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `NOT_INITIALIZED`           | A routed helper ran before `initialize`                                 |
-| `NO_SHARDS`                 | No shards are configured, or none are eligible for allocation           |
-| `SHARD_NOT_FOUND`           | A mapping names a shard this configuration does not hold                |
-| `MAPPING_NOT_FOUND`         | `reassignShard` or `updateShardMapping` found no mapping for the key    |
-| `QUERY_FAILED`              | The backend reported the statement as unsuccessful                      |
-| `GENERATED_KEY_UNAVAILABLE` | An insert returned no recognizable id; pass `idColumn`                  |
-| `GENERATED_KEY_COLLISION`   | A generated id is already mapped to a different shard                   |
-| `UNROUTABLE_QUERY`          | The planner could not prove a routing key and `onUnroutable` is `throw` |
-| `SIZE_QUERY_FAILED`         | No sizing statement worked against the backend                          |
-| `INVALID_IDENTIFIER`        | A table or column name is not a bare SQL identifier                     |
-| `EMPTY_WHERE`               | A built `UPDATE` or `DELETE` had no `WHERE` conditions                  |
-| `KV_JSON_PARSE_FAILED`      | A KV value could not be parsed as JSON                                  |
+| Code                            | Raised when                                                                                                 |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `NOT_INITIALIZED`               | A routed helper ran before `initialize`                                                                     |
+| `CONCURRENT_CONFIG`             | `collegedb` runs without `AsyncLocalStorage` and a callback with a different configuration is still running |
+| `NO_SHARDS`                     | No shards are configured, or none are eligible for allocation                                               |
+| `SHARD_NOT_FOUND`               | A mapping names a shard this configuration does not hold                                                    |
+| `MAPPING_NOT_FOUND`             | `reassignShard` or `updateShardMapping` found no mapping for the key                                        |
+| `QUERY_FAILED`                  | The backend reported the statement as unsuccessful                                                          |
+| `GENERATED_KEY_UNAVAILABLE`     | An insert returned no recognizable id; pass `idColumn`                                                      |
+| `GENERATED_KEY_COLLISION`       | A generated id is already mapped to a different shard                                                       |
+| `UNROUTABLE_QUERY`              | The planner could not prove a routing key and `onUnroutable` is `throw`                                     |
+| `SIZE_QUERY_FAILED`             | No sizing statement worked against the backend                                                              |
+| `INVALID_IDENTIFIER`            | A table or column name is not a bare SQL identifier                                                         |
+| `EMPTY_WHERE`                   | A built `UPDATE` or `DELETE` had no `WHERE` conditions                                                      |
+| `KV_JSON_PARSE_FAILED`          | A KV value could not be parsed as JSON                                                                      |
+| `KV_TIMEOUT`                    | A KV call ran past `kvTimeoutMs`                                                                            |
+| `KV_PUT_MANY_FAILED`            | A Workers KV `putMany` write failed; the message names the key                                              |
+| `CACHE_FETCH_TIMEOUT`           | A `cached` fetch ran past `fetchTimeoutMs`                                                                  |
+| `INVALID_CONSISTENCY`           | A read names a `consistency` mode that does not exist                                                       |
+| `CONSISTENCY_UNSUPPORTED`       | A shard cannot serve the requested `consistency` mode                                                       |
+| `BOOKMARK_IDENTITY_UNVERIFIED`  | A session read supplies bookmarks for a binding with no `shardState` id                                     |
+| `COORDINATOR_NOT_CONFIGURED`    | `reconcileAllocations` runs without a `coordinator` in the config                                           |
+| `COORDINATOR_ERROR`             | The coordinator returned an error while reconcile listed or pruned allocations                              |
+| `JOURNAL_NOT_CONFIGURED`        | A move, `recoverMigrations`, or a non-dry `rebalance` runs on a multi-shard config without `journalShard`   |
+| `INVALID_JOURNAL_SHARD`         | `journalShard` names a binding that is not configured                                                       |
+| `MIGRATION_UNSUPPORTED_DIALECT` | A move or journaled write involves a shard on a dialect the journal is not proven on                        |
+| `MIGRATION_NO_BATCH`            | A shard needs a batch for the move or guarded write and has no `runBatch`                                   |
+| `MIGRATION_NO_ATOMIC_BATCH`     | A shard's `runBatch` does not declare `atomicBatch`                                                         |
+| `MIGRATION_IN_PROGRESS`         | Another move holds the claim on this key                                                                    |
+| `MIGRATION_CUTOVER_PENDING`     | A write cannot tell which shard owns the key during a move. Retryable                                       |
+| `MIGRATION_SOURCE_TOMBSTONED`   | The source shard holds a tombstone for the key from another move                                            |
+| `MIGRATION_ABORTED`             | `reassignShard` stopped after repeated recopies failed to cut over                                          |
+| `MIGRATION_AMBIGUOUS`           | Recovery found an archived row that does not match the destination; an operator must decide                 |
+| `MIGRATION_ROW_TOO_WIDE`        | A row has more columns than the bind-parameter limit and no `versionColumn` was given                       |
+| `MIGRATION_UNSUPPORTED_VALUE`   | A column value has no portable encoding, such as a `Date` or an object                                      |
+| `DESTINATION_CONFLICT`          | `migrateRecord` with `onConflict: 'fail'` found a different row on the destination                          |
+| `RECORD_NOT_FOUND`              | `migrateRecord` found no source row                                                                         |
+| `PRUNE_REFUSED`                 | `pruneEpochs` cannot prove that no row depends on an epoch                                                  |
+| `TOO_MANY_EPOCHS`               | The manifest already holds 8 epochs                                                                         |
+| `PLACEMENT_CONFLICT`            | Five manifest compare-and-swap attempts in a row lost                                                       |
+| `PLACEMENT_UNVERIFIED`          | A write could not confirm the placement manifest because KV or the journal failed. Retryable                |
+| `STALE_TOPOLOGY`                | A write from an older manifest generation was refused after a reload. Retryable                             |
+| `WRITE_UNRESOLVED`              | After a topology change, the probe that finds the row could not run                                         |
+| `NO_ELIGIBLE_SHARD`             | No shard passes eligibility, or the cluster is in read-only mode for writes                                 |
+| `ELIGIBILITY_FAILED`            | The `eligible` predicate threw or rejected                                                                  |
 
 ```typescript
 try {
@@ -2264,22 +2608,25 @@ try {
 
 ### ShardCoordinator (Durable Object) API
 
-The `ShardCoordinator` is an optional Durable Object that provides centralized shard allocation and statistics management. All endpoints return JSON responses.
+The `ShardCoordinator` is an optional Durable Object that provides centralized shard allocation and statistics management. Endpoints return JSON responses. A handler that throws returns a plain-text `500`.
 
 #### HTTP API Endpoints
 
-| Endpoint    | Method | Description                        | Request Body                                     | Response                               |
-| ----------- | ------ | ---------------------------------- | ------------------------------------------------ | -------------------------------------- |
-| `/shards`   | GET    | List all registered shards         | None                                             | `["db-east", "db-west"]`               |
-| `/shards`   | POST   | Register a new shard               | `{"shard": "db-new"}`                            | `{"success": true}`                    |
-| `/shards`   | DELETE | Unregister a shard                 | `{"shard": "db-old"}`                            | `{"success": true}`                    |
-| `/stats`    | GET    | Get shard statistics               | None                                             | `[{"binding":"db-east","count":1542}]` |
-| `/stats`    | POST   | Update shard statistics            | `{"shard": "db-east", "count": 1600}`            | `{"success": true}`                    |
-| `/allocate` | POST   | Allocate shard for primary key     | `{"primaryKey": "user-123"}`                     | `{"shard": "db-west"}`                 |
-| `/allocate` | POST   | Allocate with specific strategy    | `{"primaryKey": "user-123", "strategy": "hash"}` | `{"shard": "db-west"}`                 |
-| `/sequence` | POST   | Allocate next atomic sequence id   | `{"name": "tickets", "min": 42}`                 | `{"value": 42}`                        |
-| `/flush`    | POST   | Clear all state (development only) | None                                             | `{"success": true}`                    |
-| `/health`   | GET    | Health check                       | None                                             | `"OK"`                                 |
+| Endpoint             | Method | Description                                                                      | Request Body                                     | Response                                                                                                         |
+| -------------------- | ------ | -------------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `/shards`            | GET    | List all registered shards                                                       | None                                             | `["db-east", "db-west"]`                                                                                         |
+| `/shards`            | POST   | Register a new shard                                                             | `{"shard": "db-new"}`                            | `{"success": true}`                                                                                              |
+| `/shards`            | DELETE | Unregister a shard                                                               | `{"shard": "db-old"}`                            | `{"success": true}`                                                                                              |
+| `/stats`             | GET    | Get shard statistics                                                             | None                                             | `[{"binding":"db-east","count":1542}]`                                                                           |
+| `/stats`             | POST   | Update shard statistics                                                          | `{"shard": "db-east", "count": 1600}`            | `{"success": true}`                                                                                              |
+| `/allocate`          | POST   | Allocate shard for primary key                                                   | `{"primaryKey": "user-123"}`                     | `{"shard": "db-west"}`                                                                                           |
+| `/allocate`          | POST   | Allocate with specific strategy                                                  | `{"primaryKey": "user-123", "strategy": "hash"}` | `{"shard": "db-west"}`                                                                                           |
+| `/sequence`          | POST   | Allocate next atomic sequence id                                                 | `{"name": "tickets", "min": 42}`                 | `{"value": 42}`                                                                                                  |
+| `/allocations`       | GET    | Page through recorded allocations (`?after=<key>&limit=<n>`)                     | None                                             | `{"allocations": [{"primaryKey": "user-123", "shard": "db-west", "createdAt": 1729800000}], "next": "user-123"}` |
+| `/allocations/prune` | POST   | Drop the named allocations, at most 128 keys per request                         | `{"primaryKeys": ["user-123"]}`                  | `{"pruned": 1}`                                                                                                  |
+| `/retire-legacy`     | POST   | Delete the legacy storage keys (see [Upgrading From 1.3.x](#upgrading-from-13x)) | None                                             | `{"success": true}`                                                                                              |
+| `/flush`             | POST   | Clear all state (development only)                                               | None                                             | `{"success": true}`                                                                                              |
+| `/health`            | GET    | Health check                                                                     | None                                             | `"OK"`                                                                                                           |
 
 #### Programmatic Methods
 
@@ -2345,18 +2692,30 @@ interface CollegeDBConfig {
 	onUnroutable?: 'throw' | 'fanout'; // Default: 'throw'
 	onPhase?: (span: PhaseSpan) => void;
 	waitUntil?: (promise: Promise<unknown>) => void;
+	kvTimeoutMs?: number; // Default: no timeout
+	coordinatorScope?: string; // Default: 'default'
+	shardState?: Record<string, ShardState>; // Default: none
+	journalShard?: string; // Default: none
+	journalScope?: string; // Default: 'default'
+	eligible?: (shard: string, context: EligibilityContext) => boolean | Promise<boolean>; // Default: none
 }
 ```
 
-| Option                 | Purpose                                                                                 |
-| ---------------------- | --------------------------------------------------------------------------------------- |
-| `placement`            | Resolve the shard by computing it rather than reading KV. `hash` strategy only          |
-| `allocateOnRead`       | Record a mapping when a read finds no row                                               |
-| `legacyMultiKeyLookup` | Probe the pre-1.0.3 multi-key record on a miss, at the cost of a second KV read         |
-| `keyColumns`           | Primary-key column per table, used by the planner to recover the routing key            |
-| `onUnroutable`         | Whether an unprovable routing key throws or fans out                                    |
-| `onPhase`              | Per-phase timing observer. Allocates nothing when unset                                 |
-| `waitUntil`            | Keeps `initialize`'s background work alive past the request that started it, on Workers |
+| Option                 | Purpose                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `placement`            | Resolve the shard by computing it rather than reading KV. `hash` strategy only                                                       |
+| `allocateOnRead`       | Record a mapping when a read finds no row                                                                                            |
+| `legacyMultiKeyLookup` | Probe the pre-1.0.3 multi-key record on a miss, at the cost of a second KV read                                                      |
+| `keyColumns`           | Primary-key column per table, used by the planner to recover the routing key                                                         |
+| `onUnroutable`         | Whether an unprovable routing key throws or fans out                                                                                 |
+| `onPhase`              | Per-phase timing observer. Allocates nothing when unset                                                                              |
+| `waitUntil`            | Keeps `initialize`'s background work alive past the request that started it, on Workers                                              |
+| `kvTimeoutMs`          | Per-call limit for KV reads and writes. A call over the limit rejects with `KV_TIMEOUT`                                              |
+| `coordinatorScope`     | Name passed to `idFromName` for the coordinator object. A new scope starts from an empty allocation ledger                           |
+| `shardState`           | Known facts per shard binding. `id` is the database id that session bookmarks are keyed by                                           |
+| `journalShard`         | Binding that holds the move journal and, under computed placement, the placement manifest. Required for moves on multi-shard configs |
+| `journalScope`         | Partition name for journals that share one database                                                                                  |
+| `eligible`             | Predicate that decides whether a shard takes new keys. See [Shard Eligibility](#shard-eligibility)                                   |
 
 When `hashShardMappings` is enabled (default), original keys cannot be recovered during shard operations like `getKeysForShard()`. This is intentional for privacy but means you'll get fewer results from such operations. For full key recovery, set `hashShardMappings: false`, but be aware this may expose sensitive data in KV keys.
 
@@ -2488,27 +2847,28 @@ const config: CollegeDBConfig = {
 
 CollegeDB exports TypeScript types for better development experience and type safety:
 
-| Type                    | Description                    | Example                                               |
-| ----------------------- | ------------------------------ | ----------------------------------------------------- |
-| `CollegeDBConfig`       | Main configuration object      | `{ kv, shards, strategy }`                            |
-| `KVStorage`             | Provider-agnostic KV contract  | `createRedisKVProvider(redisClient)`                  |
-| `SQLDatabase`           | Provider-agnostic SQL contract | `createPostgreSQLProvider(pgPool)`                    |
-| `NuxtHubKVLike`         | NuxtHub/Unstorage KV contract  | `createNuxtHubKVProvider(kv)`                         |
-| `DrizzleClientLike`     | Minimal Drizzle DB contract    | `createPostgreSQLProvider(drizzleDb, sql)`            |
-| `DrizzleSqlTagLike`     | Drizzle SQL tag contract       | `createSQLiteProvider(drizzleDb, sql)`                |
-| `QueryResult`           | Standard query response shape  | `{ success, results, meta }`                          |
-| `QueryResultMeta`       | Query execution metadata       | `{ duration, changes?, last_row_id? }`                |
-| `ShardingStrategy`      | Single strategy options        | `'hash' \| 'location' \| 'round-robin' \| 'random'`   |
-| `MixedShardingStrategy` | Mixed strategy configuration   | `{ read: 'hash', write: 'location' }`                 |
-| `OperationType`         | Database operation types       | `'read' \| 'write'`                                   |
-| `D1Region`              | Cloudflare D1 regions          | `'wnam' \| 'enam' \| 'weur' \| ...`                   |
-| `ShardLocation`         | Geographic shard configuration | `{ region: 'wnam', priority: 2 }`                     |
-| `ShardStats`            | Shard usage statistics         | `{ binding: 'db-east', count: 1542 }`                 |
-| `IndexColumnDefinition` | Index column definition        | `{ name: 'created_at', order: 'DESC' }`               |
-| `CreateIndexOptions`    | Index creation options         | `{ ifNotExists: true, unique: false }`                |
-| `ExplainOptions`        | Explain mode options           | `{ mode: 'query-plan' }`                              |
-| `ShardTableCount`       | Per-shard row-count result     | `{ shard: 'db-east', count: 100, success: true }`     |
-| `ShardSizeResult`       | Per-shard size result          | `{ shard: 'db-east', size: 10485760, success: true }` |
+| Type                    | Description                       | Example                                               |
+| ----------------------- | --------------------------------- | ----------------------------------------------------- |
+| `CollegeDBConfig`       | Main configuration object         | `{ kv, shards, strategy }`                            |
+| `CollegeDBClient`       | Client returned by `createClient` | `createClient(config)`                                |
+| `KVStorage`             | Provider-agnostic KV contract     | `createRedisKVProvider(redisClient)`                  |
+| `SQLDatabase`           | Provider-agnostic SQL contract    | `createPostgreSQLProvider(pgPool)`                    |
+| `NuxtHubKVLike`         | NuxtHub/Unstorage KV contract     | `createNuxtHubKVProvider(kv)`                         |
+| `DrizzleClientLike`     | Minimal Drizzle DB contract       | `createPostgreSQLProvider(drizzleDb, sql)`            |
+| `DrizzleSqlTagLike`     | Drizzle SQL tag contract          | `createSQLiteProvider(drizzleDb, sql)`                |
+| `QueryResult`           | Standard query response shape     | `{ success, results, meta }`                          |
+| `QueryResultMeta`       | Query execution metadata          | `{ duration, changes?, last_row_id? }`                |
+| `ShardingStrategy`      | Single strategy options           | `'hash' \| 'location' \| 'round-robin' \| 'random'`   |
+| `MixedShardingStrategy` | Mixed strategy configuration      | `{ read: 'hash', write: 'location' }`                 |
+| `OperationType`         | Database operation types          | `'read' \| 'write'`                                   |
+| `D1Region`              | Cloudflare D1 regions             | `'wnam' \| 'enam' \| 'weur' \| ...`                   |
+| `ShardLocation`         | Geographic shard configuration    | `{ region: 'wnam', priority: 2 }`                     |
+| `ShardStats`            | Shard usage statistics            | `{ binding: 'db-east', count: 1542 }`                 |
+| `IndexColumnDefinition` | Index column definition           | `{ name: 'created_at', order: 'DESC' }`               |
+| `CreateIndexOptions`    | Index creation options            | `{ ifNotExists: true, unique: false }`                |
+| `ExplainOptions`        | Explain mode options              | `{ mode: 'query-plan' }`                              |
+| `ShardTableCount`       | Per-shard row-count result        | `{ shard: 'db-east', count: 100, success: true }`     |
+| `ShardSizeResult`       | Per-shard size result             | `{ shard: 'db-east', size: 10485760, success: true }` |
 
 #### Mixed Strategy Configuration
 
@@ -3241,6 +3601,24 @@ First, configure the Durable Object in your `wrangler.jsonc`:
 }
 ```
 
+#### Upgrading From 1.3.x
+
+The coordinator keeps its state in the object's SQLite database (`ctx.storage.sql`), so the class must be SQLite-backed as in the setup above. Objects written by 1.3.x keep their state under legacy storage keys. No separate migration step runs. Each request that reaches the object copies one page of that state into SQL, and the object moves through these phases:
+
+- `legacy`: only the legacy keys exist.
+- `copying`: state is being copied into SQL, one page per request.
+- `dual`: the copy is complete. Every write lands in SQL and on the legacy keys, so 1.3.x code can still read the object.
+- `sql-only`: the legacy keys are deleted. Set by `POST /retire-legacy`.
+
+While the object is in `dual`, a rollback to 1.3.x keeps the object readable. Writes the older version makes to the legacy keys are not copied back, and the newer version overwrites them when the object upgrades again.
+
+`POST /retire-legacy` (which calls `retireLegacy()`) finishes any pending copy and then deletes the legacy keys. Run it once no Worker running 1.3.x is still serving traffic. Afterwards the 1.3.x code cannot read the object, and downgrading past this call is unsupported.
+
+```typescript
+const coordinator = env.ShardCoordinator.get(env.ShardCoordinator.idFromName('default'));
+await coordinator.fetch('http://coordinator/retire-legacy', { method: 'POST' });
+```
+
 #### Basic Usage with ShardCoordinator
 
 ```typescript
@@ -3393,6 +3771,24 @@ await coordinator.incrementShardCount('db-east');
 await coordinator.decrementShardCount('db-west');
 ```
 
+#### Reconciling Allocations
+
+`reconcileAllocations` compares the coordinator's allocation ledger with the shard each key lives on. The KV mapping is the record, and the ledger is advisory. Call it after `initialize`. It throws `COORDINATOR_NOT_CONFIGURED` when the config has no `coordinator`.
+
+The run is observational by default and writes nothing unless a flag is set:
+
+- `repair: true` writes a KV mapping for each key that has none, using the ledger shard when it is configured.
+- `pruneVerified: true` removes ledger rows whose shard matches their KV mapping. Rows that match only the computed placement stay.
+
+Disagreements are reported and never resolved. Key lists in the report hold at most 1,000 entries, and the counts are exact.
+
+```typescript
+import { reconcileAllocations } from '@earth-app/collegedb';
+
+const report = await reconcileAllocations({ limit: 100 });
+console.log(report.examined, report.agreed, report.missingMappingCount, report.disagreeingCount);
+```
+
 #### Advanced Monitoring Setup
 
 Monitor your shard distribution:
@@ -3455,8 +3851,7 @@ try {
 	});
 
 	if (!response.ok) {
-		const error = await response.json();
-		throw new Error(`ShardCoordinator error: ${error.error}`);
+		throw new Error(`ShardCoordinator error ${response.status}: ${await response.text()}`);
 	}
 
 	const { shard } = await response.json();
@@ -3468,10 +3863,11 @@ try {
 }
 ```
 
+A handler that throws returns status `500` with the plain-text body `Internal Server Error`. Validation failures return status `400` with a JSON `error` field, so read a non-OK body as text.
+
 #### Performance Considerations
 
-- **Coordinator Latency**: Round-robin allocation adds ~10-20ms latency due to coordinator communication
-- **Scalability**: Single coordinator instance can handle thousands of allocations per second
+- **Throughput**: Cloudflare documents a soft limit of 1,000 requests per second per Durable Object ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). Requests beyond that are queued, then return an overloaded error. The coordinator serves allocation, statistics and sequence requests. It does not serve the read path.
 - **Fault Tolerance**: Design fallback allocation strategies when coordinator is unavailable
 - **Caching**: Consider caching allocation results for frequently accessed keys
 
