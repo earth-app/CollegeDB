@@ -1140,12 +1140,26 @@ does not take the lease; `verifyMigrations({ repair: true })` does. The full con
 fence does not cover, and a Workers `scheduled()` example are in `docs/migration-protocol.md` under
 Recovery lease.
 
+A recovery that stalls between its lease check and a shard write can still run that one write after
+another recovery takes over. Its journal writes are fenced, so it never returns a report and throws
+`RECOVERY_FENCED`. The stale write can leave a stranded copy on the destination, or archive a source
+row after the new holder aborted the move. `verifyMigrations()` reports both, and `repair` fixes them
+where the journal proves the state. One case stays undetected: a stale destination insert that lands
+after the new holder committed and an acknowledged delete removed the key. It needs an executor
+stalled longer than the lease, a complete move by the new holder in that time, and a delete of the
+key in the same interval.
+
 Crash recovery is not a backup or a restore. Archived source rows are kept for seven days by default
 (`retire: { afterMs }` changes this), and `purgeRetired()` clears their payloads once the retention
 deadline has passed and a clean verification pass has run after the move. Tombstones remain, so stale
 writers stay refused. `verifyMigrations()` reports unfinished moves, ghost rows and tombstones without
-a journal record. `verifyMigrations({ repair: true })` removes a ghost only when it matches the
-archived payload.
+a journal record. It also reports two leftovers of a recovery executor that stalled past its lease: `strandedCopies`,
+a live row on the destination of an aborted move that equals a row the move journaled, and
+`staleCutovers`, a tombstone whose move the journal ended as aborted. Both count against `clean`.
+`verifyMigrations({ repair: true })` removes a ghost only when it matches the archived payload,
+removes a stranded copy by the same proof, and restores the archived row of a stale cutover when the
+journal shows that nothing else owns the key. A stale cutover that cannot be restored is reported
+with `restorable: false` and left as it is.
 
 ### Single-Row Copy
 
@@ -1173,7 +1187,12 @@ When your table assigns the primary key during insert, use `insert()` for the au
 a generated-key table across shards and the same id eventually arrives twice; the second mapping
 would overwrite the first and leave that row on a shard nothing routes to.
 
-CollegeDB throws `GENERATED_KEY_COLLISION` when it sees that instead:
+CollegeDB throws `GENERATED_KEY_COLLISION` when it sees that instead. The INSERT has already run by
+then, so the refused row sits on the shard with no mapping. CollegeDB takes a raw SQL string and
+does not parse it, so it removes that row only when you pass `{ table }`; it then deletes the row it
+just wrote, matched on `idColumn` (default `id`), before it throws. Without `table` the row stays
+and you delete it; the error message names its shard and id. If the delete fails or removes no row,
+the error keeps the same code, names the leftover row, and carries the delete failure as `cause`.
 
 ```typescript
 import { CollegeDBError, insertShard } from '@earth-app/collegedb';
@@ -1181,11 +1200,10 @@ import { CollegeDBError, insertShard } from '@earth-app/collegedb';
 await insertShard('db-a', 'INSERT INTO auto_users (name) VALUES (?)', ['Ada']); // id 1 on db-a
 
 try {
-	await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Grace']); // also id 1
+	await insertShard('db-b', 'INSERT INTO auto_users (name) VALUES (?)', ['Grace'], { table: 'auto_users' }); // also id 1
 } catch (error) {
 	if (error instanceof CollegeDBError && error.code === 'GENERATED_KEY_COLLISION') {
-		// The row was written to db-b, but id 1 already routes to db-a. Reconcile
-		// it with a cluster-unique id rather than leaving it unreachable.
+		// the row on db-b is gone; retry with a cluster-unique id from nextId()
 	}
 }
 ```
@@ -2571,7 +2589,7 @@ The `CollegeDBError` class extends the native `Error` class and includes an opti
 | `MAPPING_NOT_FOUND`             | `reassignShard` or `updateShardMapping` found no mapping for the key                                        |
 | `QUERY_FAILED`                  | The backend reported the statement as unsuccessful                                                          |
 | `GENERATED_KEY_UNAVAILABLE`     | An insert returned no recognizable id; pass `idColumn`                                                      |
-| `GENERATED_KEY_COLLISION`       | A generated id is already mapped to a different shard                                                       |
+| `GENERATED_KEY_COLLISION`       | A generated id is already mapped to another shard; `{ table }` removes the refused row                      |
 | `UNROUTABLE_QUERY`              | The planner could not prove a routing key and `onUnroutable` is `throw`                                     |
 | `SIZE_QUERY_FAILED`             | No sizing statement worked against the backend                                                              |
 | `INVALID_IDENTIFIER`            | A table or column name is not a bare SQL identifier                                                         |
